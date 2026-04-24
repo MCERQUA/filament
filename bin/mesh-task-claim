@@ -1,0 +1,224 @@
+#!/usr/bin/env python3
+"""mesh-task-claim — atomically claim and manage tasks in mesh/QUEUE/<name>/
+
+Implements PROTOCOL.md v2.1.0 §18 task queue claim protocol.
+Atomic claim uses mkdir sentinel (same pattern as inbox seq-slot allocation).
+
+Stdlib-only. Python 3.8+.
+
+Env:
+    AGENT_URI    required, e.g. bun-desktop@mesh
+    MESH_ROOT    optional, default /mnt/agent-mesh (host) or /mesh (container)
+
+Subcommands:
+    claim <queue>                   claim oldest pending task, print claimed path
+    complete <queue> <filename>     move claimed file to completed/
+    list <queue>                    list pending tasks (oldest first)
+    list-claimed <queue>            list tasks claimed by this agent
+    show <queue> <filename>         print full contents of a task file
+
+Exit codes:
+    0  success / task found
+    1  no task available (nothing in pending/)
+    2  claim race lost (another agent claimed it)
+    3  validation / usage error
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import os
+import re
+import sys
+from pathlib import Path
+
+
+def die(msg: str, code: int = 3) -> None:
+    print(f"mesh-task-claim: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def agent_name() -> str:
+    uri = os.environ.get("AGENT_URI", "")
+    if not uri.endswith("@mesh"):
+        die("AGENT_URI env var required (e.g. AGENT_URI=bun-desktop@mesh)")
+    name = uri[:-len("@mesh")]
+    if not re.fullmatch(r"[a-z0-9][a-z0-9\-]*", name):
+        die(f"AGENT_URI agent name must be kebab-case, got: {name}")
+    return name
+
+
+def mesh_dir() -> Path:
+    override = os.environ.get("MESH_ROOT")
+    if override:
+        return Path(override) / "mesh"
+    if Path("/mesh").is_dir():
+        return Path("/mesh")
+    if Path("/mnt/agent-mesh").is_dir():
+        return Path("/mnt/agent-mesh") / "mesh"
+    die("cannot discover mesh root — set MESH_ROOT or run on host/container with /mesh")
+
+
+def queue_dir(mesh: Path, queue: str) -> Path:
+    return mesh / "QUEUE" / queue
+
+
+def oldest_pending(pending: Path) -> Path | None:
+    files = sorted(pending.glob("*.md"))
+    return files[0] if files else None
+
+
+def cmd_claim(args: argparse.Namespace) -> None:
+    mesh = mesh_dir()
+    me = agent_name()
+    qdir = queue_dir(mesh, args.queue)
+    pending = qdir / "pending"
+    claimed = qdir / "claimed"
+
+    if not pending.is_dir():
+        die(f"queue '{args.queue}' has no pending/ dir (does the queue exist?)", code=3)
+    claimed.mkdir(parents=True, exist_ok=True)
+
+    task = oldest_pending(pending)
+    if task is None:
+        print("mesh-task-claim: no pending tasks", file=sys.stderr)
+        sys.exit(1)
+
+    # Atomic claim: mkdir sentinel on the target path in claimed/
+    dest = claimed / task.name
+    sentinel = claimed / (task.stem + ".claim")
+    try:
+        sentinel.mkdir(mode=0o755)
+    except FileExistsError:
+        print(f"mesh-task-claim: claim race lost on {task.name}", file=sys.stderr)
+        sys.exit(2)
+
+    try:
+        content = task.read_text(encoding="utf-8")
+        ts = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        # Inject CLAIMED_BY + CLAIMED_AT into frontmatter (after first ---)
+        lines = content.splitlines(keepends=True)
+        new_lines = []
+        injected = False
+        for i, line in enumerate(lines):
+            new_lines.append(line)
+            if not injected and i > 0 and line.strip() == "---":
+                new_lines.insert(-1, f'CLAIMED_BY: "{me}@mesh"\n')
+                new_lines.insert(-1, f"CLAIMED_AT: \"{ts}\"\n")
+                injected = True
+        if not injected:
+            new_lines.append(f'CLAIMED_BY: "{me}@mesh"\n')
+            new_lines.append(f"CLAIMED_AT: \"{ts}\"\n")
+
+        dest.write_text("".join(new_lines), encoding="utf-8")
+        task.unlink()
+    finally:
+        try:
+            sentinel.rmdir()
+        except OSError:
+            pass
+
+    print(str(dest))
+
+
+def cmd_complete(args: argparse.Namespace) -> None:
+    mesh = mesh_dir()
+    qdir = queue_dir(mesh, args.queue)
+    claimed = qdir / "claimed"
+    completed = qdir / "completed"
+    completed.mkdir(parents=True, exist_ok=True)
+
+    src = claimed / args.filename
+    if not src.exists():
+        src = claimed / (args.filename if args.filename.endswith(".md") else args.filename + ".md")
+    if not src.exists():
+        die(f"claimed file not found: {args.filename}")
+
+    dest = completed / src.name
+    src.rename(dest)
+    print(str(dest))
+
+
+def cmd_list(args: argparse.Namespace) -> None:
+    mesh = mesh_dir()
+    qdir = queue_dir(mesh, args.queue)
+    pending = qdir / "pending"
+    if not pending.is_dir():
+        die(f"queue '{args.queue}' not found", code=3)
+
+    files = sorted(pending.glob("*.md"))
+    if not files:
+        print(f"(no pending tasks in '{args.queue}')")
+        return
+    for f in files:
+        content = f.read_text(encoding="utf-8", errors="replace")
+        subject = ""
+        for line in content.splitlines():
+            if line.startswith("PRIORITY:"):
+                subject += f"  priority={line.split(':',1)[1].strip()}"
+            if line.startswith("DEADLINE:") and line.split(":",1)[1].strip():
+                subject += f"  deadline={line.split(':',1)[1].strip()}"
+        print(f"{f.name}{subject}")
+
+
+def cmd_list_claimed(args: argparse.Namespace) -> None:
+    mesh = mesh_dir()
+    me = agent_name()
+    qdir = queue_dir(mesh, args.queue)
+    claimed = qdir / "claimed"
+    if not claimed.is_dir():
+        print(f"(no claimed tasks in '{args.queue}')")
+        return
+    for f in sorted(claimed.glob("*.md")):
+        content = f.read_text(encoding="utf-8", errors="replace")
+        if f"CLAIMED_BY: \"{me}@mesh\"" in content:
+            print(f.name)
+
+
+def cmd_show(args: argparse.Namespace) -> None:
+    mesh = mesh_dir()
+    qdir = queue_dir(mesh, args.queue)
+    for subdir in ("pending", "claimed", "completed"):
+        p = qdir / subdir / args.filename
+        if not p.exists():
+            p = qdir / subdir / (args.filename + ".md")
+        if p.exists():
+            print(p.read_text(encoding="utf-8"))
+            return
+    die(f"task file '{args.filename}' not found in any queue subdir")
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="Claim and manage tasks in mesh/QUEUE/")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    c = sub.add_parser("claim", help="atomically claim oldest pending task")
+    c.add_argument("queue")
+
+    co = sub.add_parser("complete", help="move claimed task to completed/")
+    co.add_argument("queue")
+    co.add_argument("filename")
+
+    ls = sub.add_parser("list", help="list pending tasks")
+    ls.add_argument("queue")
+
+    lc = sub.add_parser("list-claimed", help="list tasks claimed by this agent")
+    lc.add_argument("queue")
+
+    sh = sub.add_parser("show", help="print full task file contents")
+    sh.add_argument("queue")
+    sh.add_argument("filename")
+
+    args = p.parse_args()
+    {
+        "claim": cmd_claim,
+        "complete": cmd_complete,
+        "list": cmd_list,
+        "list-claimed": cmd_list_claimed,
+        "show": cmd_show,
+    }[args.cmd](args)
+
+
+if __name__ == "__main__":
+    main()

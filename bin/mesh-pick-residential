@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# mesh-pick-residential.sh — select the best available residential-ip-pool node.
+#
+# Returns the agent URI (e.g. "residential-laptop@mesh") of the freshest
+# AVAILABLE node, or "none" if all nodes are offline/busy/in_use.
+#
+# Usage:
+#   AGENT=$(bash mesh-pick-residential.sh)
+#   [ "$AGENT" = "none" ] && echo "no residential available" && exit 1
+#
+# Optional flags:
+#   --allow-in-use     also accept nodes where node_status=in_use (background tasks only)
+#   --require-status <status>   only return nodes with this exact status
+#   --json             print JSON object instead of bare URI
+#
+# Exit codes:
+#   0  — agent URI printed to stdout
+#   1  — no node available ("none" also printed)
+
+set -euo pipefail
+
+POOL_DIR="${MESH_ROOT:-/mnt/agent-mesh}/agents"
+ALLOW_IN_USE=false
+REQUIRE_STATUS=""
+JSON_OUTPUT=false
+STALE_THRESHOLD=120   # seconds — older than this = OFFLINE
+DEAD_THRESHOLD=600    # seconds — older than this = definitely OFFLINE
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --allow-in-use)        ALLOW_IN_USE=true; shift ;;
+        --require-status)      REQUIRE_STATUS="$2"; shift 2 ;;
+        --json)                JSON_OUTPUT=true; shift ;;
+        *) echo "unknown flag: $1" >&2; exit 1 ;;
+    esac
+done
+
+now=$(date +%s)
+BEST_AGENT=""
+BEST_SCORE=0
+BEST_STATUS=""
+BEST_TASK=""
+BEST_TS=""
+
+for agent_dir in "$POOL_DIR"/residential-*/; do
+    [[ -d "$agent_dir" ]] || continue
+    agent_name=$(basename "$agent_dir")
+    hb="$agent_dir/status/heartbeat.txt"
+
+    # heartbeat must exist
+    [[ -f "$hb" ]] || continue
+
+    # check mtime freshness
+    mtime=$(stat -c %Y "$hb" 2>/dev/null || echo 0)
+    age=$(( now - mtime ))
+
+    if (( age >= DEAD_THRESHOLD )); then
+        continue  # OFFLINE — don't bother reading file
+    fi
+
+    # read node_status field (v2.1.0 extended format)
+    node_status=$(grep "^node_status:" "$hb" 2>/dev/null | awk '{print $2}' | tr -d '[:space:]')
+    active_task=$(grep "^active_task_id:" "$hb" 2>/dev/null | awk '{print $2}' | tr -d '[:space:]')
+    ts=$(grep "^timestamp:" "$hb" 2>/dev/null | awk '{print $2}' | tr -d '[:space:]')
+
+    # if no node_status field (v2.0.x heartbeat), infer from mtime
+    if [[ -z "$node_status" ]]; then
+        node_status=$( (( age < STALE_THRESHOLD )) && echo "available" || echo "offline" )
+        active_task="null"
+    fi
+
+    # apply status filter
+    if [[ -n "$REQUIRE_STATUS" ]]; then
+        [[ "$node_status" == "$REQUIRE_STATUS" ]] || continue
+    else
+        case "$node_status" in
+            available) ;;
+            in_use)
+                $ALLOW_IN_USE || continue
+                ;;
+            *)
+                continue  # busy, offline, scheduled — skip
+                ;;
+        esac
+    fi
+
+    # stale check (even if node_status says available, old heartbeat = offline)
+    (( age < STALE_THRESHOLD )) || continue
+
+    # schedule conflict check — skip if a task is booked within the next 5 minutes
+    schedule_file="$agent_dir/status/schedule.json"
+    if [[ -f "$schedule_file" ]]; then
+        window_start=$(python3 -c "
+import json, sys, datetime as dt
+try:
+    data = json.load(open('$schedule_file'))
+    now_ts = dt.datetime.now(dt.timezone.utc)
+    for entry in data.get('schedule', []):
+        start_str = entry.get('start', '')
+        try:
+            start = dt.datetime.fromisoformat(start_str.replace('Z','+00:00'))
+        except Exception:
+            continue
+        gap = (start - now_ts).total_seconds()
+        if -300 < gap < 300:  # within 5-min window
+            vis = entry.get('visibility', 'foreground')
+            if vis == 'foreground':
+                sys.stdout.write('BLOCKED:' + entry.get('task_id','?'))
+                sys.exit(0)
+    sys.stdout.write('OK')
+except Exception:
+    sys.stdout.write('OK')
+" 2>/dev/null || echo "OK")
+        [[ "$window_start" == BLOCKED:* ]] && continue
+    fi
+
+    # score by recency (fresher = higher)
+    score=$(( STALE_THRESHOLD - age ))
+    if (( score > BEST_SCORE )); then
+        BEST_SCORE=$score
+        BEST_AGENT="${agent_name}@mesh"
+        BEST_STATUS="$node_status"
+        BEST_TASK="${active_task:-null}"
+        BEST_TS="${ts:-}"
+    fi
+done
+
+if [[ -z "$BEST_AGENT" ]]; then
+    if $JSON_OUTPUT; then
+        echo '{"agent":"none","status":"offline","reason":"no available residential node"}'
+    else
+        echo "none"
+    fi
+    exit 1
+fi
+
+if $JSON_OUTPUT; then
+    printf '{"agent":"%s","status":"%s","active_task":"%s","heartbeat_ts":"%s","age_sec":%d}\n' \
+        "$BEST_AGENT" "$BEST_STATUS" "$BEST_TASK" "$BEST_TS" "$(( now - BEST_SCORE + STALE_THRESHOLD ))" \
+        2>/dev/null || echo "{\"agent\":\"$BEST_AGENT\",\"status\":\"$BEST_STATUS\"}"
+else
+    echo "$BEST_AGENT"
+fi
+exit 0

@@ -1,0 +1,414 @@
+#!/usr/bin/env python3
+"""mesh-send — write a file to a peer agent's inbox over the JamBot agent mesh.
+
+Implements PROTOCOL.md v2.0.0 §§3-7, 9. Atomic mkdir-claim slot allocation
+(§5), auto-computed SIZE (§4), cc fanout via /mesh/cc/ rw overlay (§7),
+urgent rate limit (§9), sent/ mirror + cc writes.
+
+Stdlib-only. Intended for Python 3.8+ (matches tenant webtop + host).
+
+Env:
+    AGENT_URI    required, e.g. host@mesh, bun-desktop@mesh
+    MESH_ROOT    optional, default /mnt/agent-mesh (host) or autodetect /mesh
+                 and /agent-desk if running inside a tenant.
+
+Usage:
+    echo "body" | mesh-send --to <peer>@mesh --kind <KIND> --subject <topic>
+                            [--replies-to <prior-filename>]
+                            [--cc <peer>@mesh ...]
+                            [--urgent]
+                            [--state-check "<text>"]
+                            [--speaking-as <voice>]
+                            [--thread <slug>]
+                            [--promoted-to <slug>]
+
+Exit codes:
+    0  success
+    1  generic failure
+    2  rate-limit hit (urgent 1/hr)
+    3  validation failure (unknown kind, missing AGENT_URI, etc.)
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# KIND enum + size caps (PROTOCOL §9)
+# ---------------------------------------------------------------------------
+KIND_CAPS_BYTES = {
+    "ping": 200,
+    "message": None,
+    "rfc": None,
+    "decision": None,
+    "announcement": None,
+    "ack": 200,                # urgent-ack carve-out extends this to 500
+    "question": 1024,
+    "urgent": 500,
+    "attachment": None,
+    "quarantine": None,
+    "thread-stub": 200,
+}
+
+SIZE_TIERS = [
+    ("micro", 200),
+    ("short", 2048),
+    ("medium", 10240),
+]
+# anything larger is "long"
+
+SLUG_MAX = 60  # filename topic segment upper bound
+
+# ---------------------------------------------------------------------------
+# Mesh root discovery
+# ---------------------------------------------------------------------------
+def discover_mesh_root() -> tuple[Path, Path, Path]:
+    """Return (mesh_dir, agents_dir, my_agent_dir).
+
+    On host:      /mnt/agent-mesh/{mesh,agents/<self>}
+    In container: /mesh + /agent-desk  (bind-mounted from host paths)
+
+    MESH_ROOT env var overrides detection.
+    """
+    override = os.environ.get("MESH_ROOT")
+    if override:
+        root = Path(override)
+        return root / "mesh", root / "agents", root / "agents" / agent_name()
+
+    # container topology
+    if Path("/agent-desk").is_dir() and Path("/mesh").is_dir():
+        mesh = Path("/mesh")
+        # /agent-desk is the per-agent rw mount; agents/ is not directly visible
+        # but peer inboxes are reached via the explicit per-pair mounts if any.
+        return mesh, Path("/agent-mesh-agents-unavailable"), Path("/agent-desk")
+
+    # host topology
+    if Path("/mnt/agent-mesh").is_dir():
+        root = Path("/mnt/agent-mesh")
+        return root / "mesh", root / "agents", root / "agents" / agent_name()
+
+    die("cannot discover mesh root — set MESH_ROOT or run on host/container with /agent-desk")
+
+
+def agent_name() -> str:
+    uri = os.environ.get("AGENT_URI")
+    if not uri:
+        die("AGENT_URI env var required (e.g. AGENT_URI=host@mesh)")
+    if not uri.endswith("@mesh"):
+        die(f"AGENT_URI must end with @mesh, got: {uri}")
+    name = uri[:-len("@mesh")]
+    if not re.fullmatch(r"[a-z0-9][a-z0-9\-]*", name):
+        die(f"AGENT_URI agent name must be kebab-case, got: {name}")
+    return name
+
+
+def die(msg: str, code: int = 3) -> None:
+    print(f"mesh-send: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+# ---------------------------------------------------------------------------
+# Slot claim (PROTOCOL §5)
+# ---------------------------------------------------------------------------
+def sweep_stale_claims(inbox: Path) -> None:
+    """Remove .claim dirs older than 60s."""
+    if not inbox.is_dir():
+        return
+    cutoff = time.time() - 60
+    for entry in inbox.iterdir():
+        if entry.is_dir() and entry.name.endswith(".claim"):
+            try:
+                if entry.stat().st_mtime < cutoff:
+                    entry.rmdir()
+            except OSError:
+                pass
+
+
+def find_start_seq(inbox: Path, date: str) -> int:
+    """Return first seq num to try (max existing + 1, or 1)."""
+    if not inbox.is_dir():
+        return 1
+    prefix_re = re.compile(rf"^{re.escape(date)}-(\d{{3}})-")
+    maxn = 0
+    for entry in inbox.iterdir():
+        m = prefix_re.match(entry.name)
+        if m:
+            maxn = max(maxn, int(m.group(1)))
+    return maxn + 1 if maxn else 1
+
+
+def claim_slot(inbox: Path, sender: str, topic: str) -> tuple[str, Path]:
+    """Atomically reserve a slot. Returns (basename, final_md_path).
+
+    Caller is responsible for writing the .md file and then calling
+    release_claim() to remove the .claim sentinel.
+    """
+    sweep_stale_claims(inbox)
+    date = _dt.datetime.utcnow().strftime("%Y-%m-%d")
+    start = find_start_seq(inbox, date)
+
+    def _try_range(rng):
+        for n in rng:
+            slot = f"{date}-{n:03d}-{sender}-{topic}"
+            claim = inbox / f"{slot}.claim"
+            try:
+                claim.mkdir(mode=0o755)
+                return slot, inbox / f"{slot}.md", claim
+            except FileExistsError:
+                continue
+        return None
+
+    result = _try_range(range(start, 1000))
+    if result is None:
+        # race fallthrough — try from 1
+        result = _try_range(range(1, start))
+    if result is None:
+        die("no free slot in 999 tries", code=1)
+    return result  # type: ignore[return-value]
+
+
+def release_claim(claim: Path) -> None:
+    try:
+        claim.rmdir()
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Urgent rate limit (PROTOCOL §9)
+# ---------------------------------------------------------------------------
+def check_urgent_rate_limit(sent_dir: Path) -> None:
+    """Die with exit 2 if an urgent was sent <1h ago (excluding ack-urgent)."""
+    if not sent_dir.is_dir():
+        return
+    cutoff = time.time() - 3600
+    for f in sent_dir.rglob("*.md"):
+        try:
+            st = f.stat()
+        except OSError:
+            continue
+        if st.st_mtime < cutoff:
+            continue
+        # cheap peek — read first 20 lines
+        try:
+            with f.open("r", encoding="utf-8", errors="replace") as fh:
+                head = "".join([next(fh, "") for _ in range(20)])
+        except OSError:
+            continue
+        if re.search(r"^KIND:\s*urgent\s*$", head, re.MULTILINE):
+            # ack-urgent carve-out: KIND ack + URGENT: true is exempt, so only
+            # bare "KIND: urgent" counts toward the limit.
+            die(f"urgent rate-limited: prior urgent at {f.name} ({int(time.time()-st.st_mtime)}s ago, limit 1/hr)", code=2)
+
+
+# ---------------------------------------------------------------------------
+# Body helpers
+# ---------------------------------------------------------------------------
+def compute_size_tier(nbytes: int) -> str:
+    for name, cap in SIZE_TIERS:
+        if nbytes <= cap:
+            return name
+    return "long"
+
+
+def validate_topic(topic: str) -> str:
+    if not topic:
+        die("--subject is required")
+    slug = re.sub(r"[^a-z0-9]+", "-", topic.lower()).strip("-")
+    if not slug:
+        die(f"--subject {topic!r} contains no kebab-safe characters")
+    if len(slug) > SLUG_MAX:
+        slug = slug[:SLUG_MAX].rstrip("-")
+    return slug
+
+
+# ---------------------------------------------------------------------------
+# Watchdog log
+# ---------------------------------------------------------------------------
+def log_drop(message: str) -> None:
+    """Best-effort append to the host watchdog log."""
+    for candidate in (
+        "/var/log/jambot-mesh-inotify.log",
+        "/config/workspace/mesh-events.log",
+    ):
+        try:
+            with open(candidate, "a", encoding="utf-8") as fh:
+                fh.write(message + "\n")
+            return
+        except OSError:
+            continue
+    # silent failure is fine — log is best-effort
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Write a file to a peer agent's inbox over the JamBot agent mesh.")
+    p.add_argument("--to", required=True, help="recipient URI, e.g. host@mesh")
+    p.add_argument("--kind", required=True, choices=sorted(KIND_CAPS_BYTES.keys()))
+    p.add_argument("--subject", required=True, help="kebab-case topic (becomes filename <topic> segment)")
+    p.add_argument("--replies-to", default=None, help="prior filename this replies to")
+    p.add_argument("--cc", action="append", default=[], help="cc recipient URI, repeatable")
+    p.add_argument("--urgent", action="store_true", help="add URGENT: true frontmatter (required for KIND urgent; carve-out for KIND ack)")
+    p.add_argument("--state-check", default=None, help="STATE_CHECK frontmatter (forensic snapshot text)")
+    p.add_argument("--speaking-as", default=None, help="SPEAKING_AS frontmatter")
+    p.add_argument("--thread", default=None, help="THREAD frontmatter (threads/<slug>)")
+    p.add_argument("--promoted-to", default=None, help="PROMOTED_TO frontmatter (for thread-stub)")
+    p.add_argument("--end-of-turn", default=None, help="END-OF-TURN frontmatter; defaults to '<to> — reply expected'")
+    p.add_argument("--dry-run", action="store_true", help="show what would be written without writing")
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    sender = agent_name()
+    mesh_dir, agents_dir, my_dir = discover_mesh_root()
+
+    # ---- validate recipient ----
+    recipient_uri: str = args.to
+    if not recipient_uri.endswith("@mesh"):
+        die(f"--to must end with @mesh, got: {recipient_uri}")
+    recipient = recipient_uri[:-len("@mesh")]
+    if not re.fullmatch(r"[a-z0-9][a-z0-9\-]*", recipient):
+        die(f"recipient agent name must be kebab-case, got: {recipient}")
+
+    # ---- validate cc ----
+    ccs: list[str] = []
+    for cc_uri in args.cc:
+        if not cc_uri.endswith("@mesh"):
+            die(f"--cc must end with @mesh, got: {cc_uri}")
+        cc_name = cc_uri[:-len("@mesh")]
+        if not re.fullmatch(r"[a-z0-9][a-z0-9\-]*", cc_name):
+            die(f"cc agent name must be kebab-case, got: {cc_name}")
+        ccs.append(cc_name)
+
+    # ---- body + size ----
+    body = sys.stdin.read()
+    body_bytes = body.encode("utf-8")
+    size_tier = compute_size_tier(len(body_bytes))
+    cap = KIND_CAPS_BYTES.get(args.kind)
+
+    # urgent-ack carve-out: KIND ack + --urgent lifts the cap to 500B
+    if args.kind == "ack" and args.urgent:
+        cap = 500
+
+    if cap is not None and len(body_bytes) > cap:
+        die(f"body is {len(body_bytes)}B, exceeds {args.kind} cap {cap}B (PROTOCOL §9)")
+
+    if args.kind == "urgent" and not args.urgent:
+        # allow --kind urgent to auto-imply URGENT: true
+        args.urgent = True
+
+    # ---- urgent rate limit ----
+    sent_dir = my_dir / "sent"
+    if args.kind == "urgent":
+        check_urgent_rate_limit(sent_dir)
+    # KIND: ack with URGENT: true explicitly bypasses the check
+
+    # ---- resolve inbox + topic ----
+    topic = validate_topic(args.subject)
+
+    # In container topology, peer inbox is only reachable if an explicit
+    # per-pair bind-mount exists. We probe by trying /agent-mesh-inbox-<peer>/
+    # first (convention), else /mnt/agent-mesh/agents/<peer>/inbox/.
+    candidate_inboxes = []
+    if recipient == sender:
+        candidate_inboxes.append(my_dir / "inbox")  # self-send allowed
+    else:
+        if agents_dir.name != "agent-mesh-agents-unavailable":
+            candidate_inboxes.append(agents_dir / recipient / "inbox")
+        # container cross-peer convention:
+        candidate_inboxes.append(Path(f"/peer-inbox/{recipient}"))
+
+    inbox = None
+    for c in candidate_inboxes:
+        if c.is_dir():
+            inbox = c
+            break
+    if inbox is None:
+        die(
+            f"recipient inbox not found. Tried: {', '.join(str(c) for c in candidate_inboxes)}. "
+            "Cross-peer writes require an explicit per-pair bind-mount (PROTOCOL §2)."
+        )
+
+    # ---- claim slot ----
+    slot, md_path, claim = claim_slot(inbox, sender, topic)
+
+    # ---- assemble frontmatter ----
+    readers = [recipient_uri] + [f"{cc}@mesh" for cc in ccs]
+    end_of_turn = args.end_of_turn or f"{recipient_uri} — reply expected"
+    fm_lines = [
+        "---",
+        f"KIND: {args.kind}",
+        f"AUTHOR: {sender}@mesh",
+        f"READERS: [{', '.join(readers)}]",
+        f"REPLIES-TO: {args.replies_to if args.replies_to else 'null'}",
+        f"SIZE: {size_tier}",
+        f"END-OF-TURN: {end_of_turn}",
+    ]
+    if args.state_check is not None:
+        fm_lines.append(f"STATE_CHECK: {args.state_check}")
+    if args.speaking_as:
+        fm_lines.append(f"SPEAKING_AS: {args.speaking_as}")
+    if args.thread:
+        fm_lines.append(f"THREAD: {args.thread}")
+    if args.promoted_to:
+        fm_lines.append(f"PROMOTED_TO: {args.promoted_to}")
+    if args.urgent:
+        fm_lines.append("URGENT: true")
+    fm_lines.append("---")
+    fm_lines.append("")
+    content = "\n".join(fm_lines) + body
+    if not content.endswith("\n"):
+        content += "\n"
+
+    # ---- dry-run early exit ----
+    if args.dry_run:
+        release_claim(claim)
+        print(f"dry-run: would write {md_path}")
+        print(f"dry-run: size-tier {size_tier} ({len(body_bytes)}B)")
+        print(f"dry-run: readers {readers}")
+        if ccs:
+            for cc in ccs:
+                cc_path = mesh_dir / "cc" / cc / f"{slot}.md"
+                print(f"dry-run: would cc to {cc_path}")
+        return
+
+    # ---- write primary ----
+    try:
+        md_path.write_text(content, encoding="utf-8")
+        # sent/ mirror (keeps audit record + powers AUTHOR validation + RECENT.md)
+        if sent_dir.is_dir():
+            sent_path = sent_dir / f"{slot}.md"
+            try:
+                sent_path.write_text(content, encoding="utf-8")
+            except OSError as e:
+                print(f"mesh-send: warning: could not mirror to sent/: {e}", file=sys.stderr)
+        # cc fanout — via the rw /mesh/cc/ overlay
+        for cc in ccs:
+            cc_dir = mesh_dir / "cc" / cc
+            try:
+                cc_dir.mkdir(parents=True, exist_ok=True)
+                (cc_dir / f"{slot}.md").write_text(content, encoding="utf-8")
+            except OSError as e:
+                print(f"mesh-send: warning: could not cc to {cc}: {e}", file=sys.stderr)
+    finally:
+        release_claim(claim)
+
+    # ---- log drop ----
+    ts = _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    log_drop(f"# MESH-SEND {ts} sender={sender} to={recipient} kind={args.kind} file={slot}.md")
+
+    print(str(md_path))
+
+
+if __name__ == "__main__":
+    main()

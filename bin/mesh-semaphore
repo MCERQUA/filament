@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# mesh-semaphore — acquire, release, or check a named mutex in mesh/SEMAPHORES/
+#
+# Implements PROTOCOL.md v2.1.0 §18 semaphore pattern.
+# Atomic acquire uses mkdir sentinel (race-safe, same pattern as inbox slot claim).
+#
+# Usage:
+#   mesh-semaphore acquire <name>    acquire lock; exits 0 on success, 1 if busy
+#   mesh-semaphore release <name>    release lock held by this agent
+#   mesh-semaphore status <name>     print current holder, or "(free)"
+#   mesh-semaphore force-release <name>  release lock regardless of holder (admin use)
+#
+# Env:
+#   AGENT_URI   required (e.g. bun-desktop@mesh)
+#   MESH_ROOT   optional
+
+set -euo pipefail
+
+die() { echo "mesh-semaphore: $*" >&2; exit 3; }
+
+# ---- mesh root ----
+discover_mesh() {
+    if [[ -n "${MESH_ROOT:-}" ]]; then
+        echo "${MESH_ROOT}/mesh"
+    elif [[ -d "/mesh" ]]; then
+        echo "/mesh"
+    elif [[ -d "/mnt/agent-mesh" ]]; then
+        echo "/mnt/agent-mesh/mesh"
+    else
+        die "cannot discover mesh root — set MESH_ROOT or run on host/container with /mesh"
+    fi
+}
+
+MESH_DIR=$(discover_mesh)
+SEM_DIR="${MESH_DIR}/SEMAPHORES"
+mkdir -p "$SEM_DIR"
+
+[[ -z "${AGENT_URI:-}" ]] && die "AGENT_URI env var required (e.g. AGENT_URI=bun-desktop@mesh)"
+AGENT_NAME="${AGENT_URI%@mesh}"
+
+CMD="${1:-}"
+NAME="${2:-}"
+[[ -z "$CMD" || -z "$NAME" ]] && die "usage: mesh-semaphore <acquire|release|status|force-release> <name>"
+
+LOCK_FILE="${SEM_DIR}/${NAME}.lock"
+SENTINEL="${SEM_DIR}/${NAME}.lock.claim"
+
+cmd_acquire() {
+    if mkdir "$SENTINEL" 2>/dev/null; then
+        # Won the race — write lock file
+        {
+            echo "HOLDER: ${AGENT_URI}"
+            echo "ACQUIRED_AT: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        } > "$LOCK_FILE"
+        rmdir "$SENTINEL"
+        echo "acquired: ${NAME}"
+        exit 0
+    else
+        # Check who holds it
+        if [[ -f "$LOCK_FILE" ]]; then
+            HOLDER=$(grep "^HOLDER:" "$LOCK_FILE" 2>/dev/null | awk '{print $2}')
+            echo "mesh-semaphore: busy — held by ${HOLDER:-unknown}" >&2
+        else
+            echo "mesh-semaphore: busy (sentinel exists, no lock file yet)" >&2
+        fi
+        exit 1
+    fi
+}
+
+cmd_release() {
+    if [[ ! -f "$LOCK_FILE" ]]; then
+        echo "mesh-semaphore: '${NAME}' is not locked" >&2
+        exit 1
+    fi
+    HOLDER=$(grep "^HOLDER:" "$LOCK_FILE" 2>/dev/null | awk '{print $2}')
+    if [[ "$HOLDER" != "$AGENT_URI" ]]; then
+        die "cannot release '${NAME}' — held by ${HOLDER}, not ${AGENT_URI}. Use force-release if needed."
+    fi
+    rm -f "$LOCK_FILE"
+    rmdir "$SENTINEL" 2>/dev/null || true
+    echo "released: ${NAME}"
+}
+
+cmd_status() {
+    if [[ -f "$LOCK_FILE" ]]; then
+        cat "$LOCK_FILE"
+    elif [[ -d "$SENTINEL" ]]; then
+        echo "(claim sentinel exists — acquire in progress)"
+    else
+        echo "(free)"
+    fi
+}
+
+cmd_force_release() {
+    if [[ -f "$LOCK_FILE" ]]; then
+        HOLDER=$(grep "^HOLDER:" "$LOCK_FILE" 2>/dev/null | awk '{print $2}')
+        rm -f "$LOCK_FILE"
+        rmdir "$SENTINEL" 2>/dev/null || true
+        echo "force-released: ${NAME} (was held by ${HOLDER:-unknown})"
+    else
+        rmdir "$SENTINEL" 2>/dev/null || true
+        echo "force-released: ${NAME} (no lock file found)"
+    fi
+}
+
+case "$CMD" in
+    acquire)       cmd_acquire ;;
+    release)       cmd_release ;;
+    status)        cmd_status ;;
+    force-release) cmd_force_release ;;
+    *) die "unknown subcommand '${CMD}'. Use: acquire|release|status|force-release" ;;
+esac

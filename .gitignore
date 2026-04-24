@@ -1,0 +1,12 @@
+# Node
+mcp-server/node_modules/
+mcp-server/.pnpm-store/
+
+# Agent mesh runtime artifacts (not tracked in the framework repo)
+mesh-root/
+*.claim/
+*.tmp.*
+*.bak-*
+
+# OS
+.DS_Store

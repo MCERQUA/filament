@@ -1,0 +1,468 @@
+#!/usr/bin/env python3
+"""mesh-event — lightweight pub/sub over the JamBot agent mesh.
+
+Implements PROTOCOL.md v2.1.0 §17 event routing.
+
+Events live in mesh/EVENTS/<topic>/ with:
+  event-<id>.md   — published event (frontmatter + body)
+  subscribers/    — one file per subscribed agent (name = agent stem, contents = subscription metadata)
+  .processed/<agent>/  — per-agent processed event pointers (symlink or empty sentinel)
+
+Stdlib-only. Python 3.8+.
+
+Env:
+    AGENT_URI    required
+    MESH_ROOT    optional
+
+Subcommands:
+    publish <topic> [--body "<text>"|--body-file <path>] [--ttl <seconds>]
+                        publish an event to a topic; delivers to all active subscribers
+
+    subscribe <topic> [--since-id <event-id>]
+                        subscribe to a topic (idempotent)
+
+    unsubscribe <topic>
+                        remove this agent's subscription
+
+    list-subscribers <topic>
+                        list agents subscribed to a topic
+
+    poll <topic> [--since-id <event-id>] [--limit <n>]
+                        print unprocessed events for this agent (oldest first)
+                        marks them processed on stdout flush
+
+    topics [--filter <prefix>]
+                        list all active topics
+
+    gc [--dry-run]
+                        remove expired events (respects TTL frontmatter)
+
+Exit codes:
+    0  success
+    1  not found / no events
+    3  usage error
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import json
+import os
+import re
+import sys
+import uuid
+from pathlib import Path
+
+
+def die(msg: str, code: int = 3) -> None:
+    print(f"mesh-event: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def agent_uri() -> str:
+    uri = os.environ.get("AGENT_URI", "")
+    if not uri.endswith("@mesh"):
+        die("AGENT_URI env var required (e.g. AGENT_URI=host@mesh)")
+    return uri
+
+
+def agent_name() -> str:
+    return agent_uri()[:-len("@mesh")]
+
+
+def discover_paths() -> tuple[Path, Path]:
+    """Return (mesh_dir, agents_dir)."""
+    override = os.environ.get("MESH_ROOT")
+    if override:
+        root = Path(override)
+        return root / "mesh", root / "agents"
+    if Path("/mesh").is_dir():
+        return Path("/mesh"), Path("/mnt/agent-mesh/agents")
+    if Path("/mnt/agent-mesh").is_dir():
+        root = Path("/mnt/agent-mesh")
+        return root / "mesh", root / "agents"
+    die("cannot discover mesh root — set MESH_ROOT or run on host/container with /mesh")
+
+
+def now_ts() -> str:
+    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def events_dir(mesh: Path, topic: str) -> Path:
+    d = mesh / "EVENTS" / _slugify(topic)
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _slugify(s: str) -> str:
+    return re.sub(r"[^a-z0-9\-]+", "-", s.lower()).strip("-")
+
+
+def new_event_id() -> str:
+    return "ev-" + uuid.uuid4().hex[:8]
+
+
+def load_frontmatter(path: Path) -> dict:
+    """Parse YAML-ish frontmatter (key: value pairs between --- markers)."""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    lines = text.split("\n")
+    if not lines or lines[0].strip() != "---":
+        return {}
+    fm: dict = {}
+    for line in lines[1:]:
+        if line.strip() == "---":
+            break
+        if ":" in line:
+            k, _, v = line.partition(":")
+            fm[k.strip()] = v.strip()
+    return fm
+
+
+def event_body(path: Path) -> str:
+    """Return body content after the closing --- of frontmatter."""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    parts = text.split("---\n", 2)
+    return parts[2] if len(parts) >= 3 else text
+
+
+# ── subcommands ───────────────────────────────────────────────────────────────
+
+def cmd_publish(args: argparse.Namespace) -> None:
+    mesh_dir, agents_dir = discover_paths()
+    topic_dir = events_dir(mesh_dir, args.topic)
+    me = agent_uri()
+    me_name = agent_name()
+    event_id = new_event_id()
+    ts = now_ts()
+
+    # Body
+    if args.body_file:
+        body = Path(args.body_file).read_text(encoding="utf-8")
+    elif args.body:
+        body = args.body
+    else:
+        body = sys.stdin.read()
+
+    if not body.strip():
+        die("event body cannot be empty (use --body, --body-file, or stdin)")
+
+    ttl = args.ttl or ""
+    expires = ""
+    if ttl:
+        try:
+            exp_dt = _dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(seconds=int(ttl))
+            expires = exp_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            die(f"--ttl must be integer seconds, got: {ttl!r}")
+
+    # Get current subscribers
+    subs_dir = topic_dir / "subscribers"
+    subs_dir.mkdir(exist_ok=True)
+    subscribers = [f.stem for f in subs_dir.iterdir() if f.is_file()]
+
+    # Write event file atomically
+    fm_lines = [
+        "---",
+        f"KIND: event",
+        f"EVENT_ID: {event_id}",
+        f"TOPIC: {args.topic}",
+        f"AUTHOR: {me}",
+        f"PUBLISHED_AT: {ts}",
+        f"SUBSCRIBER_COUNT: {len(subscribers)}",
+    ]
+    if expires:
+        fm_lines.append(f"EXPIRES_AT: {expires}")
+        fm_lines.append(f"TTL_SECONDS: {ttl}")
+    fm_lines.append("---")
+    fm_lines.append("")
+
+    content = "\n".join(fm_lines) + body
+    if not content.endswith("\n"):
+        content += "\n"
+
+    event_path = topic_dir / f"{event_id}.md"
+    tmp = event_path.with_suffix(".tmp")
+    tmp.write_text(content, encoding="utf-8")
+    tmp.rename(event_path)
+
+    # Deliver to each subscriber's inbox (create KIND: announcement)
+    delivered = 0
+    for sub_name in subscribers:
+        if sub_name == me_name:
+            continue  # don't deliver to self
+        inbox = agents_dir / sub_name / "inbox"
+        if not inbox.is_dir():
+            continue
+
+        # Slot allocation
+        date = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d")
+        prefix_re = re.compile(rf"^{re.escape(date)}-(\d{{3}})-")
+        maxn = max(
+            (int(m.group(1)) for f in inbox.iterdir()
+             if (m := prefix_re.match(f.name))),
+            default=0
+        )
+        topic_slug = _slugify(args.topic)
+        slot = f"{date}-{maxn+1:03d}-event-{topic_slug}-{event_id}"
+        notify_path = inbox / f"{slot}.md"
+
+        notify_content = (
+            f"---\nKIND: announcement\nAUTHOR: {me}\nREADERS: [{sub_name}@mesh]\n"
+            f"REPLIES-TO: null\nSIZE: short\nEVENT_ID: {event_id}\nTOPIC: {args.topic}\n"
+            f"END-OF-TURN: {sub_name}@mesh — event notification\n---\n\n"
+            f"# Event: {args.topic}\n\n"
+            f"**ID:** {event_id}  \n"
+            f"**Published:** {ts} by {me}\n\n"
+            f"Poll with: `mesh-event poll {args.topic} --since-id {event_id}`\n\n"
+            f"---\n{body}"
+        )
+        try:
+            notify_path.write_text(notify_content, encoding="utf-8")
+            delivered += 1
+        except OSError as e:
+            print(f"mesh-event: warning: could not notify {sub_name}: {e}", file=sys.stderr)
+
+    print(f"{event_id}")
+    print(f"Published to topic '{args.topic}' — notified {delivered}/{len(subscribers)} subscribers",
+          file=sys.stderr)
+
+
+def cmd_subscribe(args: argparse.Namespace) -> None:
+    mesh_dir, _ = discover_paths()
+    topic_dir = events_dir(mesh_dir, args.topic)
+    subs_dir = topic_dir / "subscribers"
+    subs_dir.mkdir(exist_ok=True)
+
+    me = agent_name()
+    sub_file = subs_dir / me
+    ts = now_ts()
+    since_id = args.since_id or ""
+
+    sub_data = json.dumps({
+        "agent": f"{me}@mesh",
+        "subscribed_at": ts,
+        "since_id": since_id,
+    }, indent=2)
+    sub_file.write_text(sub_data, encoding="utf-8")
+    print(f"Subscribed {me}@mesh to topic '{args.topic}'")
+
+
+def cmd_unsubscribe(args: argparse.Namespace) -> None:
+    mesh_dir, _ = discover_paths()
+    topic_dir = events_dir(mesh_dir, args.topic)
+    subs_dir = topic_dir / "subscribers"
+    me = agent_name()
+    sub_file = subs_dir / me
+
+    if not sub_file.exists():
+        die(f"{me}@mesh is not subscribed to '{args.topic}'", code=1)
+
+    sub_file.rename(sub_file.with_suffix(".unsubscribed"))
+    print(f"Unsubscribed {me}@mesh from topic '{args.topic}'")
+
+
+def cmd_list_subscribers(args: argparse.Namespace) -> None:
+    mesh_dir, _ = discover_paths()
+    topic_dir = events_dir(mesh_dir, args.topic)
+    subs_dir = topic_dir / "subscribers"
+
+    if not subs_dir.exists():
+        print(f"(no subscribers for topic '{args.topic}')")
+        return
+
+    found = False
+    for f in sorted(subs_dir.iterdir()):
+        if f.is_file() and not f.name.endswith(".unsubscribed"):
+            try:
+                data = json.loads(f.read_text())
+                print(f"  {data.get('agent', f.stem+'@mesh')}  (since {data.get('subscribed_at', '?')})")
+                found = True
+            except Exception:
+                print(f"  {f.stem}@mesh")
+                found = True
+
+    if not found:
+        print(f"(no active subscribers for topic '{args.topic}')")
+
+
+def cmd_poll(args: argparse.Namespace) -> None:
+    """Print unprocessed events for this agent, oldest first."""
+    mesh_dir, _ = discover_paths()
+    topic_dir = events_dir(mesh_dir, args.topic)
+    me = agent_name()
+
+    # Processed sentinels live in topic_dir/.processed/<agent>/
+    processed_dir = topic_dir / ".processed" / me
+    processed_dir.mkdir(parents=True, exist_ok=True)
+
+    # Collect events, sort by event_id (ev-<hex> — UUID4 ordering isn't guaranteed
+    # but creation time ordering works because we list by name which includes the ID)
+    events = sorted(
+        [f for f in topic_dir.iterdir() if f.name.startswith("ev-") and f.suffix == ".md"],
+        key=lambda f: f.name
+    )
+
+    since_id = args.since_id or ""
+    limit = args.limit or 50
+    printed = 0
+
+    for ev_path in events:
+        ev_id = ev_path.stem
+
+        # Skip if already processed
+        if (processed_dir / ev_id).exists():
+            continue
+
+        # Skip if before since_id
+        if since_id and ev_id <= since_id:
+            continue
+
+        fm = load_frontmatter(ev_path)
+
+        # Check TTL
+        expires = fm.get("EXPIRES_AT", "")
+        if expires:
+            try:
+                exp_dt = _dt.datetime.strptime(expires, "%Y-%m-%dT%H:%M:%SZ").replace(
+                    tzinfo=_dt.timezone.utc)
+                if _dt.datetime.now(_dt.timezone.utc) > exp_dt:
+                    # Expired — mark processed + skip
+                    (processed_dir / ev_id).touch()
+                    continue
+            except ValueError:
+                pass
+
+        body = event_body(ev_path)
+        pub = fm.get("PUBLISHED_AT", "?")
+        author = fm.get("AUTHOR", "?")
+
+        print(f"## {ev_id}  [{pub}] from {author}")
+        print(body)
+        if not body.endswith("\n"):
+            print()
+
+        # Mark processed
+        (processed_dir / ev_id).touch()
+
+        printed += 1
+        if printed >= limit:
+            break
+
+    if printed == 0:
+        print(f"(no new events on topic '{args.topic}' for {me}@mesh)")
+        sys.exit(1)
+
+
+def cmd_topics(args: argparse.Namespace) -> None:
+    mesh_dir, _ = discover_paths()
+    events_root = mesh_dir / "EVENTS"
+    if not events_root.is_dir():
+        print("(no topics yet)")
+        return
+
+    prefix = _slugify(args.filter) if args.filter else ""
+    found = False
+    for topic_dir in sorted(events_root.iterdir()):
+        if not topic_dir.is_dir():
+            continue
+        name = topic_dir.name
+        if prefix and not name.startswith(prefix):
+            continue
+
+        ev_count = len([f for f in topic_dir.iterdir()
+                        if f.name.startswith("ev-") and f.suffix == ".md"])
+        subs_dir = topic_dir / "subscribers"
+        sub_count = len([f for f in subs_dir.iterdir()
+                         if f.is_file() and not f.name.endswith(".unsubscribed")]) \
+            if subs_dir.exists() else 0
+
+        print(f"  {name:40s}  {ev_count:4d} events  {sub_count:3d} subscribers")
+        found = True
+
+    if not found:
+        print("(no matching topics)")
+
+
+def cmd_gc(args: argparse.Namespace) -> None:
+    mesh_dir, _ = discover_paths()
+    events_root = mesh_dir / "EVENTS"
+    if not events_root.is_dir():
+        print("(no events to GC)")
+        return
+
+    now = _dt.datetime.now(_dt.timezone.utc)
+    removed = 0
+    checked = 0
+
+    for topic_dir in events_root.iterdir():
+        if not topic_dir.is_dir():
+            continue
+        for ev_path in topic_dir.iterdir():
+            if not (ev_path.name.startswith("ev-") and ev_path.suffix == ".md"):
+                continue
+            checked += 1
+            fm = load_frontmatter(ev_path)
+            expires = fm.get("EXPIRES_AT", "")
+            if not expires:
+                continue
+            try:
+                exp_dt = _dt.datetime.strptime(expires, "%Y-%m-%dT%H:%M:%SZ").replace(
+                    tzinfo=_dt.timezone.utc)
+            except ValueError:
+                continue
+            if now > exp_dt:
+                if args.dry_run:
+                    print(f"dry-run: would remove {ev_path}")
+                else:
+                    ev_path.rename(ev_path.with_suffix(".expired"))
+                removed += 1
+
+    action = "would remove" if args.dry_run else "removed"
+    print(f"GC: checked {checked} events, {action} {removed} expired")
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="Pub/sub events over the JamBot agent mesh.")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    pub = sub.add_parser("publish", help="publish an event to a topic")
+    pub.add_argument("topic")
+    pub.add_argument("--body", default=None)
+    pub.add_argument("--body-file", default=None)
+    pub.add_argument("--ttl", default=None, help="time-to-live in seconds")
+
+    ss = sub.add_parser("subscribe", help="subscribe this agent to a topic")
+    ss.add_argument("topic")
+    ss.add_argument("--since-id", default=None)
+
+    us = sub.add_parser("unsubscribe", help="unsubscribe this agent from a topic")
+    us.add_argument("topic")
+
+    ls = sub.add_parser("list-subscribers", help="list agents subscribed to a topic")
+    ls.add_argument("topic")
+
+    po = sub.add_parser("poll", help="print unprocessed events for this agent")
+    po.add_argument("topic")
+    po.add_argument("--since-id", default=None)
+    po.add_argument("--limit", type=int, default=50)
+
+    tp = sub.add_parser("topics", help="list all event topics")
+    tp.add_argument("--filter", default=None)
+
+    gc = sub.add_parser("gc", help="remove expired events")
+    gc.add_argument("--dry-run", action="store_true")
+
+    args = p.parse_args()
+    {
+        "publish": cmd_publish,
+        "subscribe": cmd_subscribe,
+        "unsubscribe": cmd_unsubscribe,
+        "list-subscribers": cmd_list_subscribers,
+        "poll": cmd_poll,
+        "topics": cmd_topics,
+        "gc": cmd_gc,
+    }[args.cmd](args)
+
+
+if __name__ == "__main__":
+    main()

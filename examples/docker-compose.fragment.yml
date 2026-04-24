@@ -1,0 +1,28 @@
+# Filament mesh bind-mount fragment
+# Paste into your existing container service definition.
+#
+# MESH_ROOT is where the mesh lives on the host (set in mesh-init.sh).
+# Replace <agent-name> with the agent provisioned via scripts/agent-add.sh.
+
+services:
+  my-container:
+    environment:
+      AGENT_URI: my-agent@mesh
+      MESH_ROOT: /opt/filament-mesh
+
+    volumes:
+      # Read-only view of all shared mesh state
+      - /opt/filament-mesh/mesh:/mesh:ro
+
+      # Read-write overlay for cc/ only (single write path into shared state)
+      - /opt/filament-mesh/mesh/cc:/mesh/cc:rw
+
+      # Own agent directory (inbox, sent, snapshots, desk)
+      - /opt/filament-mesh/agents/my-agent:/agent-desk:rw
+
+      # OPTIONAL: cross-peer inbox mounts (explicit per pair, default deny)
+      # - /opt/filament-mesh/agents/host/inbox:/peer-inbox/host:rw
+      # - /opt/filament-mesh/agents/other-agent/inbox:/peer-inbox/other-agent:rw
+
+      # OPTIONAL: HITL pending dir (if this agent handles HITL requests)
+      # - /opt/filament-mesh/hitl/pending:/hitl/pending:rw

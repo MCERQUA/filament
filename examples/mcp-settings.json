@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "filament-mesh": {
+      "command": "node",
+      "args": ["/path/to/filament/mcp-server/index.js"],
+      "env": {
+        "AGENT_URI": "my-agent@mesh",
+        "MESH_ROOT": "/opt/filament-mesh",
+        "MESH_BIN": "/usr/local/bin"
+      }
+    }
+  }
+}

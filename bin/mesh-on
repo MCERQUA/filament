@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""mesh-on — session-start ritual for the agent mesh.
+
+Sweeps stale .claim/ slots, re-reads /mesh/PROTOCOL.md version, prints the
+bootstrap sequence summary (PROTOCOL §14), and advertises the watchdog log
+for a caller to tail.
+
+Does NOT itself tail the log — the Claude Code "Monitor" tool (or `tail -F`)
+is the appropriate way to stream events. mesh-on reports the path and the
+last ack-marker so the tailer can resume from there.
+
+Stdlib-only.
+
+Env:
+    AGENT_URI    required
+    MESH_ROOT    optional
+
+Usage:
+    mesh-on                 # full bootstrap
+    mesh-on --quiet         # skip printing message contents, only counts
+    mesh-on --sweep-only    # only do the stale-claim sweep and exit
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import os
+import re
+import sys
+import time
+from pathlib import Path
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"mesh-on: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def agent_name() -> str:
+    uri = os.environ.get("AGENT_URI")
+    if not uri:
+        die("AGENT_URI env var required (e.g. AGENT_URI=host@mesh)")
+    if not uri.endswith("@mesh"):
+        die(f"AGENT_URI must end with @mesh, got: {uri}")
+    return uri[: -len("@mesh")]
+
+
+def discover_roots() -> tuple[Path, Path, Path]:
+    """Return (mesh_dir, my_dir, watchdog_log_path)."""
+    override = os.environ.get("MESH_ROOT")
+    if override:
+        root = Path(override)
+        return root / "mesh", root / "agents" / agent_name(), Path("/var/log/jambot-mesh-inotify.log")
+
+    if Path("/agent-desk").is_dir() and Path("/mesh").is_dir():
+        return Path("/mesh"), Path("/agent-desk"), Path("/config/workspace/mesh-events.log")
+
+    if Path("/mnt/agent-mesh").is_dir():
+        return (
+            Path("/mnt/agent-mesh/mesh"),
+            Path("/mnt/agent-mesh/agents") / agent_name(),
+            Path("/var/log/jambot-mesh-inotify.log"),
+        )
+
+    die("cannot discover mesh root — set MESH_ROOT")
+
+
+def sweep_stale_claims(root: Path) -> int:
+    """Recursively sweep stale .claim dirs older than 60s. Returns count."""
+    if not root.is_dir():
+        return 0
+    count = 0
+    cutoff = time.time() - 60
+    for entry in root.rglob("*.claim"):
+        if entry.is_dir():
+            try:
+                if entry.stat().st_mtime < cutoff:
+                    entry.rmdir()
+                    count += 1
+            except OSError:
+                pass
+    return count
+
+
+def read_protocol_version(mesh_dir: Path) -> tuple[str, float]:
+    protocol = mesh_dir / "PROTOCOL.md"
+    if not protocol.is_file():
+        return ("(missing)", 0.0)
+    mt = protocol.stat().st_mtime
+    version = "?"
+    try:
+        with protocol.open("r", encoding="utf-8") as fh:
+            for _ in range(15):
+                line = next(fh, "")
+                m = re.match(r"^version:\s*(\S+)", line)
+                if m:
+                    version = m.group(1)
+                    break
+    except OSError:
+        pass
+    return version, mt
+
+
+def find_last_ack_marker(log_path: Path) -> str | None:
+    if not log_path.is_file():
+        return None
+    try:
+        with log_path.open("r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return None
+    me = agent_name()
+    for line in reversed(lines):
+        if "# ACKED " in line and f"agent={me}" in line:
+            return line.strip()
+    return None
+
+
+def tail(path: Path, n: int) -> list[str]:
+    if not path.is_file():
+        return []
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return []
+    return lines[-n:]
+
+
+def list_inbox_summary(inbox: Path, quiet: bool) -> dict:
+    stats = {"unread": 0, "read": 0, "files": []}
+    if not inbox.is_dir():
+        return stats
+    for entry in inbox.iterdir():
+        if entry.is_file() and entry.suffix == ".md":
+            stats["unread"] += 1
+            stats["files"].append(entry.name)
+    read_dir = inbox / ".read"
+    if read_dir.is_dir():
+        for entry in read_dir.iterdir():
+            if entry.is_file() and entry.suffix == ".md":
+                stats["read"] += 1
+    return stats
+
+
+def main() -> None:
+    p = argparse.ArgumentParser()
+    p.add_argument("--quiet", action="store_true")
+    p.add_argument("--sweep-only", action="store_true")
+    args = p.parse_args()
+
+    mesh_dir, my_dir, log_path = discover_roots()
+
+    # ---- 1. Sweep stale claims ----
+    swept = sweep_stale_claims(my_dir)
+    swept += sweep_stale_claims(mesh_dir)
+    print(f"mesh-on: swept {swept} stale claim(s)")
+
+    if args.sweep_only:
+        return
+
+    # ---- 2. Protocol version ----
+    version, mt = read_protocol_version(mesh_dir)
+    mt_iso = _dt.datetime.utcfromtimestamp(mt).strftime("%Y-%m-%dT%H:%M:%SZ") if mt else "-"
+    print(f"mesh-on: PROTOCOL.md version {version} (mtime {mt_iso})")
+
+    # ---- 3. Inbox summary ----
+    inbox = my_dir / "inbox"
+    stats = list_inbox_summary(inbox, args.quiet)
+    print(f"mesh-on: {stats['unread']} unread / {stats['read']} acked in {inbox}")
+    if not args.quiet and stats["files"]:
+        for f in stats["files"][:10]:
+            print(f"    - {f}")
+        if len(stats["files"]) > 10:
+            print(f"    ... and {len(stats['files']) - 10} more")
+
+    # ---- 4. cc/<self>/ summary ----
+    cc_dir = mesh_dir / "cc" / agent_name()
+    cc_count = 0
+    if cc_dir.is_dir():
+        cc_count = sum(1 for e in cc_dir.iterdir() if e.is_file() and e.suffix == ".md")
+    print(f"mesh-on: {cc_count} cc'd in {cc_dir}")
+
+    # ---- 5. Registry peers ----
+    registry_file = mesh_dir / "REGISTRY.md"
+    peers = []
+    if registry_file.is_file():
+        try:
+            for line in registry_file.read_text(encoding="utf-8").splitlines():
+                m = re.match(r"^-\s+([a-z0-9][a-z0-9\-]*)\s*@\s*mesh", line)
+                if m:
+                    peers.append(m.group(1))
+        except OSError:
+            pass
+    # fall back to scanning REGISTRY/
+    if not peers:
+        reg_dir = mesh_dir / "REGISTRY"
+        if reg_dir.is_dir():
+            for entry in reg_dir.iterdir():
+                if entry.is_file() and entry.suffix == ".md":
+                    peers.append(entry.stem)
+    print(f"mesh-on: {len(peers)} peer(s) in REGISTRY: {', '.join(peers) if peers else '(none)'}")
+
+    # ---- 6. STATE_CHECK latest 5 ----
+    sc_dir = mesh_dir / "STATE_CHECK"
+    sc_latest: list[str] = []
+    if sc_dir.is_dir():
+        sc_entries = sorted([e.name for e in sc_dir.iterdir() if e.is_file() and e.suffix == ".md"])
+        sc_latest = sc_entries[-5:]
+    print(f"mesh-on: STATE_CHECK latest 5: {', '.join(sc_latest) if sc_latest else '(none)'}")
+
+    # ---- 7. Watchdog log + last ack-marker ----
+    print(f"mesh-on: watchdog log: {log_path}")
+    if log_path.is_file():
+        recent = tail(log_path, 5)
+        if recent and not args.quiet:
+            print("mesh-on: last 5 log lines:")
+            for line in recent:
+                print(f"    {line.rstrip()}")
+    last_ack = find_last_ack_marker(log_path)
+    if last_ack:
+        print(f"mesh-on: last ack-marker: {last_ack}")
+    else:
+        print("mesh-on: no prior ack-marker found for this agent — full replay recommended")
+
+    print(f"mesh comms armed — watching {log_path} — peers: {peers}")
+
+
+if __name__ == "__main__":
+    main()

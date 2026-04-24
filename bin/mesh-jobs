@@ -1,0 +1,306 @@
+#!/usr/bin/env python3
+"""mesh-jobs — manage background jobs in mesh/JOBS/
+
+Implements PROTOCOL.md v2.1.0 §18 background job tracking.
+Workers write job status files atomically (.tmp then mv).
+
+Stdlib-only. Python 3.8+.
+
+Env:
+    AGENT_URI    required
+    MESH_ROOT    optional
+
+Subcommands:
+    submit --command "<cmd>" [--description "<desc>"] [--duration "<est>"]
+                        register a new job, print job-id
+    list [--active|--failed|--archive]
+                        list jobs (default: active only)
+    show <job-id>       print full status file
+    update <job-id> --status <status> [--progress "<text>"]
+                        update a running job's status/progress
+    complete <job-id> [--result "<text>"]
+                        mark job completed, move to archive/
+    fail <job-id> [--reason "<text>"]
+                        mark job failed, move to failed/
+    cancel <job-id>     write cancellation signal (worker should detect + stop)
+
+Exit codes:
+    0  success
+    1  job not found
+    3  usage error
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import os
+import re
+import sys
+import uuid
+from pathlib import Path
+
+
+def die(msg: str, code: int = 3) -> None:
+    print(f"mesh-jobs: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def agent_name() -> str:
+    uri = os.environ.get("AGENT_URI", "")
+    if not uri.endswith("@mesh"):
+        die("AGENT_URI env var required (e.g. AGENT_URI=bun-desktop@mesh)")
+    return uri[:-len("@mesh")]
+
+
+def mesh_dir() -> Path:
+    override = os.environ.get("MESH_ROOT")
+    if override:
+        return Path(override) / "mesh"
+    if Path("/mesh").is_dir():
+        return Path("/mesh")
+    if Path("/mnt/agent-mesh").is_dir():
+        return Path("/mnt/agent-mesh") / "mesh"
+    die("cannot discover mesh root — set MESH_ROOT or run on host/container with /mesh")
+
+
+def jobs_dir(mesh: Path) -> Path:
+    d = mesh / "JOBS"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def now_ts() -> str:
+    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def find_job(jobs: Path, job_id: str) -> tuple[Path, str] | None:
+    """Return (path, subdir) for a job_id, searching active/archive/failed."""
+    for subdir in ("active", "archive", "failed"):
+        d = jobs / subdir
+        if not d.is_dir():
+            continue
+        for f in d.glob(f"{job_id}*.md"):
+            return f, subdir
+    return None
+
+
+def write_atomic(path: Path, content: str) -> None:
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(content, encoding="utf-8")
+    tmp.rename(path)
+
+
+def cmd_submit(args: argparse.Namespace) -> None:
+    mesh = mesh_dir()
+    jobs = jobs_dir(mesh)
+    me = agent_name()
+    ts = now_ts()
+    job_id = "bg-" + uuid.uuid4().hex[:8]
+
+    active = jobs / "active"
+    active.mkdir(parents=True, exist_ok=True)
+
+    content = f"""---
+KIND: bg-job
+JOB_ID: {job_id}
+AUTHOR: {me}@mesh
+JOB_STATUS: running
+JOB_PROGRESS: starting...
+STARTED_AT: {ts}
+ESTIMATED_DURATION: {getattr(args, 'duration', '') or 'unknown'}
+COMMAND: {args.command}
+---
+
+# {args.description or args.command}
+
+**Job ID:** {job_id}
+**Started:** {ts}
+**Agent:** {me}@mesh
+"""
+    write_atomic(active / f"{job_id}.md", content)
+    print(job_id)
+
+
+def cmd_list(args: argparse.Namespace) -> None:
+    mesh = mesh_dir()
+    jobs = jobs_dir(mesh)
+
+    if args.failed:
+        subdirs = ["failed"]
+    elif args.archive:
+        subdirs = ["archive"]
+    else:
+        subdirs = ["active"]
+
+    found = False
+    for subdir in subdirs:
+        d = jobs / subdir
+        if not d.is_dir():
+            continue
+        for f in sorted(d.glob("*.md")):
+            found = True
+            content = f.read_text(encoding="utf-8", errors="replace")
+            job_id = status = progress = author = started = ""
+            for line in content.splitlines():
+                if line.startswith("JOB_ID:"):
+                    job_id = line.split(":", 1)[1].strip()
+                elif line.startswith("JOB_STATUS:"):
+                    status = line.split(":", 1)[1].strip()
+                elif line.startswith("JOB_PROGRESS:"):
+                    progress = line.split(":", 1)[1].strip()
+                elif line.startswith("AUTHOR:"):
+                    author = line.split(":", 1)[1].strip()
+                elif line.startswith("STARTED_AT:"):
+                    started = line.split(":", 1)[1].strip()
+            print(f"{job_id}  [{status}]  {progress}  ({author} @ {started})")
+
+    if not found:
+        print(f"(no jobs in {', '.join(subdirs)})")
+
+
+def cmd_show(args: argparse.Namespace) -> None:
+    mesh = mesh_dir()
+    jobs = jobs_dir(mesh)
+    result = find_job(jobs, args.job_id)
+    if result is None:
+        die(f"job '{args.job_id}' not found", code=1)
+    path, _ = result
+    print(path.read_text(encoding="utf-8"))
+
+
+def cmd_update(args: argparse.Namespace) -> None:
+    mesh = mesh_dir()
+    jobs = jobs_dir(mesh)
+    result = find_job(jobs, args.job_id)
+    if result is None:
+        die(f"job '{args.job_id}' not found", code=1)
+    path, subdir = result
+    if subdir != "active":
+        die(f"job '{args.job_id}' is in '{subdir}', not active — cannot update")
+
+    content = path.read_text(encoding="utf-8")
+    lines = content.splitlines(keepends=True)
+    new_lines = []
+    for line in lines:
+        if args.status and line.startswith("JOB_STATUS:"):
+            new_lines.append(f"JOB_STATUS: {args.status}\n")
+        elif args.progress and line.startswith("JOB_PROGRESS:"):
+            new_lines.append(f"JOB_PROGRESS: {args.progress}\n")
+        else:
+            new_lines.append(line)
+
+    write_atomic(path, "".join(new_lines))
+    print(str(path))
+
+
+def _finalize_job(job_id: str, final_status: str, extra_lines: list[str]) -> None:
+    mesh = mesh_dir()
+    jobs = jobs_dir(mesh)
+    result = find_job(jobs, job_id)
+    if result is None:
+        die(f"job '{job_id}' not found", code=1)
+    path, subdir = result
+
+    content = path.read_text(encoding="utf-8")
+    lines = content.splitlines(keepends=True)
+    new_lines = []
+    for line in lines:
+        if line.startswith("JOB_STATUS:"):
+            new_lines.append(f"JOB_STATUS: {final_status}\n")
+        elif line.startswith("JOB_PROGRESS:"):
+            new_lines.append(f"JOB_PROGRESS: {final_status}\n")
+        else:
+            new_lines.append(line)
+    ts = now_ts()
+    new_lines.append(f"\n---\n")
+    new_lines.append(f"FINALIZED_AT: {ts}\n")
+    new_lines.extend(f"{l}\n" for l in extra_lines)
+
+    dest_subdir = "archive" if final_status == "completed" else "failed"
+    dest_dir = jobs / dest_subdir
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / path.name
+    write_atomic(path, "".join(new_lines))
+    path.rename(dest)
+    print(str(dest))
+
+
+def cmd_complete(args: argparse.Namespace) -> None:
+    extra = [f"RESULT: {args.result}"] if getattr(args, "result", None) else []
+    _finalize_job(args.job_id, "completed", extra)
+
+
+def cmd_fail(args: argparse.Namespace) -> None:
+    extra = [f"FAILURE_REASON: {args.reason}"] if getattr(args, "reason", None) else []
+    _finalize_job(args.job_id, "failed", extra)
+
+
+def cmd_cancel(args: argparse.Namespace) -> None:
+    mesh = mesh_dir()
+    jobs = jobs_dir(mesh)
+    result = find_job(jobs, args.job_id)
+    if result is None:
+        die(f"job '{args.job_id}' not found", code=1)
+    path, subdir = result
+    if subdir != "active":
+        die(f"job '{args.job_id}' is '{subdir}', not active")
+
+    content = path.read_text(encoding="utf-8")
+    lines = content.splitlines(keepends=True)
+    new_lines = []
+    for line in lines:
+        if line.startswith("JOB_STATUS:"):
+            new_lines.append("JOB_STATUS: cancelling\n")
+        else:
+            new_lines.append(line)
+    write_atomic(path, "".join(new_lines))
+    print(f"cancellation signal written to {path}")
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="Manage background jobs in mesh/JOBS/")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sb = sub.add_parser("submit", help="register a new background job")
+    sb.add_argument("--command", required=True)
+    sb.add_argument("--description", default="")
+    sb.add_argument("--duration", default="")
+
+    ls = sub.add_parser("list", help="list jobs")
+    ls.add_argument("--active", action="store_true", default=True)
+    ls.add_argument("--failed", action="store_true", default=False)
+    ls.add_argument("--archive", action="store_true", default=False)
+
+    sh = sub.add_parser("show", help="print full job status file")
+    sh.add_argument("job_id")
+
+    up = sub.add_parser("update", help="update running job status/progress")
+    up.add_argument("job_id")
+    up.add_argument("--status", default=None)
+    up.add_argument("--progress", default=None)
+
+    co = sub.add_parser("complete", help="mark job completed, move to archive/")
+    co.add_argument("job_id")
+    co.add_argument("--result", default=None)
+
+    fa = sub.add_parser("fail", help="mark job failed, move to failed/")
+    fa.add_argument("job_id")
+    fa.add_argument("--reason", default=None)
+
+    ca = sub.add_parser("cancel", help="write cancellation signal")
+    ca.add_argument("job_id")
+
+    args = p.parse_args()
+    {
+        "submit": cmd_submit,
+        "list": cmd_list,
+        "show": cmd_show,
+        "update": cmd_update,
+        "complete": cmd_complete,
+        "fail": cmd_fail,
+        "cancel": cmd_cancel,
+    }[args.cmd](args)
+
+
+if __name__ == "__main__":
+    main()

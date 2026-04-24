@@ -1,0 +1,446 @@
+#!/usr/bin/env python3
+"""mesh-pipeline — create and drive multi-step pipelines across agents.
+
+Implements PROTOCOL.md v2.1.0 §18 pipeline chaining.
+
+Each pipeline lives in mesh/PIPELINES/<id>/ with:
+  manifest.json   — machine-readable step graph + current state
+  log.md          — append-only execution log
+  step-N-<name>-result.md — per-step result files (written by step agents)
+
+Steps are linear (no DAG). On success, the completed agent calls
+`mesh-pipeline step-done` which reads the manifest, routes to the next
+step agent via KIND: pipeline-step, and updates state.
+
+Stdlib-only. Python 3.8+.
+
+Env:
+    AGENT_URI    required
+    MESH_ROOT    optional
+
+Subcommands:
+    create <name> --step "<name>:<agent>:<on_success_agent>:<on_fail_agent>" ...
+                        create a pipeline, print pipeline-id
+                        (repeat --step for each step in order)
+
+    status <pipeline-id>
+                        print current pipeline state + step progress
+
+    step-done <pipeline-id> <step-index> [--success] [--fail] [--reason "<text>"]
+                        mark a step complete; auto-routes to next step agent
+                        via KIND: pipeline-step message to their inbox
+
+    cancel <pipeline-id> [--reason "<text>"]
+                        cancel a running pipeline
+
+    list [--active|--completed|--failed|--all]
+                        list pipelines
+
+Exit codes:
+    0  success
+    1  pipeline/step not found
+    3  usage error
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import json
+import os
+import re
+import sys
+import uuid
+from pathlib import Path
+
+
+def die(msg: str, code: int = 3) -> None:
+    print(f"mesh-pipeline: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def agent_uri() -> str:
+    uri = os.environ.get("AGENT_URI", "")
+    if not uri.endswith("@mesh"):
+        die("AGENT_URI env var required (e.g. AGENT_URI=host@mesh)")
+    return uri
+
+
+def agent_name() -> str:
+    return agent_uri()[:-len("@mesh")]
+
+
+def discover_paths() -> tuple[Path, Path]:
+    """Return (mesh_dir, agents_dir)."""
+    override = os.environ.get("MESH_ROOT")
+    if override:
+        root = Path(override)
+        return root / "mesh", root / "agents"
+    if Path("/mesh").is_dir():
+        return Path("/mesh"), Path("/mnt/agent-mesh/agents")
+    if Path("/mnt/agent-mesh").is_dir():
+        root = Path("/mnt/agent-mesh")
+        return root / "mesh", root / "agents"
+    die("cannot discover mesh root — set MESH_ROOT or run on host/container with /mesh")
+
+
+def now_ts() -> str:
+    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def pipelines_dir(mesh: Path) -> Path:
+    d = mesh / "PIPELINES"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def find_pipeline(pl_dir: Path, pipeline_id: str) -> Path | None:
+    d = pl_dir / pipeline_id
+    return d if d.is_dir() else None
+
+
+def load_manifest(pl_path: Path) -> dict:
+    mf = pl_path / "manifest.json"
+    if not mf.exists():
+        die(f"no manifest.json in {pl_path}")
+    return json.loads(mf.read_text())
+
+
+def save_manifest(pl_path: Path, manifest: dict) -> None:
+    mf = pl_path / "manifest.json"
+    tmp = mf.with_suffix(".tmp")
+    tmp.write_text(json.dumps(manifest, indent=2))
+    tmp.rename(mf)
+
+
+def append_log(pl_path: Path, entry: str) -> None:
+    log = pl_path / "log.md"
+    ts = now_ts()
+    with log.open("a") as f:
+        f.write(f"\n## {ts}\n\n{entry}\n")
+
+
+def send_pipeline_step(agents_dir: Path, target_agent: str, manifest: dict, step_idx: int) -> Path | None:
+    """Write a KIND: pipeline-step message to target_agent's inbox."""
+    agent_short = target_agent.replace("@mesh", "")
+    inbox = agents_dir / agent_short / "inbox"
+    if not inbox.is_dir():
+        print(f"mesh-pipeline: WARNING: inbox not found for {target_agent}", file=sys.stderr)
+        return None
+
+    inbox.mkdir(parents=True, exist_ok=True)
+    step = manifest["steps"][step_idx]
+    date = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d")
+
+    # Find next slot
+    prefix_re = re.compile(rf"^{re.escape(date)}-(\d{{3}})-")
+    maxn = max(
+        (int(m.group(1)) for f in inbox.iterdir()
+         if (m := prefix_re.match(f.name))),
+        default=0
+    )
+    slot = f"{date}-{maxn+1:03d}-pipeline-{manifest['pipeline_id']}-step-{step_idx}"
+    md_path = inbox / f"{slot}.md"
+
+    sender = agent_name()
+    step_count = len(manifest["steps"])
+    on_success = step.get("on_success", "host@mesh")
+    on_failure = step.get("on_failure", "host@mesh")
+
+    content = f"""---
+KIND: pipeline-step
+AUTHOR: {sender}@mesh
+READERS: [{target_agent}]
+REPLIES-TO: null
+SIZE: short
+PIPELINE_ID: {manifest["pipeline_id"]}
+PIPELINE_NAME: {manifest["name"]}
+STEP_INDEX: {step_idx}
+STEP_COUNT: {step_count}
+STEP_NAME: {step["name"]}
+ON_SUCCESS: {on_success}
+ON_FAILURE: {on_failure}
+END-OF-TURN: {target_agent} — complete and call mesh-pipeline step-done
+---
+
+# Pipeline Step {step_idx + 1}/{step_count}: {step["name"]}
+
+**Pipeline:** {manifest["name"]} ({manifest["pipeline_id"]})
+**Your role:** Execute this step, then run:
+
+```
+mesh-pipeline step-done {manifest["pipeline_id"]} {step_idx} --success
+```
+
+Or on failure:
+
+```
+mesh-pipeline step-done {manifest["pipeline_id"]} {step_idx} --fail --reason "<why>"
+```
+
+Write your result to: /mesh/PIPELINES/{manifest["pipeline_id"]}/step-{step_idx}-{step["name"]}-result.md
+
+On success, next step routes to: {on_success}
+On failure, escalation routes to: {on_failure}
+"""
+    md_path.write_text(content)
+
+    # Mirror to sender's sent/
+    sent_dir = Path("/mnt/agent-mesh/agents") / sender / "sent"
+    if not sent_dir.is_dir():
+        # Try discovering from MESH_ROOT
+        override = os.environ.get("MESH_ROOT")
+        if override:
+            sent_dir = Path(override) / "agents" / sender / "sent"
+    if sent_dir.is_dir():
+        try:
+            (sent_dir / f"{slot}.md").write_text(content)
+        except OSError:
+            pass
+
+    return md_path
+
+
+# ── subcommands ───────────────────────────────────────────────────────────────
+
+def cmd_create(args: argparse.Namespace) -> None:
+    mesh_dir, agents_dir = discover_paths()
+    pl_dir = pipelines_dir(mesh_dir)
+    me = agent_uri()
+
+    if not args.step:
+        die("at least one --step required. Format: name:assigned_to:on_success_agent:on_fail_agent")
+
+    steps = []
+    for s in args.step:
+        parts = s.split(":")
+        if len(parts) < 2:
+            die(f"step format is name:assigned_to[:on_success[:on_fail]], got: {s!r}")
+        steps.append({
+            "name": parts[0].strip(),
+            "assigned_to": parts[1].strip() if len(parts) > 1 else "host@mesh",
+            "on_success": parts[2].strip() if len(parts) > 2 else "host@mesh",
+            "on_failure": parts[3].strip() if len(parts) > 3 else "host@mesh",
+            "status": "pending",
+        })
+
+    pipeline_id = "pl-" + uuid.uuid4().hex[:8]
+    ts = now_ts()
+
+    manifest = {
+        "pipeline_id": pipeline_id,
+        "name": args.name,
+        "status": "created",
+        "current_step": 0,
+        "created_by": me,
+        "created_at": ts,
+        "steps": steps,
+    }
+
+    pl_path = pl_dir / pipeline_id
+    pl_path.mkdir(parents=True)
+    save_manifest(pl_path, manifest)
+
+    log_entry = f"Pipeline created by {me}.\n\nSteps:\n"
+    for i, s in enumerate(steps):
+        log_entry += f"  {i}: {s['name']} → {s['assigned_to']}\n"
+    append_log(pl_path, log_entry)
+
+    # Dispatch step 0 immediately
+    manifest["status"] = "running"
+    manifest["steps"][0]["status"] = "in_progress"
+    save_manifest(pl_path, manifest)
+
+    first_agent = steps[0]["assigned_to"]
+    sent_path = send_pipeline_step(agents_dir, first_agent, manifest, 0)
+    append_log(pl_path, f"Step 0 dispatched to {first_agent}. Message: {sent_path}")
+
+    print(pipeline_id)
+    print(f"Step 0 ({steps[0]['name']}) dispatched to {first_agent}", file=sys.stderr)
+
+
+def cmd_status(args: argparse.Namespace) -> None:
+    mesh_dir, _ = discover_paths()
+    pl_dir = pipelines_dir(mesh_dir)
+    pl_path = find_pipeline(pl_dir, args.pipeline_id)
+    if pl_path is None:
+        die(f"pipeline '{args.pipeline_id}' not found", code=1)
+
+    m = load_manifest(pl_path)
+    print(f"Pipeline:  {m['name']} ({m['pipeline_id']})")
+    print(f"Status:    {m['status']}")
+    print(f"Created:   {m['created_at']} by {m['created_by']}")
+    print(f"Step:      {m['current_step'] + 1}/{len(m['steps'])}")
+    print()
+    for i, s in enumerate(m["steps"]):
+        marker = "→" if i == m["current_step"] else " "
+        print(f"  {marker} [{s['status']:12}] step {i}: {s['name']} (agent: {s['assigned_to']})")
+
+
+def cmd_step_done(args: argparse.Namespace) -> None:
+    mesh_dir, agents_dir = discover_paths()
+    pl_dir = pipelines_dir(mesh_dir)
+    pl_path = find_pipeline(pl_dir, args.pipeline_id)
+    if pl_path is None:
+        die(f"pipeline '{args.pipeline_id}' not found", code=1)
+
+    m = load_manifest(pl_path)
+    step_idx = args.step_index
+    steps = m["steps"]
+
+    if step_idx >= len(steps):
+        die(f"step index {step_idx} out of range (pipeline has {len(steps)} steps)")
+
+    success = not args.fail
+    outcome = "success" if success else "failure"
+    reason = args.reason or ""
+    me = agent_uri()
+    ts = now_ts()
+
+    steps[step_idx]["status"] = "completed" if success else "failed"
+    log_entry = f"Step {step_idx} ({steps[step_idx]['name']}) marked {outcome} by {me}."
+    if reason:
+        log_entry += f" Reason: {reason}"
+
+    next_idx = step_idx + 1
+
+    if success and next_idx < len(steps):
+        # Route to next step
+        next_agent = steps[next_idx]["assigned_to"]
+        steps[next_idx]["status"] = "in_progress"
+        m["current_step"] = next_idx
+        m["status"] = "running"
+        save_manifest(pl_path, m)
+
+        sent = send_pipeline_step(agents_dir, next_agent, m, next_idx)
+        log_entry += f"\nStep {next_idx} dispatched to {next_agent}. Message: {sent}"
+        append_log(pl_path, log_entry)
+        print(f"Step {step_idx} done. Step {next_idx} dispatched to {next_agent}.")
+
+    elif success and next_idx >= len(steps):
+        # All steps complete
+        m["status"] = "completed"
+        m["current_step"] = step_idx
+        save_manifest(pl_path, m)
+        append_log(pl_path, log_entry + "\nAll steps complete. Pipeline COMPLETED.")
+        print(f"Pipeline {args.pipeline_id} COMPLETED.")
+
+    else:
+        # Failure — route to on_failure handler
+        on_failure = steps[step_idx].get("on_failure", "host@mesh")
+        m["status"] = "failed"
+        save_manifest(pl_path, m)
+
+        # Send failure notification to on_failure agent
+        fail_agent_short = on_failure.replace("@mesh", "")
+        fail_inbox = agents_dir / fail_agent_short / "inbox"
+        if fail_inbox.is_dir():
+            date = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d")
+            prefix_re = re.compile(rf"^{re.escape(date)}-(\d{{3}})-")
+            maxn = max(
+                (int(x.group(1)) for f in fail_inbox.iterdir()
+                 if (x := prefix_re.match(f.name))),
+                default=0
+            )
+            fail_path = fail_inbox / f"{date}-{maxn+1:03d}-pipeline-{m['pipeline_id']}-step-{step_idx}-failed.md"
+            fail_path.write_text(
+                f"---\nKIND: announcement\nAUTHOR: {me}\nREADERS: [{on_failure}]\n"
+                f"REPLIES-TO: null\nSIZE: short\nEND-OF-TURN: {on_failure}\n---\n\n"
+                f"# Pipeline Failure: {m['name']}\n\n"
+                f"Step {step_idx} ({steps[step_idx]['name']}) FAILED.\n"
+                f"Reason: {reason or 'none given'}\n"
+                f"Pipeline ID: {m['pipeline_id']}\n"
+            )
+            log_entry += f"\nFailure notification sent to {on_failure}."
+        append_log(pl_path, log_entry)
+        print(f"Step {step_idx} FAILED. Notified {on_failure}.", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_cancel(args: argparse.Namespace) -> None:
+    mesh_dir, _ = discover_paths()
+    pl_dir = pipelines_dir(mesh_dir)
+    pl_path = find_pipeline(pl_dir, args.pipeline_id)
+    if pl_path is None:
+        die(f"pipeline '{args.pipeline_id}' not found", code=1)
+
+    m = load_manifest(pl_path)
+    m["status"] = "cancelled"
+    save_manifest(pl_path, m)
+    reason = getattr(args, "reason", "") or ""
+    append_log(pl_path, f"Pipeline cancelled by {agent_uri()}. {reason}")
+    print(f"Pipeline {args.pipeline_id} cancelled.")
+
+
+def cmd_list(args: argparse.Namespace) -> None:
+    mesh_dir, _ = discover_paths()
+    pl_dir = pipelines_dir(mesh_dir)
+
+    found = False
+    for pl_path in sorted(pl_dir.iterdir()):
+        if not pl_path.is_dir():
+            continue
+        mf = pl_path / "manifest.json"
+        if not mf.exists():
+            continue
+        try:
+            m = json.loads(mf.read_text())
+        except Exception:
+            continue
+
+        status = m.get("status", "?")
+        if not (args.all or
+                (args.completed and status == "completed") or
+                (args.failed and status in ("failed", "cancelled")) or
+                (not args.completed and not args.failed and not args.all and status in ("created", "running"))):
+            continue
+
+        found = True
+        step_info = f"{m.get('current_step', 0)+1}/{len(m.get('steps', []))}"
+        print(f"{m['pipeline_id']}  [{status:10}]  step {step_info}  {m['name']}  (by {m.get('created_by','?')})")
+
+    if not found:
+        print("(no pipelines found)")
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="Create and drive multi-step mesh pipelines.")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    cr = sub.add_parser("create", help="create a pipeline and dispatch step 0")
+    cr.add_argument("name")
+    cr.add_argument("--step", action="append",
+                    metavar="name:agent[:on_success[:on_fail]]",
+                    help="add a step (repeat for each step in order)")
+
+    st = sub.add_parser("status", help="print pipeline state")
+    st.add_argument("pipeline_id")
+
+    sd = sub.add_parser("step-done", help="mark step complete, route to next")
+    sd.add_argument("pipeline_id")
+    sd.add_argument("step_index", type=int)
+    sd.add_argument("--success", action="store_true", default=True)
+    sd.add_argument("--fail", action="store_true", default=False)
+    sd.add_argument("--reason", default=None)
+
+    ca = sub.add_parser("cancel", help="cancel a running pipeline")
+    ca.add_argument("pipeline_id")
+    ca.add_argument("--reason", default=None)
+
+    ls = sub.add_parser("list", help="list pipelines")
+    ls.add_argument("--active", action="store_true", default=False)
+    ls.add_argument("--completed", action="store_true", default=False)
+    ls.add_argument("--failed", action="store_true", default=False)
+    ls.add_argument("--all", action="store_true", default=False)
+
+    args = p.parse_args()
+    {
+        "create": cmd_create,
+        "status": cmd_status,
+        "step-done": cmd_step_done,
+        "cancel": cmd_cancel,
+        "list": cmd_list,
+    }[args.cmd](args)
+
+
+if __name__ == "__main__":
+    main()

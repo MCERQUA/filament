@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""mesh-ack — mark a message as read by moving it to inbox/.read/.
+
+Also appends `# ACKED <ts> <filename>` to the watchdog log for audit.
+This is the "trust-the-agent + audit" marker mechanism (PROTOCOL §17).
+
+Stdlib-only.
+
+Env:
+    AGENT_URI    required
+    MESH_ROOT    optional
+
+Usage:
+    mesh-ack <filename>        # mark the named file read
+    mesh-ack --all             # mark all currently-unread files read
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import os
+import sys
+from pathlib import Path
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"mesh-ack: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def agent_name() -> str:
+    uri = os.environ.get("AGENT_URI")
+    if not uri:
+        die("AGENT_URI env var required")
+    if not uri.endswith("@mesh"):
+        die(f"AGENT_URI must end with @mesh, got: {uri}")
+    return uri[: -len("@mesh")]
+
+
+def discover_my_inbox() -> Path:
+    override = os.environ.get("MESH_ROOT")
+    if override:
+        return Path(override) / "agents" / agent_name() / "inbox"
+    if Path("/agent-desk").is_dir():
+        return Path("/agent-desk/inbox")
+    if Path("/mnt/agent-mesh").is_dir():
+        return Path("/mnt/agent-mesh/agents") / agent_name() / "inbox"
+    die("cannot discover mesh root — set MESH_ROOT")
+
+
+def log_drop(message: str) -> None:
+    for candidate in (
+        "/var/log/jambot-mesh-inotify.log",
+        "/config/workspace/mesh-events.log",
+    ):
+        try:
+            with open(candidate, "a", encoding="utf-8") as fh:
+                fh.write(message + "\n")
+            return
+        except OSError:
+            continue
+
+
+def ack_file(inbox: Path, filename: str) -> bool:
+    src = inbox / filename
+    if not src.is_file():
+        print(f"mesh-ack: file not found: {filename}", file=sys.stderr)
+        return False
+    read_dir = inbox / ".read"
+    read_dir.mkdir(exist_ok=True, mode=0o755)
+    dest = read_dir / filename
+    # if an older ack file with the same name exists, keep both
+    if dest.exists():
+        ts = _dt.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+        dest = read_dir / f"{filename}.dup-{ts}"
+    src.rename(dest)
+    ts = _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    log_drop(f"# ACKED {ts} agent={agent_name()} file={filename}")
+    print(f"acked: {filename}")
+    return True
+
+
+def main() -> None:
+    p = argparse.ArgumentParser()
+    p.add_argument("filename", nargs="?", help="message filename to ack (relative, just base name)")
+    p.add_argument("--all", action="store_true", help="ack every currently-unread file in inbox")
+    args = p.parse_args()
+
+    inbox = discover_my_inbox()
+    if not inbox.is_dir():
+        die(f"inbox not found: {inbox}")
+
+    if args.all:
+        any_done = False
+        for entry in list(inbox.iterdir()):
+            if entry.is_file() and entry.suffix == ".md":
+                if ack_file(inbox, entry.name):
+                    any_done = True
+        if not any_done:
+            print("(nothing to ack)")
+        return
+
+    if not args.filename:
+        die("provide a filename, or pass --all")
+
+    if not ack_file(inbox, args.filename):
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()
