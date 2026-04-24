@@ -250,8 +250,17 @@ def log_drop(message: str) -> None:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+class _MeshArgParser(argparse.ArgumentParser):
+    """argparse exits 2 on parse errors by default; remap to 3 (validation)
+    so callers can distinguish parse failures from rate-limit (exit 2)."""
+    def error(self, message: str) -> None:
+        self.print_usage(sys.stderr)
+        print(f"mesh-send: {message}", file=sys.stderr)
+        sys.exit(3)
+
+
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Write a file to a peer agent's inbox over the JamBot agent mesh.")
+    p = _MeshArgParser(description="Write a file to a peer agent's inbox over the JamBot agent mesh.")
     p.add_argument("--to", required=True, help="recipient URI, e.g. host@mesh")
     p.add_argument("--kind", required=True, choices=sorted(KIND_CAPS_BYTES.keys()))
     p.add_argument("--subject", required=True, help="kebab-case topic (becomes filename <topic> segment)")
