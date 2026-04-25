@@ -57,7 +57,7 @@ from pathlib import Path
 _lib = Path(__file__).resolve().parent.parent / "lib"
 if str(_lib) not in sys.path:
     sys.path.insert(0, str(_lib))
-from write_atomic import write_atomic as _write_atomic  # noqa: E402
+from write_atomic import write_atomic as _write_atomic, fsync_dir as _fsync_dir  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Intel leak filter — keep in sync with the equivalent block in bin/mesh-send.
@@ -345,6 +345,7 @@ def cmd_unsubscribe(args: argparse.Namespace) -> None:
         die(f"{me}@mesh is not subscribed to '{args.topic}'", code=1)
 
     sub_file.rename(sub_file.with_suffix(".unsubscribed"))
+    _fsync_dir(sub_file.parent)
     print(f"Unsubscribed {me}@mesh from topic '{args.topic}'")
 
 

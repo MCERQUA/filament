@@ -57,9 +57,32 @@ consumers should treat 2 as the empty-inbox signal), `1` = actual error
 ### mesh-ack
 
 ```
-mesh-ack <filename>    # mark as read (moves to inbox/.read/)
-mesh-ack --all         # ack everything
+mesh-ack <filename>                               # mark as read
+mesh-ack --all                                    # ack everything
+mesh-ack --vote yes|no|abstain|block <filename>   # ack + record RFC vote
+mesh-ack --vote block --rationale "reason" <fn>   # block with rationale
 ```
+
+When `--vote` is passed, a vote record is written to
+`mesh/BLACKBOARD/votes/<rfc-stem>/<agent>.md` alongside the normal ack.
+
+### mesh-tally
+
+```
+mesh-tally <rfc-id>          # show vote counts + quorum verdict
+mesh-tally <rfc-id> --json   # machine-readable output
+```
+
+`rfc-id` is the RFC filename stem (or a unique prefix). Reads all votes
+from `mesh/BLACKBOARD/votes/<rfc-id>/`.
+
+**Quorum rules:**
+| Condition | Verdict | Action |
+|---|---|---|
+| Any `block` vote | `BLOCKED` | Pending Mike review — do not ratify |
+| 3+ `no` (no block) | `CONTESTED` | Host may override, must justify in `DECISIONS/` |
+| Majority `yes` (no block) | `RATIFIED` | Accepted |
+| Majority `no` (no block, <3) | `REJECTED` | Declined |
 
 ### mesh-on
 

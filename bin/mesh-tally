@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""mesh-tally — aggregate VOTE records for an RFC and report quorum result.
+
+Votes are written by `mesh-ack --vote` to mesh/BLACKBOARD/votes/<rfc-stem>/.
+This tool reads that directory and reports counts with quorum analysis.
+
+Quorum rules (per skill/SKILL.md):
+  BLOCK by any agent  → pending Mike review (no auto-ratification)
+  3+ "no" (no BLOCK)  → host can override but should justify in DECISIONS/
+  Otherwise majority "yes" → ratified
+
+Stdlib-only. Python 3.8+.
+
+Env:
+    AGENT_URI    required
+    MESH_ROOT    optional
+
+Usage:
+    mesh-tally <rfc-id>          # rfc-id = filename stem or partial prefix
+    mesh-tally <rfc-id> --json   # machine-readable output
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"mesh-tally: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def discover_mesh_root() -> Path:
+    override = os.environ.get("MESH_ROOT")
+    if override:
+        return Path(override) / "mesh"
+    if Path("/mesh").is_dir():
+        return Path("/mesh")
+    if Path("/mnt/agent-mesh/mesh").is_dir():
+        return Path("/mnt/agent-mesh/mesh")
+    die("cannot discover mesh root — set MESH_ROOT")
+
+
+def parse_frontmatter(text: str) -> dict[str, str]:
+    """Extract key: value pairs from a simple YAML-ish frontmatter block."""
+    out: dict[str, str] = {}
+    if not text.startswith("---"):
+        return out
+    lines = text.split("\n")
+    in_fm = False
+    for line in lines[1:]:
+        if line.strip() == "---":
+            break
+        if ":" in line:
+            k, _, v = line.partition(":")
+            out[k.strip()] = v.strip()
+    return out
+
+
+def find_vote_dir(votes_root: Path, rfc_id: str) -> Path | None:
+    """Locate the vote directory for rfc_id (exact stem or unambiguous prefix)."""
+    if (votes_root / rfc_id).is_dir():
+        return votes_root / rfc_id
+    matches = sorted(d for d in votes_root.iterdir() if d.name.startswith(rfc_id) and d.is_dir())
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        die(f"ambiguous rfc-id '{rfc_id}' matches: {', '.join(d.name for d in matches)}")
+    return None
+
+
+def quorum_verdict(counts: dict[str, int]) -> str:
+    total = sum(counts.values())
+    if total == 0:
+        return "NO_VOTES"
+    if counts.get("block", 0) > 0:
+        return "BLOCKED"
+    if counts.get("no", 0) >= 3:
+        return "CONTESTED"
+    yes = counts.get("yes", 0)
+    no = counts.get("no", 0)
+    abstain = counts.get("abstain", 0)
+    participating = yes + no  # abstains don't count toward majority
+    if participating == 0:
+        return "ABSTAIN_ONLY"
+    return "RATIFIED" if yes > no else "REJECTED"
+
+
+def main() -> None:
+    p = argparse.ArgumentParser()
+    p.add_argument("rfc_id", help="RFC filename stem (or unique prefix) to tally")
+    p.add_argument("--json", action="store_true", help="output as JSON")
+    args = p.parse_args()
+
+    mesh = discover_mesh_root()
+    votes_root = mesh / "BLACKBOARD" / "votes"
+
+    if not votes_root.is_dir():
+        if args.json:
+            print(json.dumps({"rfc_id": args.rfc_id, "votes": [], "counts": {}, "verdict": "NO_VOTES"}))
+        else:
+            print(f"No votes recorded yet (BLACKBOARD/votes/ does not exist)")
+        return
+
+    vote_dir = find_vote_dir(votes_root, args.rfc_id)
+    if vote_dir is None:
+        if args.json:
+            print(json.dumps({"rfc_id": args.rfc_id, "votes": [], "counts": {}, "verdict": "NO_VOTES"}))
+        else:
+            print(f"No votes found for '{args.rfc_id}'")
+        return
+
+    votes: list[dict[str, str]] = []
+    for f in sorted(vote_dir.glob("*.md")):
+        fm = parse_frontmatter(f.read_text(encoding="utf-8", errors="replace"))
+        votes.append({
+            "agent": fm.get("AUTHOR", f.stem + "@mesh"),
+            "vote": fm.get("VOTE", "unknown").lower(),
+            "rationale": fm.get("RATIONALE", ""),
+            "voted_at": fm.get("VOTED_AT", ""),
+        })
+
+    counts: dict[str, int] = {"yes": 0, "no": 0, "abstain": 0, "block": 0}
+    for v in votes:
+        ballot = v["vote"]
+        if ballot in counts:
+            counts[ballot] += 1
+
+    verdict = quorum_verdict(counts)
+
+    if args.json:
+        print(json.dumps({
+            "rfc_id": vote_dir.name,
+            "votes": votes,
+            "counts": counts,
+            "verdict": verdict,
+        }, indent=2))
+        return
+
+    # Human-readable output
+    print(f"\nVote tally: {vote_dir.name}")
+    print(f"{'─' * 60}")
+    print(f"  yes      {counts['yes']:>3}")
+    print(f"  no       {counts['no']:>3}")
+    print(f"  abstain  {counts['abstain']:>3}")
+    print(f"  block    {counts['block']:>3}")
+    print(f"{'─' * 60}")
+    print(f"  VERDICT: {verdict}")
+    print()
+
+    blocks = [v for v in votes if v["vote"] == "block"]
+    if blocks:
+        print("BLOCK rationale(s):")
+        for b in blocks:
+            rationale = b["rationale"] or "(no rationale given)"
+            print(f"  {b['agent']}: {rationale}")
+        print()
+
+    nos = [v for v in votes if v["vote"] == "no"]
+    if nos and verdict == "CONTESTED":
+        print("Dissenting rationale(s):")
+        for n in nos:
+            if n["rationale"]:
+                print(f"  {n['agent']}: {n['rationale']}")
+        print()
+
+    print("Individual votes:")
+    for v in votes:
+        rationale_str = f"  — {v['rationale']}" if v["rationale"] else ""
+        print(f"  {v['vote']:<8}  {v['agent']}{rationale_str}")
+
+
+if __name__ == "__main__":
+    main()

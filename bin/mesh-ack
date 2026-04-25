@@ -4,6 +4,10 @@
 Also appends `# ACKED <ts> <filename>` to the watchdog log for audit.
 This is the "trust-the-agent + audit" marker mechanism (PROTOCOL §17).
 
+Vote support: pass --vote [yes|no|abstain|block] to record a vote on an RFC.
+Votes are written to mesh/BLACKBOARD/votes/<rfc-stem>/<agent>.md so any peer
+can run `mesh-tally <rfc-stem>` to aggregate results.
+
 Stdlib-only.
 
 Env:
@@ -11,8 +15,10 @@ Env:
     MESH_ROOT    optional
 
 Usage:
-    mesh-ack <filename>        # mark the named file read
-    mesh-ack --all             # mark all currently-unread files read
+    mesh-ack <filename>                         # mark the named file read
+    mesh-ack --all                              # ack every unread file
+    mesh-ack --vote yes|no|abstain|block \\
+             [--rationale "text"] <filename>   # ack + record RFC vote
 """
 from __future__ import annotations
 
@@ -21,6 +27,13 @@ import datetime as _dt
 import os
 import sys
 from pathlib import Path
+
+_lib = Path(__file__).resolve().parent.parent / "lib"
+if str(_lib) not in sys.path:
+    sys.path.insert(0, str(_lib))
+from write_atomic import write_atomic as _write_atomic, fsync_dir as _fsync_dir  # noqa: E402
+
+VALID_VOTES = ("yes", "no", "abstain", "block")
 
 
 def die(msg: str, code: int = 1) -> None:
@@ -61,7 +74,40 @@ def log_drop(message: str) -> None:
             continue
 
 
-def ack_file(inbox: Path, filename: str) -> bool:
+def discover_mesh_root() -> Path | None:
+    override = os.environ.get("MESH_ROOT")
+    if override:
+        return Path(override) / "mesh"
+    if Path("/mesh").is_dir():
+        return Path("/mesh")
+    if Path("/mnt/agent-mesh/mesh").is_dir():
+        return Path("/mnt/agent-mesh/mesh")
+    return None
+
+
+def record_vote(filename: str, vote: str, rationale: str) -> None:
+    """Write a vote record to mesh/BLACKBOARD/votes/<rfc-stem>/<agent>.md."""
+    mesh = discover_mesh_root()
+    if mesh is None:
+        print("mesh-ack: warning: cannot locate mesh root — vote not recorded", file=sys.stderr)
+        return
+    rfc_stem = filename.removesuffix(".md")
+    vote_dir = mesh / "BLACKBOARD" / "votes" / rfc_stem
+    vote_dir.mkdir(parents=True, exist_ok=True)
+    me = agent_name()
+    ts = _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    content = (
+        f"---\nKIND: vote\nAUTHOR: {me}@mesh\nRFC: {filename}\n"
+        f"VOTE: {vote}\nVOTED_AT: {ts}\n"
+    )
+    if rationale:
+        content += f"RATIONALE: {rationale}\n"
+    content += "---\n"
+    _write_atomic(vote_dir / f"{me}.md", content)
+    log_drop(f"# VOTED {ts} agent={me} file={filename} vote={vote}")
+
+
+def ack_file(inbox: Path, filename: str, vote: str = "", rationale: str = "") -> bool:
     src = inbox / filename
     if not src.is_file():
         print(f"mesh-ack: file not found: {filename}", file=sys.stderr)
@@ -74,9 +120,14 @@ def ack_file(inbox: Path, filename: str) -> bool:
         ts = _dt.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
         dest = read_dir / f"{filename}.dup-{ts}"
     src.rename(dest)
+    _fsync_dir(dest.parent)
     ts = _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
     log_drop(f"# ACKED {ts} agent={agent_name()} file={filename}")
-    print(f"acked: {filename}")
+    if vote:
+        record_vote(filename, vote, rationale)
+        print(f"acked: {filename} [vote={vote}]")
+    else:
+        print(f"acked: {filename}")
     return True
 
 
@@ -84,7 +135,15 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("filename", nargs="?", help="message filename to ack (relative, just base name)")
     p.add_argument("--all", action="store_true", help="ack every currently-unread file in inbox")
+    p.add_argument(
+        "--vote", choices=VALID_VOTES,
+        help="record a vote on this RFC alongside the ack (yes|no|abstain|block)",
+    )
+    p.add_argument("--rationale", default="", help="one-line rationale for the vote")
     args = p.parse_args()
+
+    if args.rationale and not args.vote:
+        die("--rationale requires --vote")
 
     inbox = discover_my_inbox()
     if not inbox.is_dir():
@@ -103,7 +162,7 @@ def main() -> None:
     if not args.filename:
         die("provide a filename, or pass --all")
 
-    if not ack_file(inbox, args.filename):
+    if not ack_file(inbox, args.filename, vote=args.vote or "", rationale=args.rationale):
         sys.exit(2)
 
 
