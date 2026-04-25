@@ -39,6 +39,11 @@ import sys
 import uuid
 from pathlib import Path
 
+_lib = Path(__file__).resolve().parent.parent / "lib"
+if str(_lib) not in sys.path:
+    sys.path.insert(0, str(_lib))
+from write_atomic import write_atomic as _write_atomic, fsync_dir as _fsync_dir  # noqa: E402
+
 
 def die(msg: str, code: int = 3) -> None:
     print(f"mesh-jobs: {msg}", file=sys.stderr)
@@ -84,11 +89,6 @@ def find_job(jobs: Path, job_id: str) -> tuple[Path, str] | None:
     return None
 
 
-def write_atomic(path: Path, content: str) -> None:
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(content, encoding="utf-8")
-    tmp.rename(path)
-
 
 def cmd_submit(args: argparse.Namespace) -> None:
     mesh = mesh_dir()
@@ -117,7 +117,7 @@ COMMAND: {args.command}
 **Started:** {ts}
 **Agent:** {me}@mesh
 """
-    write_atomic(active / f"{job_id}.md", content)
+    _write_atomic(active / f"{job_id}.md", content)
     print(job_id)
 
 
@@ -189,7 +189,7 @@ def cmd_update(args: argparse.Namespace) -> None:
         else:
             new_lines.append(line)
 
-    write_atomic(path, "".join(new_lines))
+    _write_atomic(path, "".join(new_lines))
     print(str(path))
 
 
@@ -220,8 +220,9 @@ def _finalize_job(job_id: str, final_status: str, extra_lines: list[str]) -> Non
     dest_dir = jobs / dest_subdir
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / path.name
-    write_atomic(path, "".join(new_lines))
+    _write_atomic(path, "".join(new_lines))
     path.rename(dest)
+    _fsync_dir(dest.parent)
     print(str(dest))
 
 
@@ -253,7 +254,7 @@ def cmd_cancel(args: argparse.Namespace) -> None:
             new_lines.append("JOB_STATUS: cancelling\n")
         else:
             new_lines.append(line)
-    write_atomic(path, "".join(new_lines))
+    _write_atomic(path, "".join(new_lines))
     print(f"cancellation signal written to {path}")
 
 

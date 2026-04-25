@@ -52,6 +52,11 @@ import sys
 import uuid
 from pathlib import Path
 
+_lib = Path(__file__).resolve().parent.parent / "lib"
+if str(_lib) not in sys.path:
+    sys.path.insert(0, str(_lib))
+from write_atomic import write_atomic as _write_atomic  # noqa: E402
+
 
 def die(msg: str, code: int = 3) -> None:
     print(f"mesh-pipeline: {msg}", file=sys.stderr)
@@ -107,9 +112,7 @@ def load_manifest(pl_path: Path) -> dict:
 
 def save_manifest(pl_path: Path, manifest: dict) -> None:
     mf = pl_path / "manifest.json"
-    tmp = mf.with_suffix(".tmp")
-    tmp.write_text(json.dumps(manifest, indent=2))
-    tmp.rename(mf)
+    _write_atomic(mf, json.dumps(manifest, indent=2))
 
 
 def append_log(pl_path: Path, entry: str) -> None:
@@ -182,7 +185,7 @@ Write your result to: /mesh/PIPELINES/{manifest["pipeline_id"]}/step-{step_idx}-
 On success, next step routes to: {on_success}
 On failure, escalation routes to: {on_failure}
 """
-    md_path.write_text(content)
+    _write_atomic(md_path, content)
 
     # Mirror to sender's sent/
     sent_dir = Path("/mnt/agent-mesh/agents") / sender / "sent"
@@ -193,7 +196,7 @@ On failure, escalation routes to: {on_failure}
             sent_dir = Path(override) / "agents" / sender / "sent"
     if sent_dir.is_dir():
         try:
-            (sent_dir / f"{slot}.md").write_text(content)
+            _write_atomic(sent_dir / f"{slot}.md", content)
         except OSError:
             pass
 
@@ -342,13 +345,14 @@ def cmd_step_done(args: argparse.Namespace) -> None:
                 default=0
             )
             fail_path = fail_inbox / f"{date}-{maxn+1:03d}-pipeline-{m['pipeline_id']}-step-{step_idx}-failed.md"
-            fail_path.write_text(
+            _write_atomic(
+                fail_path,
                 f"---\nKIND: announcement\nAUTHOR: {me}\nREADERS: [{on_failure}]\n"
                 f"REPLIES-TO: null\nSIZE: short\nEND-OF-TURN: {on_failure}\n---\n\n"
                 f"# Pipeline Failure: {m['name']}\n\n"
                 f"Step {step_idx} ({steps[step_idx]['name']}) FAILED.\n"
                 f"Reason: {reason or 'none given'}\n"
-                f"Pipeline ID: {m['pipeline_id']}\n"
+                f"Pipeline ID: {m['pipeline_id']}\n",
             )
             log_entry += f"\nFailure notification sent to {on_failure}."
         append_log(pl_path, log_entry)

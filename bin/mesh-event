@@ -54,6 +54,10 @@ import sys
 import uuid
 from pathlib import Path
 
+_lib = Path(__file__).resolve().parent.parent / "lib"
+if str(_lib) not in sys.path:
+    sys.path.insert(0, str(_lib))
+from write_atomic import write_atomic as _write_atomic  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Intel leak filter — keep in sync with the equivalent block in bin/mesh-send.
@@ -266,9 +270,7 @@ def cmd_publish(args: argparse.Namespace) -> None:
         content += "\n"
 
     event_path = topic_dir / f"{event_id}.md"
-    tmp = event_path.with_suffix(".tmp")
-    tmp.write_text(content, encoding="utf-8")
-    tmp.rename(event_path)
+    _write_atomic(event_path, content)
 
     # Deliver to each subscriber's inbox (create KIND: announcement)
     delivered = 0
@@ -302,7 +304,7 @@ def cmd_publish(args: argparse.Namespace) -> None:
             f"---\n{body}"
         )
         try:
-            notify_path.write_text(notify_content, encoding="utf-8")
+            _write_atomic(notify_path, notify_content)
             delivered += 1
         except OSError as e:
             print(f"mesh-event: warning: could not notify {sub_name}: {e}", file=sys.stderr)
@@ -328,7 +330,7 @@ def cmd_subscribe(args: argparse.Namespace) -> None:
         "subscribed_at": ts,
         "since_id": since_id,
     }, indent=2)
-    sub_file.write_text(sub_data, encoding="utf-8")
+    _write_atomic(sub_file, sub_data)
     print(f"Subscribed {me}@mesh to topic '{args.topic}'")
 
 

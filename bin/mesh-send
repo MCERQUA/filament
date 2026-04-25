@@ -41,6 +41,12 @@ import sys
 import time
 from pathlib import Path
 
+# Shared write_atomic helper from lib/ (same package root)
+_lib = Path(__file__).resolve().parent.parent / "lib"
+if str(_lib) not in sys.path:
+    sys.path.insert(0, str(_lib))
+from write_atomic import write_atomic as _write_atomic  # noqa: E402
+
 # ---------------------------------------------------------------------------
 # Intel leak filter (PROTOCOL §19 — pre-send PII / secret check)
 # Keep in sync with the equivalent block in bin/mesh-event.
@@ -510,12 +516,12 @@ def main() -> None:
 
     # ---- write primary ----
     try:
-        md_path.write_text(content, encoding="utf-8")
+        _write_atomic(md_path, content)
         # sent/ mirror (keeps audit record + powers AUTHOR validation + RECENT.md)
         if sent_dir.is_dir():
             sent_path = sent_dir / f"{slot}.md"
             try:
-                sent_path.write_text(content, encoding="utf-8")
+                _write_atomic(sent_path, content)
             except OSError as e:
                 print(f"mesh-send: warning: could not mirror to sent/: {e}", file=sys.stderr)
         # cc fanout — via the rw /mesh/cc/ overlay
@@ -523,7 +529,7 @@ def main() -> None:
             cc_dir = mesh_dir / "cc" / cc
             try:
                 cc_dir.mkdir(parents=True, exist_ok=True)
-                (cc_dir / f"{slot}.md").write_text(content, encoding="utf-8")
+                _write_atomic(cc_dir / f"{slot}.md", content)
             except OSError as e:
                 print(f"mesh-send: warning: could not cc to {cc}: {e}", file=sys.stderr)
     finally:

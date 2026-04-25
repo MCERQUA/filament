@@ -32,6 +32,11 @@ import re
 import sys
 from pathlib import Path
 
+_lib = Path(__file__).resolve().parent.parent / "lib"
+if str(_lib) not in sys.path:
+    sys.path.insert(0, str(_lib))
+from write_atomic import write_atomic as _write_atomic, fsync_dir as _fsync_dir  # noqa: E402
+
 
 def die(msg: str, code: int = 3) -> None:
     print(f"mesh-task-claim: {msg}", file=sys.stderr)
@@ -111,7 +116,7 @@ def cmd_claim(args: argparse.Namespace) -> None:
             new_lines.append(f'CLAIMED_BY: "{me}@mesh"\n')
             new_lines.append(f"CLAIMED_AT: \"{ts}\"\n")
 
-        dest.write_text("".join(new_lines), encoding="utf-8")
+        _write_atomic(dest, "".join(new_lines))
         task.unlink()
     finally:
         try:
@@ -137,6 +142,7 @@ def cmd_complete(args: argparse.Namespace) -> None:
 
     dest = completed / src.name
     src.rename(dest)
+    _fsync_dir(dest.parent)
     print(str(dest))
 
 
