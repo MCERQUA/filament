@@ -117,12 +117,29 @@ PYEOF
             quarantined=$((quarantined + 1)); continue
         fi
 
+        # Resolve sent_dir to its real path to block symlink-based bypass: an agent
+        # writing a symlink inside its own sent/ that points outside its directory
+        # cannot use it to forge another agent's authorship.
+        sent_real=$(realpath -m "$sent_dir" 2>/dev/null || echo "$sent_dir")
+
+        _sent_path_ok() {
+            local candidate="$1"
+            [[ -f "$candidate" ]] || return 1
+            local real; real=$(realpath -m "$candidate" 2>/dev/null) || return 1
+            [[ "$real" == "${sent_real}/"* ]] || [[ "$real" == "${sent_real}" ]]
+        }
+
         date_prefix=$(echo "$base" | grep -oE '^[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{3}' || true)
         sent_match=false
-        if [[ -f "${sent_dir}/${base}" ]]; then
+        if _sent_path_ok "${sent_dir}/${base}"; then
             sent_match=true
-        elif [[ -n "$date_prefix" ]] && ls "${sent_dir}/${date_prefix}-${author_agent}-"*.md 2>/dev/null | head -1 | grep -q .; then
-            sent_match=true
+        elif [[ -n "$date_prefix" ]]; then
+            for _candidate in "${sent_dir}/${date_prefix}-${author_agent}-"*.md; do
+                if _sent_path_ok "$_candidate"; then
+                    sent_match=true
+                    break
+                fi
+            done
         fi
 
         if ! $sent_match; then
