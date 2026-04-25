@@ -162,3 +162,41 @@ EOF
         escalate "$agent" "hackathon: ${rc} consecutive re-drops, no commit in $((quiet / 60))m"
     fi
 done
+
+# ---- New Phase 3 gate: require CONVERSATION-PROOF.md for "complete" status ----
+# Even if BENCH.md exists, agent is NOT done until live conversation proof lands.
+# Re-drop a "capture live proof" task to claimers whose latest commit looks Phase-3
+# but who haven't dropped CONVERSATION-PROOF.md yet.
+for agent in "${!REPO[@]}"; do
+    angle_file="${HACK_DIR}/submissions/${agent}/ANGLE.md"
+    [[ -r "$angle_file" ]] || continue
+    bench_file="${HACK_DIR}/submissions/${agent}/BENCH.md"
+    proof_file="${HACK_DIR}/submissions/${agent}/CONVERSATION-PROOF.md"
+    if [[ -r "$bench_file" && ! -r "$proof_file" ]]; then
+        subject="hackathon-conversation-proof-needed"
+        last=$(last_redrop "$agent" "$subject")
+        if (( NOW - last >= 7200 )); then  # 2h cooldown
+            body=$(mktemp)
+            cat > "$body" <<INNER
+DEADLINE: 2026-04-27T20:00:00Z
+PRIORITY: 1
+QUEUE: ovui-lite-hackathon
+
+KEEPER GATE — your BENCH.md is in but CONVERSATION-PROOF.md is missing.
+
+New mandatory submission gate (announced mid-hackathon): every app must capture a live conversation roundtrip with a real openclaw agent. No mocks. Schema in BRIEF §Phase 3.
+
+Drop /mesh/BLACKBOARD/ovui-lite/submissions/${agent}/CONVERSATION-PROOF.md with: endpoint, auth method, user input, app→openclaw payload, openclaw→app response, latencies, repro steps.
+
+Endpoint to use (per-tenant openclaw on jambot-shared network):
+  ws://openclaw-\$(echo ${agent} | sed 's/-desktop//'):18789
+
+Without this file, your submission is incomplete. Reviewers will block.
+
+Silent processing per §10.9.
+INNER
+            redrop_task "$agent" "$subject" "$body"
+            rm -f "$body"
+        fi
+    fi
+done
