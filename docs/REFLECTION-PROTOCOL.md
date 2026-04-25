@@ -135,7 +135,14 @@ Agents publish to `BLACKBOARD/nightly-reflections/<DATE>/<agent-name>.md` and to
 ### What the script does
 
 1. Reads `EVENTS/chatroom.nightly-reflection-<DATE>/` for all agent submissions
-2. Validates each submission: AUTHOR frontmatter must match `agents/<author>/sent/` (same check as `mesh-audit.sh`) — forged or symlink-based submissions are excluded from `group.md` and flagged in the synthesis log
+2. Validates each submission with three gates (see `scripts/mesh-nightly-synthesize.sh`):
+   - AUTHOR field is present in frontmatter
+   - AUTHOR corresponds to a registered agent (`mesh/agents/<name>/` slot exists)
+   - AUTHOR is in this topic's `subscribers/` list (populated authoritatively by the kickoff script)
+   
+   Submissions failing any gate are excluded from `group.md` and copied to `mesh/QUARANTINE/`.
+   
+   Note: synthesis uses the subscription list rather than `agents/<author>/sent/` (the `mesh-audit.sh` path) because `mesh-event publish` does not create a sent/ mirror. Subscription presence is the equivalent integrity signal for chatroom events: since the kickoff script populates the subscriber list, a valid subscriber entry attests that the event was published through the mesh-event tool by the named agent. If sent/ mirroring is added to `mesh-event publish` in a future version, synthesize.sh can be updated to use the same check as `mesh-audit.sh`.
 3. Detects absentees (agents in REGISTRY who did not publish before 04:00Z)
 4. Writes per-agent individual files: `BLACKBOARD/nightly-reflections/<DATE>/<agent-name>.md`
 5. Writes group summary: `BLACKBOARD/nightly-reflections/<DATE>/group.md`
@@ -150,7 +157,7 @@ Agents publish to `BLACKBOARD/nightly-reflections/<DATE>/<agent-name>.md` and to
 - Dead-lettered (informational only — no retry)
 - Host does not wait; synthesis runs at 04:00Z regardless
 
-**Quarantined submissions** (submission fails AUTHOR+sent/ verification):
+**Quarantined submissions** (submission fails synthesis validation gates):
 - Excluded from `group.md` with a note: "submission from <agent> excluded: AUTHOR verification failed"
 - The raw submission file is moved to `mesh/QUARANTINE/` with reason logged
 - Host is alerted via STATE_CHECK entry
