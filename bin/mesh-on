@@ -73,15 +73,75 @@ def sweep_stale_claims(root: Path) -> int:
     if not root.is_dir():
         return 0
     count = 0
-    cutoff = time.time() - 60
+    # Semaphore sentinels (SEMAPHORES/*.lock.claim) are legitimate for longer
+    # operations — use 5 min cutoff for them, 60s for inbox/task claims.
+    now = time.time()
     for entry in root.rglob("*.claim"):
         if entry.is_dir():
             try:
+                under_sem = "SEMAPHORES" in entry.parts
+                cutoff = now - 300 if under_sem else now - 60
                 if entry.stat().st_mtime < cutoff:
                     entry.rmdir()
                     count += 1
             except OSError:
                 pass
+    return count
+
+
+def sweep_stale_semaphore_locks(mesh_dir: Path) -> int:
+    """Sweep SEMAPHORES/*.lock files whose ACQUIRED_AT exceeds MESH_SEMAPHORE_TTL.
+
+    Returns count of locks removed.  Warns to stderr for each removal so the
+    operator can identify which agent left a stale lock.
+    """
+    sem_dir = mesh_dir / "SEMAPHORES"
+    if not sem_dir.is_dir():
+        return 0
+    ttl = int(os.environ.get("MESH_SEMAPHORE_TTL", "3600"))
+    now = time.time()
+    count = 0
+    for lock_file in sem_dir.glob("*.lock"):
+        if not lock_file.is_file():
+            continue
+        try:
+            content = lock_file.read_text(encoding="utf-8")
+            acquired_at = ""
+            for line in content.splitlines():
+                if line.startswith("ACQUIRED_AT:"):
+                    acquired_at = line.split(":", 1)[1].strip()
+                    break
+            if not acquired_at:
+                continue
+            import datetime as _dt2
+            try:
+                acq_dt = _dt2.datetime.strptime(acquired_at, "%Y-%m-%dT%H:%M:%SZ").replace(
+                    tzinfo=_dt2.timezone.utc
+                )
+                age = now - acq_dt.timestamp()
+            except ValueError:
+                continue
+            if age > ttl:
+                holder = ""
+                for line in content.splitlines():
+                    if line.startswith("HOLDER:"):
+                        holder = line.split(":", 1)[1].strip()
+                        break
+                print(
+                    f"mesh-on: stale semaphore lock removed: {lock_file.name} "
+                    f"(holder: {holder or 'unknown'}, age: {int(age)}s > TTL {ttl}s)",
+                    file=sys.stderr,
+                )
+                lock_file.unlink()
+                sentinel = lock_file.with_suffix(".lock.claim")
+                if sentinel.is_dir():
+                    try:
+                        sentinel.rmdir()
+                    except OSError:
+                        pass
+                count += 1
+        except OSError:
+            pass
     return count
 
 
@@ -223,9 +283,10 @@ def main() -> None:
 
     mesh_dir, my_dir, log_path = discover_roots()
 
-    # ---- 1. Sweep stale claims ----
+    # ---- 1. Sweep stale claims + stale semaphore locks ----
     swept = sweep_stale_claims(my_dir)
     swept += sweep_stale_claims(mesh_dir)
+    swept += sweep_stale_semaphore_locks(mesh_dir)
     print(f"mesh-on: swept {swept} stale claim(s)")
 
     if args.sweep_only:

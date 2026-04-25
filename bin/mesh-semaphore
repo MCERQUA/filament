@@ -8,11 +8,14 @@
 #   mesh-semaphore acquire <name>    acquire lock; exits 0 on success, 1 if busy
 #   mesh-semaphore release <name>    release lock held by this agent
 #   mesh-semaphore status <name>     print current holder, or "(free)"
-#   mesh-semaphore force-release <name>  release lock regardless of holder (admin use)
+#   mesh-semaphore force-release <name>  release lock regardless of holder (admin only)
 #
 # Env:
-#   AGENT_URI   required (e.g. bun-desktop@mesh)
-#   MESH_ROOT   optional
+#   AGENT_URI              required (e.g. bun-desktop@mesh)
+#   MESH_ROOT              optional
+#   MESH_ADMINS            space-separated list of admin URIs allowed to force-release
+#                          (in addition to host@mesh, which is always allowed)
+#   MESH_SEMAPHORE_TTL     stale-lock threshold in seconds (default: 3600)
 
 set -euo pipefail
 
@@ -84,6 +87,19 @@ cmd_release() {
 cmd_status() {
     if [[ -f "$LOCK_FILE" ]]; then
         cat "$LOCK_FILE"
+        # Warn if lock is stale (age > MESH_SEMAPHORE_TTL)
+        TTL="${MESH_SEMAPHORE_TTL:-3600}"
+        ACQUIRED=$(grep "^ACQUIRED_AT:" "$LOCK_FILE" 2>/dev/null | awk '{print $2}')
+        if [[ -n "$ACQUIRED" ]]; then
+            NOW=$(date +%s)
+            ACQ=$(date -d "$ACQUIRED" +%s 2>/dev/null || echo 0)
+            if [[ $ACQ -gt 0 ]]; then
+                AGE=$(( NOW - ACQ ))
+                if [[ $AGE -gt $TTL ]]; then
+                    echo "WARNING: lock is stale (age ${AGE}s > TTL ${TTL}s) — use force-release to clear" >&2
+                fi
+            fi
+        fi
     elif [[ -d "$SENTINEL" ]]; then
         echo "(claim sentinel exists — acquire in progress)"
     else
@@ -91,7 +107,17 @@ cmd_status() {
     fi
 }
 
+_check_force_release_authz() {
+    # Only host@mesh and agents in MESH_ADMINS may force-release.
+    local allowed="host@mesh ${MESH_ADMINS:-}"
+    for admin in $allowed; do
+        [[ "$AGENT_URI" == "$admin" ]] && return 0
+    done
+    die "force-release denied: ${AGENT_URI} is not in the admin allowlist (host@mesh + MESH_ADMINS)"
+}
+
 cmd_force_release() {
+    _check_force_release_authz
     if [[ -f "$LOCK_FILE" ]]; then
         HOLDER=$(grep "^HOLDER:" "$LOCK_FILE" 2>/dev/null | awk '{print $2}')
         rm -f "$LOCK_FILE"

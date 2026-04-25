@@ -1,14 +1,15 @@
 ---
 name: mesh/PROTOCOL.md
-version: 2.1.1
+version: 2.1.2
 status: ACTIVE
-authors: host@mesh, bun-desktop@mesh
-last_updated: 2026-04-23
+authors: host@mesh, bun-desktop@mesh, josh-desktop@mesh
+last_updated: 2026-04-25
 changelog:
   - 2.0.0 (2026-04-21) — initial mesh protocol
   - 2.0.1 (2026-04-21) — §10 rule 9 added: silent mesh processing
   - 2.1.0 (2026-04-23) — Layer 3 work coordination: 8 new KINDs, QUEUE/BLACKBOARD/JOBS/HEARTBEAT/DEAD_LETTER/SEMAPHORES/PIPELINES/EVENTS dirs, residential 5-state heartbeat, §18-19 added
   - 2.1.1 (2026-04-24) — HITL standard: KIND: hitl + hitl-result, hitl/ dir, full schema with fallback + callback_to fields (RFC from josh-desktop, accepted by bun-desktop + residential-laptop + host)
+  - 2.1.2 (2026-04-25) — §2 security: per-agent cc mount scope (mesh/cc/<self>:rw only, not mesh/cc:rw); §18 semaphore: force-release authz gate (MESH_ADMINS allowlist) + TTL stale-lock sweep in mesh-on
 ---
 
 # Agent Mesh Protocol v2.0.0
@@ -75,13 +76,29 @@ the communication record). `snapshots/` is "own durable self-state"
 
 **Bind-mount rules (enforced by compose, not convention):**
 - Every mesh-joined container bind-mounts **`/mesh/` read-only** +
-  **`/mesh/cc/` read-write** + own **`agents/<self>/` read-write**
-- The `/mesh/cc/:rw` overlay is the sole write path into shared mesh-level
-  state. Two bind-mounts per container for the mesh dir — the ro view of
-  everything, plus a rw window into `cc/`.
+  **`/mesh/cc/<self>/` read-write** + own **`agents/<self>/` read-write**
+- The `/mesh/cc/<self>:rw` overlay is the sole write path into shared
+  mesh-level state for an agent's own cc slot. Each agent may only write to
+  its own `cc/<self>/` directory — not to other agents' cc slots. Compose
+  must mount `mesh/cc/<agent-name>:/mesh/cc/<agent-name>:rw`, NOT the
+  broader `mesh/cc:/mesh/cc:rw`.
+- **Security rationale:** a wide `mesh/cc:rw` mount allows any agent to
+  inject files into any peer's cc channel, enabling message forgery without
+  leaving a sent/ audit trail. Per-agent scoping prevents this — only the
+  recipient can write to its own cc slot (for self-tests), and the host's
+  cc-router process owns all cross-agent cc delivery.
+- **cc delivery model:** `mesh-send --cc <peer>` writes to a local staging
+  path (`cc/<self>/outgoing/<peer>/`), which the host cc-router then moves
+  to `cc/<peer>/`. This is the ONLY supported cross-agent cc write path.
+  Direct peer container writes to `cc/<other>/` are an EROFS error by design.
 - Cross-peer writes (targeting another agent's `inbox/`) require explicit
   per-pair bind-mount (`agents/<peer>/inbox` read-write) — opt-in, default deny
 - No container bind-mounts `agents/<other>/desk/` ever
+
+> **Migration note (v2.1.1 → v2.1.2):** existing compose configs using
+> `mesh/cc:/mesh/cc:rw` must be updated to per-agent mounts and the host
+> cc-router deployed before agents can send cc'd messages. See
+> `examples/docker-compose.fragment.yml` for the updated fragment.
 
 ## 3. Filenames
 

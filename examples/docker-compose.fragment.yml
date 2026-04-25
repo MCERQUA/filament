@@ -3,26 +3,75 @@
 #
 # MESH_ROOT is where the mesh lives on the host (set in mesh-init.sh).
 # Replace <agent-name> with the agent provisioned via scripts/agent-add.sh.
+#
+# EROFS error guide — if a CLI fails with "read-only file system", the
+# corresponding rw mount below is missing from your compose config.
 
 services:
   my-container:
     environment:
       AGENT_URI: my-agent@mesh
       MESH_ROOT: /opt/filament-mesh
+      # OPTIONAL: space-separated list of agent URIs allowed to use
+      # mesh-semaphore force-release (host@mesh is always allowed)
+      # MESH_ADMINS: ""
+      # OPTIONAL: stale semaphore lock TTL in seconds (default: 3600)
+      # MESH_SEMAPHORE_TTL: "3600"
 
     volumes:
-      # Read-only view of all shared mesh state
+      # ── REQUIRED ────────────────────────────────────────────────────────────
+
+      # Read-only view of all shared mesh state (PROTOCOL.md, REGISTRY,
+      # STATE_CHECK, DECISIONS, THREADS, EVENTS, …). Without this mount,
+      # mesh-recv, mesh-on, and any tool that reads /mesh/* will EROFS.
       - /opt/filament-mesh/mesh:/mesh:ro
 
-      # Read-write overlay for cc/ only (single write path into shared state)
-      - /opt/filament-mesh/mesh/cc:/mesh/cc:rw
+      # Per-agent cc slot — rw access to this agent's own cc directory only.
+      # Enables: receiving cc'd messages, self-tests writing to own cc slot.
+      # SECURITY: mount only your own slot (mesh/cc/<self>), NOT mesh/cc:rw.
+      # A wide mesh/cc:rw mount lets any agent forge messages into peers' cc
+      # channels without a sent/ audit trail (PROTOCOL.md §2).
+      # Without this mount: cc messages sent to this agent are invisible.
+      - /opt/filament-mesh/mesh/cc/my-agent:/mesh/cc/my-agent:rw
 
-      # Own agent directory (inbox, sent, snapshots, desk)
+      # Own agent directory — inbox, sent, snapshots, desk.
+      # Without this mount: mesh-recv, mesh-send, mesh-ack all EROFS.
       - /opt/filament-mesh/agents/my-agent:/agent-desk:rw
 
-      # OPTIONAL: cross-peer inbox mounts (explicit per pair, default deny)
+      # ── LAYER 3 (required if using queues, events, semaphores, etc.) ────────
+
+      # Task queue — required for mesh-task-claim, mesh-task-complete.
+      # Without this mount: mesh-task-claim EROFS; agents cannot claim work.
+      - /opt/filament-mesh/mesh/QUEUE:/mesh/QUEUE:rw
+
+      # Shared blackboard — required for mesh-blackboard-write.
+      # Without this mount: blackboard writes EROFS; reads still work via ro.
+      - /opt/filament-mesh/mesh/BLACKBOARD:/mesh/BLACKBOARD:rw
+
+      # Semaphores — required for mesh-semaphore acquire/release.
+      # Without this mount: mesh-semaphore EROFS; distributed locks unavailable.
+      - /opt/filament-mesh/mesh/SEMAPHORES:/mesh/SEMAPHORES:rw
+
+      # Event bus — required for mesh-event publish/subscribe.
+      # Without this mount: mesh-event publish EROFS; subscribe EROFS.
+      - /opt/filament-mesh/mesh/EVENTS:/mesh/EVENTS:rw
+
+      # Pipeline jobs — required for mesh-pipeline step execution.
+      # Without this mount: pipeline step claims EROFS.
+      - /opt/filament-mesh/mesh/JOBS:/mesh/JOBS:rw
+
+      # ── OPTIONAL ────────────────────────────────────────────────────────────
+
+      # Cross-peer inbox mounts — explicit per pair, default deny.
+      # Required for mesh-send to deliver directly to peer inboxes without
+      # host relay. Without this mount, messages route through host@mesh.
       # - /opt/filament-mesh/agents/host/inbox:/peer-inbox/host:rw
       # - /opt/filament-mesh/agents/other-agent/inbox:/peer-inbox/other-agent:rw
 
-      # OPTIONAL: HITL pending dir (if this agent handles HITL requests)
+      # HITL pending dir — only needed if this agent dispatches HITL requests.
+      # Without this mount: HITL requests must be sent via mesh-send to host.
       # - /opt/filament-mesh/hitl/pending:/hitl/pending:rw
+
+      # Upgrade audit log — needed if using mesh-upgrade-post wrapper shims.
+      # Without this mount: upgrade events EROFS; use manual mesh-send fallback.
+      # - /opt/filament-mesh/mesh/UPGRADES:/mesh/UPGRADES:rw
