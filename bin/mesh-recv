@@ -144,7 +144,7 @@ def main() -> None:
             "author": fm.get("AUTHOR", "?"),
             "size": fm.get("SIZE", "?"),
             "urgent": fm.get("URGENT", ""),
-            "mtime": _dt.datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S"),
+            "mtime": _dt.datetime.fromtimestamp(ts, tz=_dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
             "read": f.parent.name == ".read",
         })
         if len(rows) >= args.limit:

@@ -95,7 +95,7 @@ def record_vote(filename: str, vote: str, rationale: str) -> None:
     vote_dir = mesh / "BLACKBOARD" / "votes" / rfc_stem
     vote_dir.mkdir(parents=True, exist_ok=True)
     me = agent_name()
-    ts = _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    ts = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     content = (
         f"---\nKIND: vote\nAUTHOR: {me}@mesh\nRFC: {filename}\n"
         f"VOTE: {vote}\nVOTED_AT: {ts}\n"
@@ -117,11 +117,11 @@ def ack_file(inbox: Path, filename: str, vote: str = "", rationale: str = "") ->
     dest = read_dir / filename
     # if an older ack file with the same name exists, keep both
     if dest.exists():
-        ts = _dt.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+        ts = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%d-%H%M%S")
         dest = read_dir / f"{filename}.dup-{ts}"
     src.rename(dest)
     _fsync_dir(dest.parent)
-    ts = _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    ts = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     log_drop(f"# ACKED {ts} agent={agent_name()} file={filename}")
     if vote:
         record_vote(filename, vote, rationale)

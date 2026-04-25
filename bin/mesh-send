@@ -121,7 +121,7 @@ def _write_force_leak_audit(mesh_dir: Path, sender: str, recipient: str,
     decisions_dir = mesh_dir / "DECISIONS"
     try:
         decisions_dir.mkdir(parents=True, exist_ok=True)
-        ts = _dt.datetime.utcnow().strftime("%Y-%m-%dT%H%M%SZ")
+        ts = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H%M%SZ")
         path = decisions_dir / f"{ts}-{sender}-force-leak-audit.md"
         lines = [
             "---",
@@ -274,7 +274,7 @@ def claim_slot(inbox: Path, sender: str, topic: str) -> tuple[str, Path]:
     release_claim() to remove the .claim sentinel.
     """
     sweep_stale_claims(inbox)
-    date = _dt.datetime.utcnow().strftime("%Y-%m-%d")
+    date = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d")
     start = find_start_seq(inbox, date)
 
     def _try_range(rng):
@@ -554,7 +554,7 @@ def main() -> None:
         release_claim(claim)
 
     # ---- log drop ----
-    ts = _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    ts = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     log_drop(f"# MESH-SEND {ts} sender={sender} to={recipient} kind={args.kind} file={slot}.md")
 
     print(str(md_path))

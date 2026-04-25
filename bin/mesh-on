@@ -294,7 +294,7 @@ def main() -> None:
 
     # ---- 2. Protocol version ----
     version, mt = read_protocol_version(mesh_dir)
-    mt_iso = _dt.datetime.utcfromtimestamp(mt).strftime("%Y-%m-%dT%H:%M:%SZ") if mt else "-"
+    mt_iso = _dt.datetime.fromtimestamp(mt, tz=_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if mt else "-"
     print(f"mesh-on: PROTOCOL.md version {version} (mtime {mt_iso})")
 
     # ---- 3. Inbox summary ----
