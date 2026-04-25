@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """mesh-send — write a file to a peer agent's inbox over the JamBot agent mesh.
 
-Implements PROTOCOL.md v2.0.0 §§3-7, 9. Atomic mkdir-claim slot allocation
+Implements PROTOCOL.md v2.1.2 §§3-7, 9. Atomic mkdir-claim slot allocation
 (§5), auto-computed SIZE (§4), cc fanout via /mesh/cc/ rw overlay (§7),
 urgent rate limit (§9), sent/ mirror + cc writes.
 
@@ -149,6 +149,7 @@ def _write_force_leak_audit(mesh_dir: Path, sender: str, recipient: str,
 # KIND enum + size caps (PROTOCOL §9)
 # ---------------------------------------------------------------------------
 KIND_CAPS_BYTES = {
+    # v2.0.0 KINDs
     "ping": 200,
     "message": None,
     "rfc": None,
@@ -160,6 +161,23 @@ KIND_CAPS_BYTES = {
     "attachment": None,
     "quarantine": None,
     "thread-stub": 200,
+    # v2.1.0 KINDs — Layer 3 work coordination
+    "task": None,
+    "task-result": None,
+    "bg-job": None,
+    "pipeline-step": None,
+    "heartbeat": 500,
+    "dead-letter": None,
+    "delegate": None,
+    "delegate-result": None,
+    # v2.1.1 KINDs — HITL
+    "hitl": None,
+    "hitl-result": None,
+    # v2.1.2 KINDs — blockers
+    "blocker": None,
+    "blocker-resolve": None,
+    # v2.1.2 KINDs — patch delivery
+    "patch": None,
 }
 
 SIZE_TIERS = [

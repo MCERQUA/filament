@@ -1,0 +1,348 @@
+#!/usr/bin/env python3
+"""mesh-blocker — raise, list, and resolve KIND:blocker entries on the mesh.
+
+Blockers are coordination signals: one agent declares it cannot proceed until
+another agent (or Mike) takes a specific action.  Each blocker is stored as a
+local state file in /agent-desk/blockers/ AND sent as a KIND:blocker message
+to the blocked-on agent's inbox.
+
+Stdlib-only. Python 3.8+.
+
+Env:
+    AGENT_URI    required
+    MESH_ROOT    optional
+
+Usage:
+    mesh-blocker raise \\
+        --blocked-on host@mesh \\
+        --blocker-type github-push \\
+        --blocks sprint4-implementation \\
+        --sla 30 \\
+        --fallback proceed \\
+        --resolution "git push origin main from /home/mike/filament" \\
+        < body.txt
+
+    mesh-blocker list                     # show all OPEN blockers (raised or received)
+    mesh-blocker resolve <id> --by host   # mark resolved (closes the blocker)
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import os
+import re
+import sys
+import time
+from pathlib import Path
+
+_lib = Path(__file__).resolve().parent.parent / "lib"
+if str(_lib) not in sys.path:
+    sys.path.insert(0, str(_lib))
+from write_atomic import write_atomic  # noqa: E402
+
+BLOCKER_TYPES = ("github-push", "infra", "access", "other")
+FALLBACK_VALUES = ("proceed", "abort", "wait")
+
+ANSI_RED = "\033[31m"
+ANSI_BOLD = "\033[1m"
+ANSI_RESET = "\033[0m"
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"mesh-blocker: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def agent_name() -> str:
+    uri = os.environ.get("AGENT_URI", "")
+    if not uri:
+        die("AGENT_URI env var required")
+    if not uri.endswith("@mesh"):
+        die(f"AGENT_URI must end with @mesh, got: {uri}")
+    return uri[: -len("@mesh")]
+
+
+def discover_roots() -> tuple[Path, Path]:
+    """Return (my_agent_dir, mesh_dir)."""
+    override = os.environ.get("MESH_ROOT")
+    if override:
+        root = Path(override)
+        return root / "agents" / agent_name(), root / "mesh"
+    if Path("/agent-desk").is_dir() and Path("/mesh").is_dir():
+        return Path("/agent-desk"), Path("/mesh")
+    if Path("/mnt/agent-mesh").is_dir():
+        return (
+            Path("/mnt/agent-mesh/agents") / agent_name(),
+            Path("/mnt/agent-mesh/mesh"),
+        )
+    die("cannot discover mesh root — set MESH_ROOT")
+
+
+def blockers_dir(my_dir: Path) -> Path:
+    d = my_dir / "blockers"
+    d.mkdir(exist_ok=True)
+    (d / ".resolved").mkdir(exist_ok=True)
+    return d
+
+
+def ts_now() -> str:
+    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_frontmatter(text: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    if not text.startswith("---"):
+        return out
+    for line in text.split("\n")[1:]:
+        if line.strip() == "---":
+            break
+        if ":" in line:
+            k, _, v = line.partition(":")
+            out[k.strip()] = v.strip()
+    return out
+
+
+def blocker_id_from_path(p: Path) -> str:
+    return p.stem
+
+
+# ---------------------------------------------------------------------------
+# raise subcommand
+# ---------------------------------------------------------------------------
+def cmd_raise(args: argparse.Namespace) -> None:
+    my_dir, mesh_dir = discover_roots()
+    bd = blockers_dir(my_dir)
+
+    body = sys.stdin.read().strip()
+    ts = ts_now()
+    date = ts[:10]
+    me = agent_name()
+
+    # build unique id
+    slug = re.sub(r"[^a-z0-9]+", "-", args.blocks.lower()).strip("-")[:50]
+    # find a free slot in blockers_dir
+    for n in range(1, 1000):
+        bid = f"{date}-{n:03d}-{me}-blocker-{slug}"
+        candidate = bd / f"{bid}.md"
+        if not candidate.exists():
+            break
+    else:
+        die("no free blocker slot")
+
+    resolution_paths = [r.strip() for r in args.resolution] if args.resolution else []
+    res_lines = "\n".join(f"  - {r}" for r in resolution_paths) if resolution_paths else "  - (see body)"
+
+    content = f"""---
+KIND: blocker
+AUTHOR: {me}@mesh
+BLOCKED_ON: {args.blocked_on}
+BLOCKER_TYPE: {args.blocker_type}
+BLOCKS: {args.blocks}
+SLA_MINUTES: {args.sla}
+FALLBACK: {args.fallback}
+RESOLUTION_PATHS: [{', '.join(resolution_paths)}]
+UNBLOCKS: []
+STATUS: OPEN
+RAISED_AT: {ts}
+---
+[UNBLOCK] {slug}
+
+{body}
+
+Resolution paths:
+{res_lines}
+"""
+
+    write_atomic(candidate, content)
+
+    # send KIND:blocker to the blocked-on agent
+    recipient = args.blocked_on
+    if recipient.endswith("@mesh"):
+        recipient_name = recipient[: -len("@mesh")]
+    else:
+        recipient_name = recipient
+
+    inbox_candidates = []
+    if Path("/agent-mesh-agents-unavailable").is_dir() is False:
+        pass
+    inbox_candidates.append(Path(f"/peer-inbox/{recipient_name}"))
+    # host topology
+    if Path("/mnt/agent-mesh").is_dir():
+        inbox_candidates.append(Path(f"/mnt/agent-mesh/agents/{recipient_name}/inbox"))
+
+    inbox = None
+    for c in inbox_candidates:
+        if c.is_dir():
+            inbox = c
+            break
+
+    if inbox:
+        # atomic write to peer inbox
+        slot_path = inbox / f"{bid}.md"
+        write_atomic(slot_path, content)
+        sent_dir = my_dir / "sent"
+        if sent_dir.is_dir():
+            try:
+                write_atomic(sent_dir / f"{bid}.md", content)
+            except OSError:
+                pass
+
+    print(f"blocker raised: {bid}")
+    print(f"  STATUS: OPEN")
+    print(f"  BLOCKED_ON: {args.blocked_on}")
+    print(f"  BLOCKS: {args.blocks}")
+    print(f"  SLA: {args.sla}min  FALLBACK: {args.fallback}")
+    if inbox:
+        print(f"  sent → {inbox / (bid + '.md')}")
+    else:
+        print(f"  WARNING: could not deliver to {args.blocked_on} inbox (local state saved)")
+
+
+# ---------------------------------------------------------------------------
+# list subcommand
+# ---------------------------------------------------------------------------
+def cmd_list(args: argparse.Namespace) -> None:
+    my_dir, _ = discover_roots()
+    bd = blockers_dir(my_dir)
+    use_color = sys.stdout.isatty()
+
+    open_blockers: list[dict] = []
+
+    # raised by me
+    for f in sorted(bd.glob("*.md")):
+        if f.name.startswith("."):
+            continue
+        try:
+            fm = parse_frontmatter(f.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            continue
+        if fm.get("STATUS", "OPEN") == "OPEN":
+            open_blockers.append({
+                "id": blocker_id_from_path(f),
+                "direction": "raised",
+                "blocked_on": fm.get("BLOCKED_ON", "?"),
+                "blocks": fm.get("BLOCKS", "?"),
+                "blocker_type": fm.get("BLOCKER_TYPE", "?"),
+                "sla": fm.get("SLA_MINUTES", "?"),
+                "fallback": fm.get("FALLBACK", "?"),
+                "raised_at": fm.get("RAISED_AT", "?"),
+                "status": fm.get("STATUS", "OPEN"),
+            })
+
+    # received (in inbox + .read)
+    inbox = my_dir / "inbox"
+    for search_dir in (inbox, inbox / ".read"):
+        if not search_dir.is_dir():
+            continue
+        for f in sorted(search_dir.glob("*.md")):
+            try:
+                fm = parse_frontmatter(f.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                continue
+            if fm.get("KIND") == "blocker" and fm.get("STATUS", "OPEN") == "OPEN":
+                bid = blocker_id_from_path(f)
+                if not any(b["id"] == bid for b in open_blockers):
+                    open_blockers.append({
+                        "id": bid,
+                        "direction": "received",
+                        "blocked_on": fm.get("BLOCKED_ON", "?"),
+                        "blocks": fm.get("BLOCKS", "?"),
+                        "blocker_type": fm.get("BLOCKER_TYPE", "?"),
+                        "sla": fm.get("SLA_MINUTES", "?"),
+                        "fallback": fm.get("FALLBACK", "?"),
+                        "raised_at": fm.get("RAISED_AT", "?"),
+                        "status": fm.get("STATUS", "OPEN"),
+                    })
+
+    if not open_blockers:
+        print("(no open blockers)")
+        return
+
+    header_color = f"{ANSI_BOLD}{ANSI_RED}" if use_color else ""
+    reset = ANSI_RESET if use_color else ""
+    indicator = f"{ANSI_RED}[BLOCKED]{ANSI_RESET}" if use_color else "[BLOCKED]"
+
+    print(f"{header_color}OPEN BLOCKERS ({len(open_blockers)}){reset}")
+    print("─" * 80)
+    for b in open_blockers:
+        dir_arrow = "→" if b["direction"] == "raised" else "←"
+        print(f"  {indicator} {dir_arrow} {b['id']}")
+        print(f"       BLOCKED_ON={b['blocked_on']}  BLOCKS={b['blocks']}")
+        print(f"       TYPE={b['blocker_type']}  SLA={b['sla']}min  FALLBACK={b['fallback']}")
+        print(f"       RAISED_AT={b['raised_at']}")
+        print()
+
+
+# ---------------------------------------------------------------------------
+# resolve subcommand
+# ---------------------------------------------------------------------------
+def cmd_resolve(args: argparse.Namespace) -> None:
+    my_dir, _ = discover_roots()
+    bd = blockers_dir(my_dir)
+    resolved_dir = bd / ".resolved"
+
+    bid = args.id
+    src = bd / f"{bid}.md"
+    if not src.is_file():
+        # try prefix match
+        matches = sorted(bd.glob(f"{bid}*.md"))
+        if len(matches) == 1:
+            src = matches[0]
+            bid = src.stem
+        elif len(matches) > 1:
+            die(f"ambiguous blocker id '{args.id}': {[m.name for m in matches]}")
+        else:
+            die(f"blocker not found: {args.id}")
+
+    content = src.read_text(encoding="utf-8", errors="replace")
+    ts = ts_now()
+    resolver = args.by if args.by else agent_name() + "@mesh"
+
+    # update STATUS in frontmatter
+    content = re.sub(r"^STATUS: OPEN$", f"STATUS: RESOLVED", content, flags=re.MULTILINE)
+    content += f"\nRESOLVED_AT: {ts}\nRESOLVED_BY: {resolver}\n"
+
+    write_atomic(resolved_dir / f"{bid}.md", content)
+    src.unlink()
+
+    print(f"blocker resolved: {bid}")
+    print(f"  RESOLVED_AT: {ts}")
+    print(f"  RESOLVED_BY: {resolver}")
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+def main() -> None:
+    p = argparse.ArgumentParser(prog="mesh-blocker")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    # raise
+    r = sub.add_parser("raise", help="raise a new blocker")
+    r.add_argument("--blocked-on", required=True, help="agent URI that must act, e.g. host@mesh")
+    r.add_argument("--blocker-type", required=True, choices=BLOCKER_TYPES)
+    r.add_argument("--blocks", required=True, help="task-id, sprint-name, or freeform string being blocked")
+    r.add_argument("--sla", type=int, default=30, help="SLA in minutes (default 30)")
+    r.add_argument("--fallback", choices=FALLBACK_VALUES, default="wait", help="action if SLA expires")
+    r.add_argument("--resolution", action="append", help="one-line resolution path (repeatable)")
+
+    # list
+    sub.add_parser("list", help="list OPEN blockers")
+
+    # resolve
+    rv = sub.add_parser("resolve", help="mark a blocker resolved")
+    rv.add_argument("id", help="blocker id (or unique prefix)")
+    rv.add_argument("--by", default=None, help="resolver agent URI (default: self)")
+
+    args = p.parse_args()
+
+    if args.cmd == "raise":
+        cmd_raise(args)
+    elif args.cmd == "list":
+        cmd_list(args)
+    elif args.cmd == "resolve":
+        cmd_resolve(args)
+
+
+if __name__ == "__main__":
+    main()

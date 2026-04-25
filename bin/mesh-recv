@@ -152,7 +152,16 @@ def main() -> None:
 
     if not rows:
         print("(no messages)")
-        sys.exit(2)
+        return
+
+    # Sort KIND:blocker to top, then by mtime descending (rows already sorted by mtime)
+    blocker_rows = [r for r in rows if r["kind"] == "blocker"]
+    other_rows = [r for r in rows if r["kind"] != "blocker"]
+    rows = blocker_rows + other_rows
+
+    # Show open blocker count banner if any
+    if blocker_rows:
+        print(f"*** {len(blocker_rows)} BLOCKER message(s) ***")
 
     # header
     print(f"{'MTIME (UTC)':<20} {'KIND':<13} {'SIZE':<7} {'U':<1} {'FROM':<22} FILENAME")
@@ -160,7 +169,8 @@ def main() -> None:
     for r in rows:
         urg = "!" if r["urgent"].lower() == "true" else " "
         flag = "R" if r["read"] else urg
-        print(f"{r['mtime']:<20} {r['kind']:<13} {r['size']:<7} {flag:<1} {r['author']:<22} {r['filename']}")
+        blocker_prefix = "[BLOCKER] " if r["kind"] == "blocker" else ""
+        print(f"{r['mtime']:<20} {r['kind']:<13} {r['size']:<7} {flag:<1} {r['author']:<22} {blocker_prefix}{r['filename']}")
 
 
 if __name__ == "__main__":
