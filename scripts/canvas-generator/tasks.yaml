@@ -1,0 +1,192 @@
+# tasks.yaml -- registry of work tracked on this dashboard + how to detect status
+#
+# Each task has a `detect` rule. The generator reads filament + mesh state and
+# resolves each task to one of: live | in_progress | planned | blocked | vuln
+#
+# Detection rule types:
+#   file_exists               { path: "/abs/path" }
+#   dir_exists                { path: "/abs/path" }
+#   git_commit                { repo: "filament" | "/abs/repo", subject_match: "regex" }
+#   container_mount           { path: "/in/container", containers: [name1, name2] }
+#   file_exists_in_container  { container: "name", path: "/abs/path" }
+#   glob                      { path: "/path/with/*.glob" }
+#   file_contains             { path: "/abs/path", text: "literal substring" }
+#   cron_present              { pattern: "literal substring of crontab line" }
+#   systemd_timer             { unit: "filament-foo.timer" }
+#
+# Optional fields:
+#   layer       free-form tag (L0, L1, L2, L3, infra, cron, docs, etc.)
+#   owner       agent or team responsible
+#   sprint      free-form milestone label
+#   notes       short note shown in the table
+#   severity    "critical" -> shows as VULN if not LIVE
+#
+# This starter set ships filament's own framework primitives. Replace / extend
+# with your own work as you build on top of the mesh.
+
+tasks:
+  # --- L0 Liveness ---
+  - id: mesh-heartbeat-check
+    name: "mesh-heartbeat-check.sh"
+    layer: L0
+    owner: filament
+    sprint: core
+    detect: { type: file_exists, path: "/opt/filament-mesh/../filament/scripts/mesh-heartbeat-check.sh" }
+    notes: "Periodic liveness sweep. Stamps STATE_CHECK on stale agents."
+
+  - id: registry-host
+    name: "REGISTRY/host.md present"
+    layer: L0
+    owner: host
+    sprint: core
+    detect: { type: file_exists, path: "/opt/filament-mesh/mesh/REGISTRY/host.md" }
+    notes: "Written by mesh-init.sh on first run."
+
+  # --- L1 Direct Messaging ---
+  - id: mesh-send
+    name: "mesh-send"
+    layer: L1
+    owner: filament
+    sprint: core
+    detect: { type: file_exists, path: "/usr/local/bin/mesh-send" }
+    notes: "Point-to-point message delivery with atomic mkdir claims."
+
+  - id: mesh-recv
+    name: "mesh-recv"
+    layer: L1
+    owner: filament
+    sprint: core
+    detect: { type: file_exists, path: "/usr/local/bin/mesh-recv" }
+    notes: "Pulls inbox messages, exit-2 on empty (script-friendly)."
+
+  - id: mesh-ack
+    name: "mesh-ack"
+    layer: L1
+    owner: filament
+    sprint: core
+    detect: { type: file_exists, path: "/usr/local/bin/mesh-ack" }
+    notes: "Mark message read; moves to inbox/.read/."
+
+  # --- L2 Events / Pub-Sub ---
+  - id: mesh-event
+    name: "mesh-event"
+    layer: L2
+    owner: filament
+    sprint: core
+    detect: { type: file_exists, path: "/usr/local/bin/mesh-event" }
+    notes: "Subscribe / publish / poll on EVENTS/<topic>/."
+
+  - id: mesh-chat
+    name: "mesh-chat"
+    layer: L2
+    owner: filament
+    sprint: core
+    detect: { type: file_exists, path: "/usr/local/bin/mesh-chat" }
+    notes: "Wrapper over mesh-event with chatroom.* topic prefix."
+
+  - id: mesh-chat-watch
+    name: "mesh-chat-watch (inotify tail)"
+    layer: L2
+    owner: filament
+    sprint: core
+    detect: { type: file_exists, path: "/usr/local/bin/mesh-chat-watch" }
+    notes: "Sub-second latency on EVENTS/<topic>/."
+
+  # --- L3 Active Coordination ---
+  - id: mesh-queue
+    name: "mesh-queue (work queue)"
+    layer: L3
+    owner: filament
+    sprint: core
+    detect: { type: file_exists, path: "/usr/local/bin/mesh-task-claim" }
+    notes: "Atomic claim-via-rename for distributed work."
+
+  - id: mesh-jobs
+    name: "mesh-jobs (long-running tasks)"
+    layer: L3
+    owner: filament
+    sprint: core
+    detect: { type: file_exists, path: "/usr/local/bin/mesh-jobs" }
+    notes: "Submit / status / result for multi-step jobs."
+
+  - id: mesh-pipeline
+    name: "mesh-pipeline (multi-step pipelines)"
+    layer: L3
+    owner: filament
+    sprint: core
+    detect: { type: file_exists, path: "/usr/local/bin/mesh-pipeline" }
+    notes: "DAG of stages, each handed off via inbox messages."
+
+  - id: mesh-semaphore
+    name: "mesh-semaphore (distributed locks)"
+    layer: L3
+    owner: filament
+    sprint: core
+    detect: { type: file_exists, path: "/usr/local/bin/mesh-semaphore" }
+    notes: "Counting semaphores via SEMAPHORES/<name>/<slot>/."
+
+  # --- Operator infrastructure ---
+  - id: mesh-rollover
+    name: "Daily rollover (04:15)"
+    layer: cron
+    owner: host
+    sprint: core
+    detect: { type: cron_present, pattern: "mesh-rollover" }
+    notes: "Daily snapshot + thread compaction."
+
+  - id: mesh-rollup
+    name: "Rollup (every 5 min)"
+    layer: cron
+    owner: host
+    sprint: core
+    detect: { type: cron_present, pattern: "mesh-rollup" }
+    notes: "Regenerates REGISTRY/STATE_CHECK/THREADS placeholders."
+
+  - id: blocker-check
+    name: "mesh-blocker-check (15-min SLA sweep)"
+    layer: cron
+    owner: host
+    sprint: core
+    detect: { type: systemd_timer, unit: "filament-blocker-check.timer" }
+    notes: "Auto-escalates over-SLA blockers to STATE_CHECK + BLACKBOARD."
+
+  - id: patch-apply
+    name: "mesh-patch-apply (5-min auto-merge)"
+    layer: cron
+    owner: host
+    sprint: core
+    detect: { type: systemd_timer, unit: "filament-patch-apply.timer" }
+    notes: "Applies KIND:patch from agent inboxes, pushes upstream, acks author."
+
+  - id: canvas-generator
+    name: "Canvas dashboard generator"
+    layer: cron
+    owner: host
+    sprint: core
+    detect: { type: systemd_timer, unit: "filament-canvas-generator.timer" }
+    notes: "This page. Regenerated every 15 min."
+
+  # --- Nightly Reflection (optional) ---
+  - id: nightly-kickoff
+    name: "Nightly kickoff (03:15 UTC)"
+    layer: cron
+    owner: host
+    sprint: reflection
+    detect: { type: systemd_timer, unit: "filament-nightly-kickoff.timer" }
+    notes: "Dispatches reflection task to every agent on the mesh."
+
+  - id: nightly-synthesize
+    name: "Nightly synthesis (04:00 UTC)"
+    layer: cron
+    owner: host
+    sprint: reflection
+    detect: { type: systemd_timer, unit: "filament-nightly-synthesize.timer" }
+    notes: "Reads per-agent reflections, writes group.md."
+
+  - id: nightly-archive
+    name: "Nightly archive (04:05 UTC)"
+    layer: cron
+    owner: host
+    sprint: reflection
+    detect: { type: systemd_timer, unit: "filament-nightly-archive.timer" }
+    notes: "Appends to THREADS/nightly-reflections/ rollup."

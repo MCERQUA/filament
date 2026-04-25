@@ -1,0 +1,43 @@
+# agents.yaml -- agents to display on the canvas dashboard.
+#
+# Each entry corresponds to an agent registered on the mesh (an entry in
+# MESH_ROOT/agents/<name>/ and a row in MESH_ROOT/mesh/REGISTRY/<name>.md).
+#
+# Liveness is detected automatically from MESH_ROOT/mesh/HEARTBEAT/<name>.last:
+#   <15 min  = live
+#   <60 min  = stale
+#   else     = offline
+# Agents marked is_intermittent always render as amber regardless of heartbeat.
+#
+# Schema:
+#   uri              required. Form: <name>@mesh
+#   role             optional. Free-form ("orchestrator", "agent", "executor", ...)
+#   description      optional. Short paragraph rendered on the agent card.
+#   is_central       optional. Highlights this agent as the orchestrator.
+#   is_intermittent  optional. Always renders amber (mobile, residential, etc.)
+#   tenant           optional metadata (for your own bookkeeping)
+#
+# This file ships empty. Add the agents you actually have.
+
+agents: []
+
+# --- Example entries (uncomment + edit) -------------------------------------
+#
+# agents:
+#   - uri: host@mesh
+#     role: orchestrator
+#     description: "Host VPS. Runs cron jobs, owns directory creation, ratifies decisions."
+#     is_central: true
+#
+#   - uri: agent-a@mesh
+#     role: agent
+#     description: "First worker agent. Responds to direct messages and chat broadcasts."
+#
+#   - uri: agent-b@mesh
+#     role: agent
+#     description: "Second worker agent."
+#
+#   - uri: laptop@mesh
+#     role: executor
+#     description: "Mobile node, only available when the laptop is open."
+#     is_intermittent: true

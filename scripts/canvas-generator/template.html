@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{PAGE_TITLE}}</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600;700&family=Fira+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #05070f;
+    --surface: #0d1117;
+    --surface2: #161b27;
+    --border: #1e2d45;
+    --blue: #3b82f6;
+    --blue-dim: #1e3a5f;
+    --green: #10b981;
+    --amber: #f59e0b;
+    --red: #ef4444;
+    --cyan: #06b6d4;
+    --text: #e2e8f0;
+    --text-dim: #64748b;
+    --text-muted: #94a3b8;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html { scroll-behavior: smooth; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Fira Sans', system-ui, sans-serif;
+    font-size: 15px;
+    line-height: 1.6;
+    display: flex;
+    min-height: 100vh;
+  }
+  code, .mono { font-family: 'Fira Code', monospace; }
+  .sidebar {
+    width: 220px;
+    min-width: 220px;
+    background: var(--surface);
+    border-right: 1px solid var(--border);
+    position: fixed;
+    top: 0; left: 0; bottom: 0;
+    overflow-y: auto;
+    z-index: 50;
+    padding: 1rem 0;
+  }
+  .sidebar-logo { padding: 0.75rem 1rem 1rem; border-bottom: 1px solid var(--border); margin-bottom: 0.5rem; }
+  .sidebar-logo .title { font-family: 'Fira Code', monospace; font-size: 0.75rem; color: var(--blue); font-weight: 600; letter-spacing: 0.05em; }
+  .sidebar-logo .sub { font-size: 0.65rem; color: var(--text-dim); margin-top: 2px; }
+  .nav-section { padding: 0.35rem 1rem; font-size: 0.6rem; color: var(--text-dim); letter-spacing: 0.1em; text-transform: uppercase; font-weight: 600; margin-top: 0.5rem; }
+  .nav-link { display: block; padding: 0.35rem 1rem; font-size: 0.75rem; color: var(--text-muted); text-decoration: none; border-left: 2px solid transparent; transition: all 0.15s; }
+  .nav-link:hover { color: var(--text); border-left-color: var(--blue); background: rgba(59,130,246,0.05); }
+  .nav-link.active { color: var(--blue); border-left-color: var(--blue); background: rgba(59,130,246,0.08); }
+  .main { margin-left: 220px; flex: 1; padding: 2rem; max-width: 1400px; }
+  h1 { font-size: 1.75rem; font-weight: 700; font-family: 'Fira Code', monospace; color: var(--text); }
+  h2 { font-size: 1.2rem; font-weight: 600; font-family: 'Fira Code', monospace; color: var(--blue); margin-bottom: 1rem; }
+  h3 { font-size: 0.9rem; font-weight: 600; font-family: 'Fira Code', monospace; color: var(--text-muted); margin-bottom: 0.5rem; text-transform: uppercase; letter-spacing: 0.05em; }
+  section { margin-bottom: 3rem; scroll-margin-top: 1.5rem; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.25rem; }
+  .badge { display: inline-flex; align-items: center; gap: 0.3rem; padding: 0.2rem 0.6rem; border-radius: 999px; font-size: 0.65rem; font-family: 'Fira Code', monospace; font-weight: 600; letter-spacing: 0.05em; }
+  .badge-green { background: rgba(16,185,129,0.15); color: var(--green); border: 1px solid rgba(16,185,129,0.3); }
+  .badge-blue { background: rgba(59,130,246,0.15); color: var(--blue); border: 1px solid rgba(59,130,246,0.3); }
+  .badge-amber { background: rgba(245,158,11,0.15); color: var(--amber); border: 1px solid rgba(245,158,11,0.3); }
+  .badge-red { background: rgba(239,68,68,0.15); color: var(--red); border: 1px solid rgba(239,68,68,0.3); }
+  .badge-cyan { background: rgba(6,182,212,0.15); color: var(--cyan); border: 1px solid rgba(6,182,212,0.3); }
+  .dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
+  .dot-green { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .dot-amber { background: var(--amber); box-shadow: 0 0 6px var(--amber); }
+  .dot-red { background: var(--red); box-shadow: 0 0 6px var(--red); }
+  .dot-blue { background: var(--blue); }
+  .dot-dim { background: var(--text-dim); }
+  .mermaid-wrap { background: #0d1117; border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; overflow-x: auto; }
+  .mermaid svg { max-width: 100%; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
+  th { background: var(--surface2); color: var(--text-dim); font-family: 'Fira Code', monospace; font-size: 0.65rem; letter-spacing: 0.05em; text-transform: uppercase; padding: 0.6rem 0.75rem; text-align: left; border-bottom: 1px solid var(--border); }
+  td { padding: 0.6rem 0.75rem; border-bottom: 1px solid var(--border); color: var(--text); vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: rgba(255,255,255,0.02); }
+  .layer-stack { display: flex; flex-direction: column; gap: 0; border-radius: 8px; overflow: hidden; border: 1px solid var(--border); }
+  .layer { padding: 0.9rem 1.25rem; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 1rem; }
+  .layer:last-child { border-bottom: none; }
+  .layer-num { font-family: 'Fira Code', monospace; font-size: 0.65rem; color: var(--text-dim); min-width: 20px; }
+  .layer-name { font-family: 'Fira Code', monospace; font-size: 0.8rem; font-weight: 600; min-width: 120px; }
+  .layer-items { font-size: 0.75rem; color: var(--text-muted); }
+  .layer-l3 { background: rgba(59,130,246,0.04); }
+  .layer-l2 { background: rgba(6,182,212,0.04); }
+  .layer-l1 { background: rgba(16,185,129,0.04); }
+  .layer-l0 { background: rgba(245,158,11,0.04); }
+  .grid-2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 1rem; }
+  .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; }
+  @media (max-width: 900px) {
+    .sidebar { display: none; }
+    .main { margin-left: 0; padding: 1rem; }
+    .grid-2, .grid-3 { grid-template-columns: 1fr; }
+  }
+  .agent-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1rem; position: relative; }
+  .agent-card .agent-name { font-family: 'Fira Code', monospace; font-size: 0.8rem; font-weight: 600; }
+  .agent-card .agent-role { font-size: 0.7rem; color: var(--text-dim); margin-top: 2px; }
+  .agent-card .agent-status { position: absolute; top: 1rem; right: 1rem; display: flex; align-items: center; gap: 0.35rem; font-size: 0.65rem; color: var(--text-dim); }
+  .sep { border: none; border-top: 1px solid var(--border); margin: 2.5rem 0; }
+  .stat-pill { display: inline-flex; align-items: center; gap: 0.4rem; padding: 0.35rem 0.7rem; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; font-family: 'Fira Code', monospace; font-size: 0.72rem; }
+  .stat-pill .stat-val { font-weight: 700; color: var(--text); }
+  .stat-pill .stat-lbl { color: var(--text-dim); font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.05em; }
+  .live-banner { background: linear-gradient(90deg, rgba(16,185,129,0.08), transparent); border-left: 2px solid var(--green); padding: 0.6rem 1rem; border-radius: 0 6px 6px 0; margin-bottom: 1.5rem; font-size: 0.75rem; color: var(--text-muted); }
+  .live-banner .pulse { display: inline-block; width: 6px; height: 6px; background: var(--green); border-radius: 50%; box-shadow: 0 0 6px var(--green); animation: pulse 2s infinite; vertical-align: middle; margin-right: 0.4rem; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+</style>
+</head>
+<body>
+
+<nav class="sidebar">
+  <div class="sidebar-logo">
+    <div class="title">FILAMENT</div>
+    <div class="sub">{{PAGE_SUBTITLE}}</div>
+  </div>
+  <div class="nav-section">Live State</div>
+  <a href="#agents" class="nav-link">Agent Network</a>
+  <a href="#status" class="nav-link">Status Table</a>
+  <a href="#commits" class="nav-link">Recent Commits</a>
+  <div class="nav-section">Architecture</div>
+  <a href="#protocol" class="nav-link">Protocol Stack</a>
+  <a href="#filesystem" class="nav-link">Filesystem</a>
+  <a href="#flows" class="nav-link">Data Flows</a>
+</nav>
+
+<main class="main">
+
+  <div style="margin-bottom:2rem">
+    <div style="display:flex;align-items:center;gap:1rem;flex-wrap:wrap;margin-bottom:0.6rem">
+      <h1>{{PAGE_TITLE}}</h1>
+      <span class="badge badge-green"><span class="dot dot-green"></span>FILAMENT</span>
+    </div>
+    <p style="color:var(--text-dim);font-size:0.85rem;max-width:780px;margin-bottom:1rem">
+      Auto-generated dashboard of the Filament agent mesh. Status flips automatically as commits land, directories appear, mounts go live, and timers fire. Edit detection rules in <code>tasks.yaml</code>.
+    </p>
+    <div style="display:flex;gap:0.5rem;flex-wrap:wrap">
+      <span class="stat-pill"><span class="dot dot-green"></span><span class="stat-val">{{COUNT_LIVE}}</span><span class="stat-lbl">live</span></span>
+      <span class="stat-pill"><span class="dot dot-amber"></span><span class="stat-val">{{COUNT_IN_PROGRESS}}</span><span class="stat-lbl">in&nbsp;progress</span></span>
+      <span class="stat-pill"><span class="dot dot-blue"></span><span class="stat-val">{{COUNT_PLANNED}}</span><span class="stat-lbl">planned</span></span>
+      <span class="stat-pill"><span class="dot dot-red"></span><span class="stat-val">{{COUNT_VULN}}</span><span class="stat-lbl">vuln</span></span>
+      <span class="stat-pill"><span class="stat-val">{{HOST_INBOX_UNREAD}}</span><span class="stat-lbl">unread</span></span>
+      <span class="stat-pill"><span class="stat-val">{{HOST_INBOX_READ}}</span><span class="stat-lbl">acked</span></span>
+      <span class="stat-pill"><span class="stat-val">{{DECISIONS_COUNT}}</span><span class="stat-lbl">decisions</span></span>
+      <span class="stat-pill"><span class="stat-val">{{BROADCASTS_COUNT}}</span><span class="stat-lbl">broadcasts</span></span>
+      <span class="stat-pill"><span class="stat-val">{{UPGRADES_COUNT}}</span><span class="stat-lbl">upgrades</span></span>
+    </div>
+    <div class="live-banner" style="margin-top:1rem"><span class="pulse"></span>Auto-refreshed every 15 min &middot; Last generated: <code>{{LAST_GENERATED}}</code> &middot; mesh root: <code>{{MESH_ROOT}}</code></div>
+  </div>
+
+  <!-- AGENTS -->
+  <section id="agents">
+    <h2>// Agent Network</h2>
+    <p style="color:var(--text-dim);font-size:0.78rem;margin-bottom:1rem;max-width:780px">Liveness derived from <code>HEARTBEAT/&lt;name&gt;.last</code> mtime: green &lt; 15 min, amber &lt; 60 min, red otherwise.</p>
+    <div class="grid-3" style="margin-bottom:1.25rem">
+      {{AGENT_CARDS}}
+    </div>
+  </section>
+
+  <hr class="sep">
+
+  <!-- STATUS -->
+  <section id="status">
+    <h2>// Status Table</h2>
+    <table>
+      <thead>
+        <tr><th>Item</th><th>Layer</th><th>Owner</th><th>Sprint</th><th>Status</th><th>Notes</th></tr>
+      </thead>
+      <tbody>
+        {{STATUS_TABLE_ROWS}}
+      </tbody>
+    </table>
+  </section>
+
+  <hr class="sep">
+
+  <!-- COMMITS -->
+  <section id="commits">
+    <h2>// Recent Commits</h2>
+    <div class="card">
+      {{RECENT_COMMITS}}
+    </div>
+    <div style="margin-top:0.5rem;font-size:0.7rem;color:var(--text-dim)">From <code>git log {{FILAMENT_REPO}}</code></div>
+  </section>
+
+  <hr class="sep">
+
+  <!-- PROTOCOL -->
+  <section id="protocol">
+    <h2>// Protocol Stack</h2>
+    <p style="color:var(--text-dim);font-size:0.8rem;margin-bottom:1rem">4 layers, each independently usable. Higher layers build on lower ones.</p>
+    <div class="layer-stack">
+      <div class="layer layer-l3">
+        <div class="layer-num" style="color:var(--blue)">L3</div>
+        <div class="layer-name" style="color:var(--blue)">Active Coordination</div>
+        <div class="layer-items"><code>mesh-queue</code> &middot; <code>mesh-jobs</code> &middot; <code>mesh-semaphore</code> &middot; <code>mesh-pipeline</code><br><span style="font-size:0.7rem">Parallel work claim, locks, multi-step pipelines</span></div>
+      </div>
+      <div class="layer layer-l2">
+        <div class="layer-num" style="color:var(--cyan)">L2</div>
+        <div class="layer-name" style="color:var(--cyan)">Events &amp; Broadcast</div>
+        <div class="layer-items"><code>mesh-event</code> &middot; <code>mesh-chat</code> &middot; <code>BROADCAST/</code> &middot; <code>BLACKBOARD/</code><br><span style="font-size:0.7rem">Pub/sub fanout, persistent topic history, group chat transport</span></div>
+      </div>
+      <div class="layer layer-l1">
+        <div class="layer-num" style="color:var(--green)">L1</div>
+        <div class="layer-name" style="color:var(--green)">Direct Messaging</div>
+        <div class="layer-items"><code>mesh-send</code> &middot; <code>mesh-recv</code> &middot; <code>mesh-ack</code> &middot; <code>inbox/</code> &middot; <code>sent/</code> &middot; <code>DEAD_LETTER/</code><br><span style="font-size:0.7rem">Point-to-point messages, atomic mkdir-claim delivery, quarantine</span></div>
+      </div>
+      <div class="layer layer-l0">
+        <div class="layer-num" style="color:var(--amber)">L0</div>
+        <div class="layer-name" style="color:var(--amber)">Liveness</div>
+        <div class="layer-items"><code>STATE_CHECK/</code> &middot; <code>HEARTBEAT/</code> &middot; <code>REGISTRY/</code><br><span style="font-size:0.7rem">Agent presence, heartbeat stamps, registry, watchdog integration</span></div>
+      </div>
+    </div>
+  </section>
+
+  <hr class="sep">
+
+  <!-- FILESYSTEM -->
+  <section id="filesystem">
+    <h2>// Filesystem</h2>
+    <div class="grid-2">
+      <div class="mermaid-wrap">
+        <pre class="mermaid">
+graph TD
+    ROOT["{{MESH_ROOT}}"]
+    MESH["mesh/"]
+    AGENTS["agents/"]
+    ROOT --> MESH
+    ROOT --> AGENTS
+    MESH --> BC["BROADCAST/"]
+    MESH --> DEC["DECISIONS/"]
+    MESH --> BB["BLACKBOARD/"]
+    MESH --> EV["EVENTS/"]
+    MESH --> Q["QUEUE/"]
+    MESH --> JOB["JOBS/"]
+    MESH --> SEM["SEMAPHORES/"]
+    MESH --> THR["PIPELINES/"]
+    MESH --> REG["REGISTRY/"]
+    MESH --> SC["STATE_CHECK/"]
+    MESH --> HB["HEARTBEAT/"]
+    MESH --> DL["DEAD_LETTER/"]
+    AGENTS --> AH["host/"]
+    AGENTS --> AAGENT["&lt;agent-name&gt;/"]
+        </pre>
+      </div>
+      <div>
+        <div class="card">
+          <h3>Design Principles</h3>
+          <ul style="font-size:0.78rem;color:var(--text-muted);list-style:none;display:flex;flex-direction:column;gap:0.5rem;margin-top:0.5rem">
+            <li><span style="color:var(--green)">&gt;</span> <strong>Files are the bus.</strong> No broker, no DB. Every primitive is a POSIX file.</li>
+            <li><span style="color:var(--green)">&gt;</span> <strong>Atomic mkdir claims.</strong> Race-free slot allocation.</li>
+            <li><span style="color:var(--green)">&gt;</span> <strong>Additive only.</strong> No file deleted by protocol. TTL + archive handle retention.</li>
+            <li><span style="color:var(--green)">&gt;</span> <strong>inotify trigger.</strong> Watchdog fires consumers in near-real-time.</li>
+            <li><span style="color:var(--blue)">&gt;</span> <strong>EROFS from agents.</strong> Agents only write to mounted paths. Host owns shared-dir creation.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <hr class="sep">
+
+  <!-- FLOWS -->
+  <section id="flows">
+    <h2>// Message Lifecycle</h2>
+    <div class="mermaid-wrap">
+      <pre class="mermaid">
+sequenceDiagram
+    participant A as Sender Agent
+    participant FS as MESH_ROOT
+    participant B as Recipient Agent
+
+    A->>FS: mesh-send --to B --kind message
+    Note over FS: Atomic mkdir claim
+    FS->>B: inotify (watchdog fires)
+    B->>FS: mesh-recv reads inbox
+    B->>B: process message
+    B->>FS: mesh-ack (move to .read/)
+      </pre>
+    </div>
+  </section>
+
+  <div style="height:3rem"></div>
+  <div style="border-top:1px solid var(--border);padding-top:1rem;font-size:0.7rem;color:var(--text-dim);display:flex;justify-content:space-between;flex-wrap:wrap;gap:0.5rem">
+    <span class="mono">filament &middot; auto-generated &middot; {{LAST_GENERATED}}</span>
+    <span class="mono"><a href="https://github.com/MCERQUA/filament" style="color:var(--blue);text-decoration:none">github.com/MCERQUA/filament</a></span>
+  </div>
+</main>
+
+<script>
+mermaid.initialize({
+  startOnLoad: true,
+  theme: 'dark',
+  themeVariables: {
+    primaryColor: '#1e3a5f', primaryTextColor: '#e2e8f0', primaryBorderColor: '#3b82f6',
+    lineColor: '#3b82f6', secondaryColor: '#1a2744', tertiaryColor: '#0f1629',
+    background: '#0d1117', mainBkg: '#0f1629', nodeBorder: '#3b82f6',
+    clusterBkg: '#1a2744', titleColor: '#93c5fd', edgeLabelBackground: '#1a2744',
+    fontFamily: 'Fira Code, monospace', fontSize: '13px',
+  },
+  flowchart: { curve: 'basis', padding: 20 }
+});
+
+const sections = document.querySelectorAll('section[id]');
+const navLinks = document.querySelectorAll('.nav-link');
+const observer = new IntersectionObserver(entries => {
+  entries.forEach(e => {
+    if (e.isIntersecting) {
+      navLinks.forEach(l => l.classList.remove('active'));
+      const a = document.querySelector(`.nav-link[href="#${e.target.id}"]`);
+      if (a) a.classList.add('active');
+    }
+  });
+}, { rootMargin: '-20% 0px -70% 0px' });
+sections.forEach(s => observer.observe(s));
+
+// Auto-refresh page every 15 min to pick up new generation
+setTimeout(() => location.reload(), 15 * 60 * 1000);
+</script>
+</body>
+</html>

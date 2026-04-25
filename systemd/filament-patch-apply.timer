@@ -1,0 +1,13 @@
+[Unit]
+Description=Run filament-patch-apply every 5 minutes
+Documentation=https://github.com/MCERQUA/filament/blob/main/docs/OPERATOR-GUIDE.md
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Persistent=true
+Unit=filament-patch-apply.service
+
+[Install]
+WantedBy=timers.target

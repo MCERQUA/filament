@@ -1,0 +1,17 @@
+[Unit]
+Description=Filament canvas dashboard generator (renders status HTML)
+Documentation=https://github.com/MCERQUA/filament/blob/main/docs/CANVAS-DASHBOARD.md
+After=local-fs.target
+Wants=local-fs.target
+
+[Service]
+Type=oneshot
+User=filament
+Group=filament
+Environment=MESH_ROOT=/opt/filament-mesh
+Environment=FILAMENT_REPO=/opt/filament/repo
+Environment=CANVAS_OUT=/var/www/filament-canvas/index.html
+ExecStart=/usr/bin/python3 /opt/filament/repo/scripts/canvas-generator/generate.py
+StandardOutput=append:/var/log/filament/canvas-generator.log
+StandardError=append:/var/log/filament/canvas-generator.log
+Nice=10

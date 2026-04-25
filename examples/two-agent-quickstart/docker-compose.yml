@@ -1,0 +1,105 @@
+# Two-agent Filament mesh on a single Docker host.
+#
+# Sets up two ubuntu containers (agent-a, agent-b) that share /opt/filament-mesh.
+# Each container has its own writable inbox/sent + cross-peer write to the other's inbox.
+#
+# Bring up:
+#   bash setup.sh
+#   docker compose up -d
+#   bash demo.sh
+
+version: "3.8"
+
+services:
+  agent-a:
+    image: ubuntu:24.04
+    container_name: filament-agent-a
+    hostname: agent-a
+    user: "1000:1000"
+    environment:
+      AGENT_URI: agent-a@mesh
+      MESH_ROOT: /mesh
+    command: ["/bin/bash", "-c", "tail -f /dev/null"]
+    volumes:
+      - filament-mesh-root:/mesh:ro
+      - filament-agent-a-inbox:/mesh/agents/agent-a/inbox:rw
+      - filament-agent-a-sent:/mesh/agents/agent-a/sent:rw
+      - filament-agent-a-desk:/mesh/agents/agent-a/desk:rw
+      - filament-agent-a-snapshots:/mesh/agents/agent-a/snapshots:rw
+      - filament-agent-b-inbox:/mesh/agents/agent-b/inbox:rw
+      - /usr/local/bin:/usr/local/bin:ro
+
+  agent-b:
+    image: ubuntu:24.04
+    container_name: filament-agent-b
+    hostname: agent-b
+    user: "1000:1000"
+    environment:
+      AGENT_URI: agent-b@mesh
+      MESH_ROOT: /mesh
+    command: ["/bin/bash", "-c", "tail -f /dev/null"]
+    volumes:
+      - filament-mesh-root:/mesh:ro
+      - filament-agent-b-inbox:/mesh/agents/agent-b/inbox:rw
+      - filament-agent-b-sent:/mesh/agents/agent-b/sent:rw
+      - filament-agent-b-desk:/mesh/agents/agent-b/desk:rw
+      - filament-agent-b-snapshots:/mesh/agents/agent-b/snapshots:rw
+      - filament-agent-a-inbox:/mesh/agents/agent-a/inbox:rw
+      - /usr/local/bin:/usr/local/bin:ro
+
+volumes:
+  # Bind-mounts to the host mesh tree -- created by setup.sh.
+  filament-mesh-root:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /opt/filament-mesh
+  filament-agent-a-inbox:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /opt/filament-mesh/agents/agent-a/inbox
+  filament-agent-a-sent:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /opt/filament-mesh/agents/agent-a/sent
+  filament-agent-a-desk:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /opt/filament-mesh/agents/agent-a/desk
+  filament-agent-a-snapshots:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /opt/filament-mesh/agents/agent-a/snapshots
+  filament-agent-b-inbox:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /opt/filament-mesh/agents/agent-b/inbox
+  filament-agent-b-sent:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /opt/filament-mesh/agents/agent-b/sent
+  filament-agent-b-desk:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /opt/filament-mesh/agents/agent-b/desk
+  filament-agent-b-snapshots:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /opt/filament-mesh/agents/agent-b/snapshots

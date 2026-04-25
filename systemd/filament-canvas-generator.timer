@@ -1,0 +1,13 @@
+[Unit]
+Description=Run filament-canvas-generator every 15 minutes
+Documentation=https://github.com/MCERQUA/filament/blob/main/docs/CANVAS-DASHBOARD.md
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+AccuracySec=30s
+Persistent=true
+Unit=filament-canvas-generator.service
+
+[Install]
+WantedBy=timers.target

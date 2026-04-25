@@ -1,0 +1,12 @@
+[Unit]
+Description=Run filament-nightly-archive daily at 04:05 UTC
+Documentation=https://github.com/MCERQUA/filament/blob/main/docs/REFLECTION-PROTOCOL.md
+
+[Timer]
+OnCalendar=*-*-* 04:05:00 UTC
+AccuracySec=1min
+Persistent=true
+Unit=filament-nightly-archive.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,56 @@
+# Minimal two-agent Filament mesh on a single Docker host.
+#
+# Both agents bind-mount the shared mesh root read-only (so they can read every
+# message), plus their own inbox / sent / desk directories read-write so they
+# can deliver and consume messages.
+#
+# Bring up:
+#   sudo bash filament/scripts/install.sh
+#   AGENTS=agent-a,agent-b sudo bash filament/contrib/docker/agent-add.sh
+#   docker compose -f compose.example.yml up -d
+#
+# Where the mesh lives on the host (matches MESH_ROOT in install.sh):
+#   /opt/filament-mesh/
+
+version: "3.8"
+
+services:
+  agent-a:
+    image: ubuntu:24.04
+    container_name: agent-a
+    hostname: agent-a
+    user: "1000:1000"
+    environment:
+      AGENT_URI: agent-a@mesh
+      MESH_ROOT: /mesh-root
+    command: ["/bin/bash", "-c", "tail -f /dev/null"]
+    volumes:
+      # Shared mesh root, read-only -- everyone can read everything.
+      - /opt/filament-mesh:/mesh-root:ro
+      # This agent's own write-able directories.
+      - /opt/filament-mesh/agents/agent-a/inbox:/mesh-root/agents/agent-a/inbox:rw
+      - /opt/filament-mesh/agents/agent-a/sent:/mesh-root/agents/agent-a/sent:rw
+      - /opt/filament-mesh/agents/agent-a/desk:/mesh-root/agents/agent-a/desk:rw
+      - /opt/filament-mesh/agents/agent-a/snapshots:/mesh-root/agents/agent-a/snapshots:rw
+      # Cross-peer write so agent-a can deliver to agent-b's inbox.
+      - /opt/filament-mesh/agents/agent-b/inbox:/mesh-root/agents/agent-b/inbox:rw
+      # CLI binaries from the host install.
+      - /usr/local/bin:/usr/local/bin:ro
+
+  agent-b:
+    image: ubuntu:24.04
+    container_name: agent-b
+    hostname: agent-b
+    user: "1000:1000"
+    environment:
+      AGENT_URI: agent-b@mesh
+      MESH_ROOT: /mesh-root
+    command: ["/bin/bash", "-c", "tail -f /dev/null"]
+    volumes:
+      - /opt/filament-mesh:/mesh-root:ro
+      - /opt/filament-mesh/agents/agent-b/inbox:/mesh-root/agents/agent-b/inbox:rw
+      - /opt/filament-mesh/agents/agent-b/sent:/mesh-root/agents/agent-b/sent:rw
+      - /opt/filament-mesh/agents/agent-b/desk:/mesh-root/agents/agent-b/desk:rw
+      - /opt/filament-mesh/agents/agent-b/snapshots:/mesh-root/agents/agent-b/snapshots:rw
+      - /opt/filament-mesh/agents/agent-a/inbox:/mesh-root/agents/agent-a/inbox:rw
+      - /usr/local/bin:/usr/local/bin:ro

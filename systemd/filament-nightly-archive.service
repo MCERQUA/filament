@@ -1,0 +1,16 @@
+[Unit]
+Description=Filament nightly reflection -- archive group.md to THREADS rollup
+Documentation=https://github.com/MCERQUA/filament/blob/main/docs/REFLECTION-PROTOCOL.md
+After=local-fs.target
+Wants=local-fs.target
+
+[Service]
+Type=oneshot
+User=filament
+Group=filament
+Environment=MESH_ROOT=/opt/filament-mesh
+Environment=LOG_DIR=/var/log/filament
+ExecStart=/bin/bash /opt/filament/repo/scripts/mesh-nightly-archive.sh
+StandardOutput=append:/var/log/filament/nightly-archive.log
+StandardError=append:/var/log/filament/nightly-archive.log
+Nice=10
