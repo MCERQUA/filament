@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""mesh-capabilities-query — query agent capability declarations.
+
+Usage:
+    mesh-capabilities-query "needs:ffmpeg"
+    mesh-capabilities-query "tools:python3.13 AND special_access:residential_ip"
+    mesh-capabilities-query "npm_projects:motion-videos"
+    mesh-capabilities-query --list          # dump all agents + their tool lists
+    mesh-capabilities-query --json          # machine-readable output
+
+Filter grammar (simple):
+    TERM [AND TERM ...]
+    TERM = field:value   (substring match on the value list for that field)
+    fields: tools, languages, npm_projects, pip_packages, special_access, needs
+    'needs:X' is an alias that searches tools + languages + npm_projects + pip_packages
+
+Stdlib only.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+REGISTRY_DIR = Path("/mesh/REGISTRY")
+
+
+def parse_frontmatter(text: str) -> dict:
+    """Extract the YAML-ish frontmatter block as raw key→value strings."""
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}
+    fm: dict = {}
+    current_key = None
+    current_list: list | None = None
+    for line in lines[1:]:
+        if line.strip() == "---":
+            break
+        # list item
+        if line.startswith("  - "):
+            if current_list is not None:
+                current_list.append(line[4:].strip())
+            continue
+        # nested key (indented, no leading spaces beyond 2)
+        m = re.match(r"^(\w[\w_-]*):\s*(.*)", line)
+        if m:
+            if current_list is not None:
+                fm[current_key] = current_list
+            current_key = m.group(1)
+            val = m.group(2).strip()
+            if val in ("", "[]"):
+                current_list = []
+            elif val.startswith("[") and val.endswith("]"):
+                current_list = [v.strip() for v in val[1:-1].split(",") if v.strip()]
+                fm[current_key] = current_list
+                current_list = None
+            else:
+                fm[current_key] = val
+                current_list = None
+    if current_list is not None and current_key:
+        fm[current_key] = current_list
+    return fm
+
+
+def load_agents() -> list[dict]:
+    agents = []
+    for cap_file in REGISTRY_DIR.glob("*-CAPABILITIES.md"):
+        try:
+            text = cap_file.read_text()
+            fm = parse_frontmatter(text)
+            fm["_file"] = str(cap_file)
+            fm["_agent"] = cap_file.stem.replace("-CAPABILITIES", "")
+            agents.append(fm)
+        except Exception as e:
+            sys.stderr.write(f"warning: could not parse {cap_file}: {e}\n")
+    return agents
+
+
+def all_searchable(agent: dict) -> list[str]:
+    """All values worth searching across for 'needs:X'."""
+    out = []
+    for key in ("tools", "languages", "npm_projects", "pip_packages"):
+        val = agent.get(key, [])
+        if isinstance(val, list):
+            out.extend(val)
+        elif isinstance(val, str):
+            out.append(val)
+    return [v.lower() for v in out]
+
+
+def matches_term(agent: dict, field: str, value: str) -> bool:
+    value_lc = value.lower()
+    if field == "needs":
+        return any(value_lc in s for s in all_searchable(agent))
+    val = agent.get(field)
+    if val is None:
+        return False
+    if isinstance(val, list):
+        return any(value_lc in v.lower() for v in val)
+    return value_lc in str(val).lower()
+
+
+def parse_query(query: str) -> list[tuple[str, str]]:
+    terms = []
+    for part in re.split(r"\s+AND\s+", query, flags=re.IGNORECASE):
+        part = part.strip()
+        if ":" in part:
+            field, _, value = part.partition(":")
+            terms.append((field.strip(), value.strip()))
+        else:
+            terms.append(("needs", part))
+    return terms
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Query mesh agent capabilities")
+    ap.add_argument("query", nargs="?", help='e.g. "needs:ffmpeg AND tools:python3.13"')
+    ap.add_argument("--list", action="store_true", help="List all agents and their tools")
+    ap.add_argument("--json", action="store_true", dest="as_json", help="JSON output")
+    args = ap.parse_args()
+
+    agents = load_agents()
+    if not agents:
+        sys.stderr.write(f"no *-CAPABILITIES.md files found in {REGISTRY_DIR}\n")
+        sys.exit(1)
+
+    if args.list:
+        for a in sorted(agents, key=lambda x: x.get("_agent", "")):
+            tools = a.get("tools", [])
+            langs = a.get("languages", [])
+            print(f"{a['_agent']:30s}  tools={len(tools)}  langs={len(langs)}")
+            for t in tools[:8]:
+                print(f"  {t}")
+        return
+
+    if not args.query:
+        ap.print_help()
+        sys.exit(0)
+
+    terms = parse_query(args.query)
+    results = [a for a in agents if all(matches_term(a, f, v) for f, v in terms)]
+
+    if args.as_json:
+        print(json.dumps([{k: v for k, v in r.items() if not k.startswith("_")}
+                          for r in results], indent=2))
+        return
+
+    if not results:
+        print("no agents match")
+        sys.exit(1)
+
+    for r in sorted(results, key=lambda x: x.get("_agent", "")):
+        print(r["_agent"])
+
+
+if __name__ == "__main__":
+    main()
+
+---
+

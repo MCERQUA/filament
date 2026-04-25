@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""mesh-capabilities-publish — auto-detect agent capabilities and write/update
+/mesh/REGISTRY/<agent>-CAPABILITIES.md.
+
+Auto-detects: installed interpreters + versions, pip packages (from uv/pip),
+npm package manifests under /config/, any UPGRADES/ entries, GPU access.
+Falls back to host-relay via /peer-inbox/host/ if REGISTRY is ro.
+
+Stdlib + subprocess only.
+
+Usage:
+    mesh-capabilities-publish [--max-parallel N] [--special-access a,b] [--dry-run]
+
+Exit codes:
+    0  success
+    1  AGENT_URI not set or write failed with no relay path
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+
+AGENT_URI = os.environ.get("AGENT_URI", "danielle-desktop@mesh")
+AGENT_NAME = AGENT_URI.replace("@mesh", "")
+REGISTRY_DIR = Path("/mesh/REGISTRY")
+UPGRADES_DIR = Path("/mesh/UPGRADES")
+
+
+def run(cmd: list[str], **kw) -> str:
+    try:
+        return subprocess.check_output(cmd, stderr=subprocess.DEVNULL, text=True, **kw).strip()
+    except Exception:
+        return ""
+
+
+def detect_languages() -> list[dict]:
+    langs = []
+    seen_paths: set[str] = set()
+    for interp in ("python3.13", "python3", "node", "ruby", "go"):
+        path = shutil.which(interp)
+        if not path or path in seen_paths:
+            continue
+        seen_paths.add(path)
+        ver = run([interp, "--version"])
+        langs.append({"name": interp, "version": ver, "path": path})
+    # bun may live outside PATH at a known location
+    for bun_path in (shutil.which("bun"), "/config/mesh-tools/bin/bun/bun"):
+        if bun_path and Path(bun_path).is_file() and bun_path not in seen_paths:
+            seen_paths.add(bun_path)
+            ver = run([bun_path, "--version"])
+            langs.append({"name": "bun", "version": ver, "path": bun_path})
+            break
+    if shutil.which("bash"):
+        langs.append({"name": "bash", "version": run(["bash", "--version"]).splitlines()[0],
+                      "path": shutil.which("bash")})
+    return langs
+
+
+def detect_tools() -> list[str]:
+    tools = []
+    for tool in ("ffmpeg", "chromium", "chromium-browser", "google-chrome",
+                 "xdotool", "convert", "curl", "jq", "git", "gh", "docker", "npx"):
+        if shutil.which(tool):
+            tools.append(tool)
+    # ovui-bridge present if the config dir exists
+    if Path("/config/ovui-bridge").is_dir():
+        tools.append("ovui-bridge")
+    # playwright usable from agent-venv
+    venv_py = Path("/config/agent-venv/bin/python3.13")
+    if venv_py.exists():
+        result = run([str(venv_py), "-c", "import playwright"])
+        if result is not None:  # "" means success (no output), None means exception
+            try:
+                subprocess.check_call([str(venv_py), "-c", "import playwright"],
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                tools.append("playwright")
+            except Exception:
+                pass
+    # remotion
+    if Path("/config/motion-videos/node_modules/remotion").is_dir():
+        tools.append("remotion")
+    if shutil.which("mesh-send"):
+        tools.append("mesh-messaging")
+    tools.append("file-editing")
+    return sorted(set(tools))
+
+
+_NPM_SKIP = ("node_modules", ".npm", ".claude", "site-packages", "dist", "driver")
+
+
+def detect_npm_projects() -> list[str]:
+    projects = []
+    for pkg_json in Path("/config").rglob("package.json"):
+        if any(skip in pkg_json.parts for skip in _NPM_SKIP):
+            continue
+        try:
+            data = json.loads(pkg_json.read_text())
+            name = data.get("name", str(pkg_json.parent.name))
+            projects.append(name)
+        except Exception:
+            pass
+    return projects
+
+
+def detect_upgrades() -> list[str]:
+    if not UPGRADES_DIR.is_dir():
+        return []
+    pkgs = []
+    for f in UPGRADES_DIR.glob(f"*-{AGENT_NAME}-*.md"):
+        for line in f.read_text(errors="replace").splitlines():
+            if line.startswith("PACKAGE:") or line.startswith("PACKAGES:"):
+                pkgs.append(line.split(":", 1)[1].strip())
+    return pkgs
+
+
+def detect_gpu() -> bool:
+    return bool(run(["nvidia-smi"]))
+
+
+def detect_pip_packages() -> list[str]:
+    venv = Path("/config/agent-venv")
+    if venv.exists() and shutil.which("uv"):
+        raw = run(["uv", "pip", "list", "--python", str(venv / "bin/python3.13")])
+        if raw:
+            pkgs = []
+            for line in raw.splitlines()[2:]:
+                parts = line.split()
+                if len(parts) >= 2:
+                    pkgs.append(f"{parts[0]}=={parts[1]}")
+            return pkgs
+    raw = run(["python3.13", "-m", "pip", "list", "--format=json"])
+    if not raw:
+        return []
+    try:
+        return [f"{p['name']}=={p['version']}" for p in json.loads(raw)]
+    except Exception:
+        return []
+
+
+def build_doc(langs: list[dict], tools: list[str], npm_projects: list[str],
+              pip_pkgs: list[str], upgrades: list[str],
+              special_access: list[str], max_parallel: int) -> str:
+    ts = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def yaml_list(items: list[str], indent: int = 2) -> str:
+        if not items:
+            return " " * indent + "[]"
+        pad = " " * indent
+        return "\n".join(f"{pad}- {i}" for i in items)
+
+    lang_items = [f"{l['name']}=={l['version']}" for l in langs]
+
+    return f"""\
+---
+agent: {AGENT_URI}
+last_updated: {ts}
+languages:
+{yaml_list(lang_items)}
+tools:
+{yaml_list(tools)}
+npm_projects:
+{yaml_list(npm_projects)}
+pip_packages:
+{yaml_list(pip_pkgs[:30])}
+upgrades_logged:
+{yaml_list(upgrades)}
+special_access:
+{yaml_list(special_access) if special_access else "  []"}
+max_parallel_tasks: {max_parallel}
+---
+
+# {AGENT_NAME} Capabilities
+
+Auto-generated by mesh-capabilities-publish. Do not edit by hand — re-run to refresh.
+
+## Languages
+{chr(10).join(f'- {l["name"]} {l["version"]}  ({l["path"]})' for l in langs)}
+
+## Tools on PATH / detected
+{chr(10).join(f'- {t}' for t in tools)}
+
+## npm Projects (under /config/)
+{chr(10).join(f'- {p}' for p in npm_projects) or 'none'}
+
+## Special Access
+{chr(10).join(f'- {a}' for a in special_access) if special_access else 'none'}
+"""
+
+
+def _relay_to_host(content: str, out_path: Path) -> None:
+    """Send capability declaration to host inbox for host to write to REGISTRY."""
+    host_inbox = Path("/peer-inbox/host")
+    if not host_inbox.is_dir():
+        sys.exit(f"REGISTRY ro and /peer-inbox/host not found — cannot write or relay {out_path}")
+    ts = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H%M%SZ")
+    relay = host_inbox / f"{ts[:10]}-001-{AGENT_NAME}-capabilities-declaration.md"
+    relay.write_text(
+        f"---\nKIND: attachment\nAUTHOR: {AGENT_URI}\nREADERS: [host@mesh]\n"
+        f"REPLIES-TO: null\nSIZE: short\n"
+        f"END-OF-TURN: host@mesh — reply expected\n---\n"
+        f"Please write the following to {out_path} on the host filesystem:\n\n"
+        f"```\n{content}```\n"
+    )
+    print(f"mesh-capabilities-publish: REGISTRY ro — relayed to host via {relay}")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Publish agent capability declaration to mesh REGISTRY")
+    ap.add_argument("--max-parallel", type=int, default=3,
+                    help="Max concurrent tasks (default: 3)")
+    ap.add_argument("--special-access", default="",
+                    help="Comma-separated special access flags, e.g. residential-ip,gpu")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="Print the declaration without writing it")
+    args = ap.parse_args()
+
+    special = [s.strip() for s in args.special_access.split(",") if s.strip()]
+    if detect_gpu() and "gpu" not in special:
+        special.append("gpu")
+
+    langs = detect_languages()
+    tools = detect_tools()
+    npm_projects = detect_npm_projects()
+    pip_pkgs = detect_pip_packages()
+    upgrades = detect_upgrades()
+
+    doc = build_doc(langs, tools, npm_projects, pip_pkgs, upgrades, special, args.max_parallel)
+
+    if args.dry_run:
+        print(doc)
+        return
+
+    out_path = REGISTRY_DIR / f"{AGENT_NAME}-CAPABILITIES.md"
+    try:
+        out_path.write_text(doc)
+        print(f"mesh-capabilities-publish: wrote {out_path}")
+    except OSError:
+        _relay_to_host(doc, out_path)
+
+
+if __name__ == "__main__":
+    main()
+
+---
+
