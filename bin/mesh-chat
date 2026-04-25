@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+"""mesh-chat — thin wrapper over mesh-event for chatroom topics.
+
+Subcommands:
+    post <slug> [--body "<text>"|--body-file <path>]  publish to chatroom.<slug>
+    tail <slug> [--n N] [--follow]                    print last N; -f to keep watching
+    join <slug>                                       subscribe to chatroom.<slug>
+    leave <slug>                                      unsubscribe
+    list [--filter <prefix>]                          list chatroom.* topics
+
+Post size cap: 8KB (enforced by mesh-event --chat).
+Topic format: chatroom.<slug>  (slug becomes chatroom-<slug> on disk via _slugify).
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+
+CHAT_PREFIX = "chatroom."
+
+
+def die(msg: str, code: int = 3) -> None:
+    print(f"mesh-chat: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def topic_for(slug: str) -> str:
+    if slug.startswith(CHAT_PREFIX):
+        return slug
+    return CHAT_PREFIX + slug
+
+
+def mesh_event_bin() -> str:
+    here = Path(__file__).resolve().parent
+    local = here / "mesh-event"
+    if local.is_file():
+        return str(local)
+    return "mesh-event"
+
+
+def run(cmd: list[str], **kw) -> int:
+    return subprocess.run(cmd, **kw).returncode
+
+
+def cmd_post(args: argparse.Namespace) -> None:
+    topic = topic_for(args.slug)
+    cmd = [mesh_event_bin(), "publish", topic, "--chat"]
+    if args.body is not None:
+        cmd += ["--body", args.body]
+    elif args.body_file:
+        cmd += ["--body-file", args.body_file]
+    if args.ttl:
+        cmd += ["--ttl", str(args.ttl)]
+    sys.exit(run(cmd))
+
+
+def cmd_tail(args: argparse.Namespace) -> None:
+    topic = topic_for(args.slug)
+    cmd = [mesh_event_bin(), "poll", topic, "--tail", str(args.n)]
+    if args.follow:
+        cmd.append("--follow")
+    sys.exit(run(cmd))
+
+
+def cmd_join(args: argparse.Namespace) -> None:
+    topic = topic_for(args.slug)
+    sys.exit(run([mesh_event_bin(), "subscribe", topic]))
+
+
+def cmd_leave(args: argparse.Namespace) -> None:
+    topic = topic_for(args.slug)
+    sys.exit(run([mesh_event_bin(), "unsubscribe", topic]))
+
+
+def cmd_list(args: argparse.Namespace) -> None:
+    # mesh-event uses slugified names on disk (chatroom. → chatroom-). Filter
+    # by the slugified prefix so we actually match.
+    filt = "chatroom-"
+    if args.filter:
+        filt = filt + args.filter.removeprefix(CHAT_PREFIX).lstrip("-")
+    sys.exit(run([mesh_event_bin(), "topics", "--filter", filt]))
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="Chatroom wrapper around mesh-event.")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    po = sub.add_parser("post", help="publish a chat message")
+    po.add_argument("slug", help="chatroom slug (e.g. 'general' or 'chatroom.general')")
+    po.add_argument("--body", default=None)
+    po.add_argument("--body-file", default=None)
+    po.add_argument("--ttl", type=int, default=None, help="time-to-live in seconds")
+
+    ta = sub.add_parser("tail", help="print last N chat messages")
+    ta.add_argument("slug")
+    ta.add_argument("--n", type=int, default=20)
+    ta.add_argument("-f", "--follow", action="store_true", help="keep watching for new messages")
+
+    jo = sub.add_parser("join", help="subscribe to a chatroom")
+    jo.add_argument("slug")
+
+    le = sub.add_parser("leave", help="unsubscribe from a chatroom")
+    le.add_argument("slug")
+
+    ls = sub.add_parser("list", help="list chatroom topics")
+    ls.add_argument("--filter", default=None)
+
+    args = p.parse_args()
+    {
+        "post": cmd_post,
+        "tail": cmd_tail,
+        "join": cmd_join,
+        "leave": cmd_leave,
+        "list": cmd_list,
+    }[args.cmd](args)
+
+
+if __name__ == "__main__":
+    main()

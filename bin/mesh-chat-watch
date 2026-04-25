@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# mesh-chat-watch — emit an event line for every new message in a chatroom topic.
+#
+# Usage: mesh-chat-watch <slug|chatroom.slug>
+#
+# Uses inotifywait on mesh/EVENTS/<slugified-topic>/ when available, else 2s poll.
+# Exit cleanly on SIGINT. One line per new event file — wrap in Monitor(persistent=true)
+# to surface chat activity to the agent without polling from inside the LLM loop.
+
+set -euo pipefail
+
+if [[ $# -lt 1 ]]; then
+    echo "usage: mesh-chat-watch <slug|chatroom.slug>" >&2
+    exit 3
+fi
+
+SLUG="$1"
+case "$SLUG" in
+    chatroom.*) TOPIC="$SLUG" ;;
+    *) TOPIC="chatroom.$SLUG" ;;
+esac
+
+# Mirror _slugify() in bin/mesh-event: lowercase, non [a-z0-9-] → '-'
+slugify() {
+    local s="${1,,}"
+    printf '%s' "$s" | sed -E 's/[^a-z0-9-]+/-/g; s/^-+//; s/-+$//'
+}
+
+TOPIC_SLUG="$(slugify "$TOPIC")"
+
+# Resolve mesh root (mirror bin/mesh-event discover_paths order)
+if [[ -n "${MESH_ROOT:-}" ]]; then
+    MESH_DIR="${MESH_ROOT}/mesh"
+elif [[ -d /mesh ]]; then
+    MESH_DIR="/mesh"
+elif [[ -d /mnt/agent-mesh ]]; then
+    MESH_DIR="/mnt/agent-mesh/mesh"
+else
+    echo "mesh-chat-watch: cannot discover mesh root — set MESH_ROOT" >&2
+    exit 1
+fi
+
+TOPIC_DIR="${MESH_DIR}/EVENTS/${TOPIC_SLUG}"
+mkdir -p "$TOPIC_DIR"
+
+trap 'exit 0' INT TERM
+
+if command -v inotifywait >/dev/null 2>&1; then
+    # -m monitor; close_write + moved_to catches atomic tmp.rename by mesh-event publish
+    inotifywait -m -q \
+        -e close_write -e moved_to \
+        --format '%f' "$TOPIC_DIR" 2>/dev/null \
+    | while IFS= read -r name; do
+        case "$name" in
+            ev-*.md) printf '[chat new] %s %s\n' "$TOPIC" "$name" ;;
+        esac
+    done
+else
+    # Poll fallback: 2s cadence, track seen set in-memory only (restart = re-seed)
+    declare -A SEEN
+    for f in "$TOPIC_DIR"/ev-*.md; do
+        [[ -f "$f" ]] || continue
+        SEEN["$(basename "$f")"]=1
+    done
+    while true; do
+        for f in "$TOPIC_DIR"/ev-*.md; do
+            [[ -f "$f" ]] || continue
+            b="$(basename "$f")"
+            if [[ -z "${SEEN[$b]:-}" ]]; then
+                SEEN["$b"]=1
+                printf '[chat new] %s %s\n' "$TOPIC" "$b"
+            fi
+        done
+        sleep 2
+    done
+fi

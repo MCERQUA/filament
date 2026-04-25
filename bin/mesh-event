@@ -15,8 +15,9 @@ Env:
     MESH_ROOT    optional
 
 Subcommands:
-    publish <topic> [--body "<text>"|--body-file <path>] [--ttl <seconds>]
+    publish <topic> [--body "<text>"|--body-file <path>] [--ttl <seconds>] [--chat]
                         publish an event to a topic; delivers to all active subscribers
+                        --chat sets CHAT:true and trims inbox notifications to a one-liner
 
     subscribe <topic> [--since-id <event-id>]
                         subscribe to a topic (idempotent)
@@ -27,9 +28,11 @@ Subcommands:
     list-subscribers <topic>
                         list agents subscribed to a topic
 
-    poll <topic> [--since-id <event-id>] [--limit <n>]
-                        print unprocessed events for this agent (oldest first)
-                        marks them processed on stdout flush
+    poll <topic> [--since-id <event-id>] [--limit <n>] [--tail <n>] [--follow]
+                        print events for this agent (oldest first)
+                        default: unprocessed only, marked processed on print
+                        --tail N: print last N events regardless of processed state
+                        --follow: after initial print, watch for new events (Ctrl-C to exit)
 
     topics [--filter <prefix>]
                         list all active topics
@@ -49,9 +52,14 @@ import datetime as _dt
 import json
 import os
 import re
+import subprocess
 import sys
+import time
 import uuid
 from pathlib import Path
+
+
+CHAT_BODY_MAX_BYTES = 8 * 1024  # Host decision 2026-04-24: 8KB cap on chatroom posts
 
 
 def die(msg: str, code: int = 3) -> None:
@@ -146,6 +154,11 @@ def cmd_publish(args: argparse.Namespace) -> None:
     if not body.strip():
         die("event body cannot be empty (use --body, --body-file, or stdin)")
 
+    chat = bool(getattr(args, "chat", False))
+    if chat and len(body.encode("utf-8")) > CHAT_BODY_MAX_BYTES:
+        die(f"--chat body exceeds {CHAT_BODY_MAX_BYTES}B cap "
+            f"(got {len(body.encode('utf-8'))}B)", code=3)
+
     ttl = args.ttl or ""
     expires = ""
     if ttl:
@@ -170,6 +183,8 @@ def cmd_publish(args: argparse.Namespace) -> None:
         f"PUBLISHED_AT: {ts}",
         f"SUBSCRIBER_COUNT: {len(subscribers)}",
     ]
+    if chat:
+        fm_lines.append("CHAT: true")
     if expires:
         fm_lines.append(f"EXPIRES_AT: {expires}")
         fm_lines.append(f"TTL_SECONDS: {ttl}")
@@ -206,16 +221,32 @@ def cmd_publish(args: argparse.Namespace) -> None:
         slot = f"{date}-{maxn+1:03d}-event-{topic_slug}-{event_id}"
         notify_path = inbox / f"{slot}.md"
 
-        notify_content = (
-            f"---\nKIND: announcement\nAUTHOR: {me}\nREADERS: [{sub_name}@mesh]\n"
-            f"REPLIES-TO: null\nSIZE: short\nEVENT_ID: {event_id}\nTOPIC: {args.topic}\n"
-            f"END-OF-TURN: {sub_name}@mesh — event notification\n---\n\n"
-            f"# Event: {args.topic}\n\n"
-            f"**ID:** {event_id}  \n"
-            f"**Published:** {ts} by {me}\n\n"
-            f"Poll with: `mesh-event poll {args.topic} --since-id {event_id}`\n\n"
-            f"---\n{body}"
-        )
+        if chat:
+            first_line = next(
+                (ln.strip() for ln in body.splitlines() if ln.strip()),
+                "(empty)",
+            )
+            if len(first_line) > 140:
+                first_line = first_line[:137] + "..."
+            notify_content = (
+                f"---\nKIND: announcement\nAUTHOR: {me}\nREADERS: [{sub_name}@mesh]\n"
+                f"REPLIES-TO: null\nSIZE: micro\nEVENT_ID: {event_id}\nTOPIC: {args.topic}\n"
+                f"CHAT: true\n"
+                f"END-OF-TURN: {sub_name}@mesh — chat notification\n---\n\n"
+                f"chat [{args.topic}] {me}: {first_line}\n\n"
+                f"Tail: `mesh-event poll {args.topic} --tail 20`\n"
+            )
+        else:
+            notify_content = (
+                f"---\nKIND: announcement\nAUTHOR: {me}\nREADERS: [{sub_name}@mesh]\n"
+                f"REPLIES-TO: null\nSIZE: short\nEVENT_ID: {event_id}\nTOPIC: {args.topic}\n"
+                f"END-OF-TURN: {sub_name}@mesh — event notification\n---\n\n"
+                f"# Event: {args.topic}\n\n"
+                f"**ID:** {event_id}  \n"
+                f"**Published:** {ts} by {me}\n\n"
+                f"Poll with: `mesh-event poll {args.topic} --since-id {event_id}`\n\n"
+                f"---\n{body}"
+            )
         try:
             notify_path.write_text(notify_content, encoding="utf-8")
             delivered += 1
@@ -285,8 +316,44 @@ def cmd_list_subscribers(args: argparse.Namespace) -> None:
         print(f"(no active subscribers for topic '{args.topic}')")
 
 
+def _topic_events_sorted(topic_dir: Path) -> list[Path]:
+    """Events in this topic, sorted by PUBLISHED_AT when available, else by id."""
+    evs = [f for f in topic_dir.iterdir()
+           if f.name.startswith("ev-") and f.suffix == ".md"]
+    def key(f: Path) -> tuple[str, str]:
+        fm = load_frontmatter(f)
+        return (fm.get("PUBLISHED_AT", ""), f.name)
+    evs.sort(key=key)
+    return evs
+
+
+def _print_event(ev_path: Path) -> None:
+    fm = load_frontmatter(ev_path)
+    body = event_body(ev_path)
+    pub = fm.get("PUBLISHED_AT", "?")
+    author = fm.get("AUTHOR", "?")
+    tag = " [chat]" if fm.get("CHAT", "").lower() == "true" else ""
+    print(f"## {ev_path.stem}{tag}  [{pub}] from {author}")
+    print(body)
+    if not body.endswith("\n"):
+        print()
+    sys.stdout.flush()
+
+
+def _is_expired(fm: dict) -> bool:
+    expires = fm.get("EXPIRES_AT", "")
+    if not expires:
+        return False
+    try:
+        exp_dt = _dt.datetime.strptime(expires, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=_dt.timezone.utc)
+    except ValueError:
+        return False
+    return _dt.datetime.now(_dt.timezone.utc) > exp_dt
+
+
 def cmd_poll(args: argparse.Namespace) -> None:
-    """Print unprocessed events for this agent, oldest first."""
+    """Print events for this agent. Unprocessed by default, or --tail N / --follow."""
     mesh_dir, _ = discover_paths()
     topic_dir = events_dir(mesh_dir, args.topic)
     me = agent_name()
@@ -295,62 +362,93 @@ def cmd_poll(args: argparse.Namespace) -> None:
     processed_dir = topic_dir / ".processed" / me
     processed_dir.mkdir(parents=True, exist_ok=True)
 
-    # Collect events, sort by event_id (ev-<hex> — UUID4 ordering isn't guaranteed
-    # but creation time ordering works because we list by name which includes the ID)
-    events = sorted(
-        [f for f in topic_dir.iterdir() if f.name.startswith("ev-") and f.suffix == ".md"],
-        key=lambda f: f.name
-    )
-
+    tail = args.tail or 0
+    follow = bool(args.follow)
     since_id = args.since_id or ""
     limit = args.limit or 50
-    printed = 0
 
+    events = _topic_events_sorted(topic_dir)
+
+    # --tail: print the last N events regardless of processed state, then (if --follow) watch
+    if tail > 0:
+        recent = [e for e in events if not _is_expired(load_frontmatter(e))]
+        for ev_path in recent[-tail:]:
+            _print_event(ev_path)
+            (processed_dir / ev_path.stem).touch()
+        if not follow:
+            return
+        _follow_loop(topic_dir, processed_dir)
+        return
+
+    # Default path: print unprocessed events, oldest first, up to --limit
+    printed = 0
     for ev_path in events:
         ev_id = ev_path.stem
-
-        # Skip if already processed
         if (processed_dir / ev_id).exists():
             continue
-
-        # Skip if before since_id
         if since_id and ev_id <= since_id:
             continue
-
         fm = load_frontmatter(ev_path)
-
-        # Check TTL
-        expires = fm.get("EXPIRES_AT", "")
-        if expires:
-            try:
-                exp_dt = _dt.datetime.strptime(expires, "%Y-%m-%dT%H:%M:%SZ").replace(
-                    tzinfo=_dt.timezone.utc)
-                if _dt.datetime.now(_dt.timezone.utc) > exp_dt:
-                    # Expired — mark processed + skip
-                    (processed_dir / ev_id).touch()
-                    continue
-            except ValueError:
-                pass
-
-        body = event_body(ev_path)
-        pub = fm.get("PUBLISHED_AT", "?")
-        author = fm.get("AUTHOR", "?")
-
-        print(f"## {ev_id}  [{pub}] from {author}")
-        print(body)
-        if not body.endswith("\n"):
-            print()
-
-        # Mark processed
+        if _is_expired(fm):
+            (processed_dir / ev_id).touch()
+            continue
+        _print_event(ev_path)
         (processed_dir / ev_id).touch()
-
         printed += 1
         if printed >= limit:
             break
 
+    if follow:
+        _follow_loop(topic_dir, processed_dir)
+        return
+
     if printed == 0:
         print(f"(no new events on topic '{args.topic}' for {me}@mesh)")
         sys.exit(1)
+
+
+def _follow_loop(topic_dir: Path, processed_dir: Path) -> None:
+    """Watch topic_dir for new events. Uses inotifywait if available, else 2s poll."""
+    have_inotify = False
+    try:
+        subprocess.run(["inotifywait", "--help"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        have_inotify = True
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        have_inotify = False
+
+    def emit_new():
+        for ev_path in _topic_events_sorted(topic_dir):
+            ev_id = ev_path.stem
+            if (processed_dir / ev_id).exists():
+                continue
+            fm = load_frontmatter(ev_path)
+            if _is_expired(fm):
+                (processed_dir / ev_id).touch()
+                continue
+            _print_event(ev_path)
+            (processed_dir / ev_id).touch()
+
+    try:
+        if have_inotify:
+            # -m monitor, -e close_write|moved_to catches our atomic tmp.rename
+            proc = subprocess.Popen(
+                ["inotifywait", "-m", "-q",
+                 "-e", "close_write", "-e", "moved_to",
+                 "--format", "%f", str(topic_dir)],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            )
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                name = line.strip()
+                if name.startswith("ev-") and name.endswith(".md"):
+                    emit_new()
+        else:
+            while True:
+                emit_new()
+                time.sleep(2)
+    except KeyboardInterrupt:
+        pass
 
 
 def cmd_topics(args: argparse.Namespace) -> None:
@@ -430,6 +528,8 @@ def main() -> None:
     pub.add_argument("--body", default=None)
     pub.add_argument("--body-file", default=None)
     pub.add_argument("--ttl", default=None, help="time-to-live in seconds")
+    pub.add_argument("--chat", action="store_true",
+                     help="chatroom post: set CHAT:true, trim inbox notification, cap body at 8KB")
 
     ss = sub.add_parser("subscribe", help="subscribe this agent to a topic")
     ss.add_argument("topic")
@@ -441,10 +541,14 @@ def main() -> None:
     ls = sub.add_parser("list-subscribers", help="list agents subscribed to a topic")
     ls.add_argument("topic")
 
-    po = sub.add_parser("poll", help="print unprocessed events for this agent")
+    po = sub.add_parser("poll", help="print events for this agent")
     po.add_argument("topic")
     po.add_argument("--since-id", default=None)
     po.add_argument("--limit", type=int, default=50)
+    po.add_argument("--tail", type=int, default=0,
+                    help="print last N events regardless of processed state")
+    po.add_argument("--follow", action="store_true",
+                    help="after initial print, watch for new events (Ctrl-C to exit)")
 
     tp = sub.add_parser("topics", help="list all event topics")
     tp.add_argument("--filter", default=None)
