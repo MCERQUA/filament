@@ -204,6 +204,48 @@ def event_body(path: Path) -> str:
     return parts[2] if len(parts) >= 3 else text
 
 
+# ── EROFS outbox fallback ─────────────────────────────────────────────────────
+
+def _publish_via_outbox(event_id: str, topic: str, content: str, author_uri: str) -> None:
+    """Fallback for containers where /mesh/ is read-only.
+
+    Writes the event to one of two outbox paths, checked in order:
+    1. $PEER_EVENTS_DIR/<event_id>.md  — future compose bind-mount (preferred)
+    2. /agent-desk/events-outbox/<event_id>.md — agent-desk rw slot (always present)
+
+    Host inotify watcher (or cron) merges outbox events into /mesh/EVENTS/.
+    The outbox file carries full event content so host can replay without
+    additional context.
+    """
+    peer_events = os.environ.get("PEER_EVENTS_DIR")
+    if peer_events:
+        outbox = Path(peer_events)
+    else:
+        # Derive agent-desk path from AGENT_URI or default
+        agent_stem = (os.environ.get("AGENT_URI") or "unknown").split("@")[0]
+        # Try /agent-desk/events-outbox/ (in-container bind-mount view)
+        candidate = Path("/agent-desk/events-outbox")
+        if candidate.parent.exists():
+            outbox = candidate
+        else:
+            # Last resort: /tmp/mesh-events-outbox/
+            outbox = Path(f"/tmp/mesh-events-outbox-{agent_stem}")
+
+    try:
+        outbox.mkdir(parents=True, exist_ok=True)
+        relay_path = outbox / f"{event_id}.md"
+        # Wrap content with relay metadata so host knows origin + topic
+        relay_content = (
+            f"---\nRELAY_KIND: event-outbox\nORIGIN: {author_uri}\n"
+            f"TOPIC: {topic}\nEVENT_ID: {event_id}\n---\n"
+        ) + content
+        _write_atomic(relay_path, relay_content)
+    except OSError as e2:
+        # If even the outbox write fails, warn and continue (event is lost for now)
+        print(f"mesh-event: warning: outbox write failed ({e2}); event {event_id} not persisted",
+              file=sys.stderr)
+
+
 # ── subcommands ───────────────────────────────────────────────────────────────
 
 def cmd_publish(args: argparse.Namespace) -> None:
@@ -270,7 +312,18 @@ def cmd_publish(args: argparse.Namespace) -> None:
         content += "\n"
 
     event_path = topic_dir / f"{event_id}.md"
-    _write_atomic(event_path, content)
+    try:
+        _write_atomic(event_path, content)
+    except OSError as e:
+        import errno as _errno
+        if e.errno != _errno.EROFS:
+            raise
+        # /mesh/ is read-only inside containers. Route via outbox.
+        _publish_via_outbox(event_id, args.topic, content, me)
+        print(f"{event_id}")
+        print(f"Published to topic '{args.topic}' via outbox relay (EROFS fallback)",
+              file=sys.stderr)
+        return
 
     # Deliver to each subscriber's inbox (create KIND: announcement)
     delivered = 0
