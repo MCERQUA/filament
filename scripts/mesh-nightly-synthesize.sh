@@ -86,6 +86,7 @@ for reg in "${MESH_ROOT}/mesh/REGISTRY/"*.md; do
     agent="$(basename "$reg" .md)"
     case "$agent" in
         host|REGISTRY|"") continue ;;
+        *-CAPABILITIES) continue ;;  # capabilities sidecars are not agents
     esac
     if ! printf '%s\n' "${POSTED[@]}" | grep -qx "$agent"; then
         ABSENT+=("$agent")

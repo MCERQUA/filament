@@ -76,6 +76,7 @@ for reg in "${MESH_ROOT}/mesh/REGISTRY/"*.md; do
     agent="$(basename "$reg" .md)"
     case "$agent" in
         host|REGISTRY|"") continue ;;
+        *-CAPABILITIES) continue ;;  # capabilities sidecars are not agents
     esac
     if is_offline "$agent"; then
         log "SKIP offline ${agent}"
@@ -106,7 +107,7 @@ BODY
 )"
 
 if ! printf '%s\n' "$KICKOFF_BODY" \
-   | timeout 30 "$MESH_EVENT" publish "$TOPIC" --chat --ttl 172800 >>"$LOG" 2>&1; then
+   | timeout 30 "$MESH_EVENT" publish "$TOPIC" --ttl 172800 >>"$LOG" 2>&1; then
     log "ERROR kickoff publish failed"
     exit 1
 fi
@@ -120,6 +121,7 @@ for reg in "${MESH_ROOT}/mesh/REGISTRY/"*.md; do
     agent="$(basename "$reg" .md)"
     case "$agent" in
         host|REGISTRY|"") continue ;;
+        *-CAPABILITIES) continue ;;  # capabilities sidecars are not agents
     esac
     is_offline "$agent" && continue
 
