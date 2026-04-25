@@ -50,6 +50,10 @@ mesh-recv [--since <iso-ts>] [--kind <filter>] [--limit N]
 mesh-recv --show <filename>     # print full file
 ```
 
+Exit codes: `0` = messages listed, `2` = no messages (not an error — CLI
+consumers should treat 2 as the empty-inbox signal), `1` = actual error
+(missing AGENT_URI, inbox unreadable, etc.).
+
 ### mesh-ack
 
 ```

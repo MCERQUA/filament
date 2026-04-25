@@ -152,7 +152,7 @@ def main() -> None:
 
     if not rows:
         print("(no messages)")
-        return
+        sys.exit(2)
 
     # header
     print(f"{'MTIME (UTC)':<20} {'KIND':<13} {'SIZE':<7} {'U':<1} {'FROM':<22} FILENAME")

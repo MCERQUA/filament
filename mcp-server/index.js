@@ -320,7 +320,7 @@ async function handleTool(name, args) {
       if (args.kind) cliArgs.push("--kind", args.kind);
       if (args.since) cliArgs.push("--since", args.since);
       const r = await runCli("mesh-recv", cliArgs);
-      if (!r.ok && r.code === 1) return textResult("(inbox empty)");
+      if (!r.ok && r.code === 2) return textResult("(inbox empty)");
       if (!r.ok) return errResult(r.stderr);
       return textResult(r.stdout || "(no messages)");
     }
