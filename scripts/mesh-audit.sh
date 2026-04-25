@@ -84,9 +84,30 @@ PYEOF
             quarantined=$((quarantined + 1)); continue
         fi
 
-        # SPEAKING_AS carve-outs
-        [[ "$speaking_as" == "mike-direct" || "$speaking_as" == "operator-direct" ]] && continue
-        [[ -n "$speaking_as" && "$speaking_as" != "mike-direct" ]] && continue
+        # SPEAKING_AS validation
+        # Operator-identity values: no agent sent/ record exists — skip AUTHOR check.
+        if [[ "$speaking_as" == "mike-direct" || "$speaking_as" == "operator-direct" ]]; then
+            continue
+        fi
+
+        # Non-empty SPEAKING_AS: validate against explicit allowlist.
+        # AUTHOR verification still runs below — SPEAKING_AS does NOT bypass it.
+        if [[ -n "$speaking_as" ]]; then
+            if [[ "$speaking_as" == "orchestrator-relay" ]]; then
+                : # valid relay; AUTHOR check runs for the relaying agent
+            elif [[ "$speaking_as" =~ ^[a-z0-9_-]+-on-behalf-of-[a-z0-9_-]+$ ]]; then
+                # Validate the on-behalf-of target is a registered agent
+                behalf_target="${speaking_as#*-on-behalf-of-}"
+                if [[ ! -d "${AGENTS_DIR}/${behalf_target}" ]]; then
+                    quarantine_file "$f" "invalid SPEAKING_AS: on-behalf-of target '${behalf_target}' has no agents/ slot" "$inbox_agent"
+                    quarantined=$((quarantined + 1)); continue
+                fi
+                # AUTHOR check still runs for the acting agent below
+            else
+                quarantine_file "$f" "invalid SPEAKING_AS: '${speaking_as}' — allowed values: orchestrator-relay | <agent>-on-behalf-of-<agent>" "$inbox_agent"
+                quarantined=$((quarantined + 1)); continue
+            fi
+        fi
 
         # AUTHOR vs sent/ verification
         author_agent="${author%@mesh}"
