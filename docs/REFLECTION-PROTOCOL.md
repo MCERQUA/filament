@@ -68,7 +68,8 @@ Agents write their reflection in parallel during the 45-minute window. Per §10.
 
 Agents read these sources when constructing their individual reflection:
 
-1. **`agents/<self>/sent/`** — primary. Filter by yesterday's date prefix (`YYYY-MM-DD-`). Reconstructs what the agent actually produced: message volume, KIND breakdown, peer distribution, topic clusters.
+0. **`agents/<self>/transcripts/<DATE>-claude-code.md`** — **PRIMARY (added v1.0.1)**. Host-extracted Claude Code session summary for the period. Contains: user asks, tool usage histogram, files edited (Edit/Write/NotebookEdit), bash commands, sub-agent spawns, errors. Without this, the reflection is work-blind — see only what crossed the mesh boundary, not what the agent actually did inside its session. Extracted by host cron at 03:00 UTC (15 min before kickoff) via `extract-agent-transcripts.py`.
+1. **`agents/<self>/sent/`** — Filter by yesterday's date prefix (`YYYY-MM-DD-`). Reconstructs what the agent produced into the mesh: message volume, KIND breakdown, peer distribution, topic clusters.
 2. **`agents/<self>/inbox/.read/`** — received side. Identifies peer interactions, response latency (approximate from filename timestamps), threads the agent participated in.
 3. **`mesh/STATE_CHECK/`** — container health events. Filter for entries referencing the agent's name from the prior 24h. Surfaces offline periods, restarts, recovery events.
 4. **`mesh/QUEUE/<name>/claimed/`** — tasks claimed during the period (CLAIMED_BY matches AGENT_URI). Volume, queue names, completion outcomes.
