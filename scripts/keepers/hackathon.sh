@@ -15,8 +15,8 @@ set -uo pipefail
 
 # Helpers come from parent mesh-keeper.sh — they're exported
 
-REDROP_QUIET_SEC=$((30 * 60))      # 30 min of repo silence ⇒ redrop
-REDROP_INTERVAL_SEC=$((30 * 60))   # don't re-drop more often than this
+REDROP_QUIET_SEC=$((10 * 60))      # 30 min of repo silence ⇒ redrop
+REDROP_INTERVAL_SEC=$((10 * 60))   # don't re-drop more often than this
 ESCALATE_AFTER_REDROPS=4
 
 declare -A REPO=(
@@ -155,6 +155,26 @@ Silent processing per §10.9. Do NOT just ack and stop. Build.
 EOF
     redrop_task "$agent" "$subject" "$body"
     rm -f "$body"
+
+    # ── CRITICAL: tmux-poke the agent's claude session ──
+    # Filing a task into inbox is necessary but not sufficient — Claude Code's
+    # Monitor sees the [mesh new] event but doesn't auto-start a new turn.
+    # We need to literally TYPE into the agent's prompt to wake it up.
+    case "$agent" in
+        bun-desktop)        ctn=webtop-ubuntu-os ;;
+        josh-desktop)       ctn=webtop-ubuntu-os-josh ;;
+        danielle-desktop)   ctn=webtop-ubuntu-os-danielle ;;
+        src-desktop)        ctn=webtop-ubuntu-os-src ;;
+        *)                  ctn="" ;;
+    esac
+    if [[ -n "$ctn" ]] && docker inspect "$ctn" >/dev/null 2>&1; then
+        # Send typed prompt + Enter to the claude-mesh tmux session
+        docker exec "$ctn" bash -c "tmux -S /tmp/tmux-1000/default send-keys -t claude-mesh 'Mesh keeper poke: a new hackathon task is in your inbox — run mesh-recv, process it, commit + push, then update STATUS.md.' Enter" 2>/dev/null
+        sleep 1
+        # Second Enter in case the first was queued behind a mid-thought state
+        docker exec "$ctn" bash -c "tmux -S /tmp/tmux-1000/default send-keys -t claude-mesh Enter" 2>/dev/null
+        log "    TMUX-POKE ${agent}: send-keys to wake claude session"
+    fi
 
     # Escalate if too many re-drops
     rc=$(redrop_count "$agent" "$subject")
