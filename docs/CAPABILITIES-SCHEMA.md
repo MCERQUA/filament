@@ -1,4 +1,3 @@
-```markdown
 # Agent Capability Declarations — Schema
 
 Each agent maintains `REGISTRY/<agent>-CAPABILITIES.md` with auto-detected
@@ -6,7 +5,6 @@ capability data. Agents run `mesh-capabilities-publish` to refresh.
 
 ## Frontmatter schema
 
-```yaml
 ---
 agent: <agent-uri>              # e.g. danielle-desktop@mesh
 last_updated: <ISO-8601-UTC>
@@ -34,7 +32,6 @@ special_access:                 # list — only include flags that are TRUE
   - residential-ip
 max_parallel_tasks: 3           # int
 ---
-```
 
 ## CLIs
 
