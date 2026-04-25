@@ -27,6 +27,7 @@ Exit codes:
     1  generic failure
     2  rate-limit hit (urgent 1/hr)
     3  validation failure (unknown kind, missing AGENT_URI, etc.)
+    4  intel filter blocked — body matched a secret/PII pattern; use --force-leak to override
 """
 from __future__ import annotations
 
@@ -39,6 +40,104 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Intel leak filter (PROTOCOL §19 — pre-send PII / secret check)
+# Keep in sync with the equivalent block in bin/mesh-event.
+# ---------------------------------------------------------------------------
+_BUILTIN_FILTER_PATTERNS: list[tuple[str, str]] = [
+    (r"\bhf_[A-Za-z0-9]{20,}\b",            "HuggingFace token (hf_...)"),
+    (r"\bsk-[A-Za-z0-9]{20,}\b",            "API key (sk-...)"),
+    (r"eyJ[A-Za-z0-9+/=]{30,}",             "JWT token (eyJ...)"),
+    (r"\bAKIA[A-Z0-9]{16}\b",               "AWS access key (AKIA...)"),
+    (r"\bghp_[A-Za-z0-9]{36}\b",            "GitHub PAT (ghp_...)"),
+    (r"\bgithub_pat_[A-Za-z0-9_]{59,}\b",   "GitHub fine-grained token"),
+    (r"\baia_sk_[A-Za-z0-9]{20,}\b",        "AIA secret key (aia_sk_...)"),
+    (r"-----BEGIN [A-Z ]+-----",            "PEM / private key block"),
+    (r"(?i)\bpassword\s*=\s*\S{4,}",        "password= assignment"),
+    (r"(?i)\bauthorization\s*:\s*\S+",      "Authorization header value"),
+]
+
+
+def _load_private_context(agent_dir: Path) -> list[tuple[str, str]]:
+    """Load per-agent filter patterns from /agent-desk/private_context.md.
+
+    Format — one entry per line, prefix determines category:
+        client: <regex>   client name / PII (company, employees, contacts)
+        domain: <regex>   domain / hostname patterns
+        secret: <regex>   custom secret formats (API keys, internal tokens)
+    Blank lines and lines starting with # are ignored.
+    """
+    ctx = agent_dir / "private_context.md"
+    if not ctx.is_file():
+        return []
+    patterns: list[tuple[str, str]] = []
+    labels = {"client": "client pattern", "domain": "domain pattern", "secret": "custom secret"}
+    try:
+        with ctx.open("r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                for prefix, label in labels.items():
+                    key = f"{prefix}: "
+                    if line.startswith(key):
+                        pat = line[len(key):]
+                        patterns.append((pat, f"{label}: {pat[:50]}"))
+                        break
+    except OSError:
+        pass
+    return patterns
+
+
+def _run_intel_filter(body: str, agent_dir: Path) -> list[tuple[int, str, str]]:
+    """Scan body lines for secrets / PII. Returns [(line_no, snippet, description)]."""
+    per_agent = _load_private_context(agent_dir)
+    all_patterns = _BUILTIN_FILTER_PATTERNS + per_agent
+    hits: list[tuple[int, str, str]] = []
+    for lineno, line in enumerate(body.splitlines(), 1):
+        for pat, desc in all_patterns:
+            try:
+                m = re.search(pat, line)
+            except re.error:
+                continue
+            if m:
+                start = max(0, m.start() - 15)
+                snippet = line[start:m.end() + 15].strip()
+                hits.append((lineno, snippet, desc))
+                break  # one hit per line is enough
+    return hits
+
+
+def _write_force_leak_audit(mesh_dir: Path, sender: str, recipient: str,
+                            hits: list[tuple[int, str, str]]) -> None:
+    """Append a force-leak audit entry to mesh/DECISIONS/ (best-effort)."""
+    decisions_dir = mesh_dir / "DECISIONS"
+    try:
+        decisions_dir.mkdir(parents=True, exist_ok=True)
+        ts = _dt.datetime.utcnow().strftime("%Y-%m-%dT%H%M%SZ")
+        path = decisions_dir / f"{ts}-{sender}-force-leak-audit.md"
+        lines = [
+            "---",
+            "KIND: decision",
+            f"AUTHOR: {sender}@mesh",
+            f"FORCE_LEAK: true",
+            f"RECIPIENT: {recipient}",
+            f"TIMESTAMP: {ts}",
+            "---",
+            "",
+            "# Force-leak override — audit record",
+            "",
+            f"**Agent:** {sender}@mesh  **Recipient:** {recipient}",
+            "",
+            "**Matched patterns (would have been blocked):**",
+        ]
+        for lineno, snippet, desc in hits:
+            lines.append(f"- Line {lineno}: [{desc}] near: {snippet!r}")
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except OSError:
+        pass  # audit is best-effort; don't block the send
+
 
 # ---------------------------------------------------------------------------
 # KIND enum + size caps (PROTOCOL §9)
@@ -250,21 +349,24 @@ def log_drop(message: str) -> None:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-class _MeshArgParser(argparse.ArgumentParser):
-    """argparse exits 2 on parse errors by default; remap to 3 (validation)
-    so callers can distinguish parse failures from rate-limit (exit 2)."""
+class _ArgumentParser(argparse.ArgumentParser):
+    """Remap argparse's default exit-2 to exit-3 so exit 2 stays exclusively
+    for rate-limit (PROTOCOL §9). Without this, `mesh-send --bad-flag` and
+    `mesh-send` hitting the urgent rate-limit both exit 2, making them
+    indistinguishable for callers using exit codes to drive retry logic."""
     def error(self, message: str) -> None:
         self.print_usage(sys.stderr)
-        print(f"mesh-send: {message}", file=sys.stderr)
+        print(f"{self.prog}: error: {message}", file=sys.stderr)
         sys.exit(3)
 
 
 def parse_args() -> argparse.Namespace:
-    p = _MeshArgParser(description="Write a file to a peer agent's inbox over the JamBot agent mesh.")
+    p = _ArgumentParser(description="Write a file to a peer agent's inbox over the JamBot agent mesh.")
     p.add_argument("--to", required=True, help="recipient URI, e.g. host@mesh")
     p.add_argument("--kind", required=True, choices=sorted(KIND_CAPS_BYTES.keys()))
     p.add_argument("--subject", required=True, help="kebab-case topic (becomes filename <topic> segment)")
-    p.add_argument("--replies-to", default=None, help="prior filename this replies to")
+    p.add_argument("--replies-to", "--reply-to", default=None, dest="replies_to",
+                   help="prior filename this replies to")
     p.add_argument("--cc", action="append", default=[], help="cc recipient URI, repeatable")
     p.add_argument("--urgent", action="store_true", help="add URGENT: true frontmatter (required for KIND urgent; carve-out for KIND ack)")
     p.add_argument("--state-check", default=None, help="STATE_CHECK frontmatter (forensic snapshot text)")
@@ -273,6 +375,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--promoted-to", default=None, help="PROMOTED_TO frontmatter (for thread-stub)")
     p.add_argument("--end-of-turn", default=None, help="END-OF-TURN frontmatter; defaults to '<to> — reply expected'")
     p.add_argument("--dry-run", action="store_true", help="show what would be written without writing")
+    p.add_argument("--force-leak", action="store_true",
+                   help="bypass intel filter and send anyway; creates an audit entry in mesh/DECISIONS/")
     return p.parse_args()
 
 
@@ -301,6 +405,19 @@ def main() -> None:
 
     # ---- body + size ----
     body = sys.stdin.read()
+
+    # ---- intel leak filter ----
+    hits = _run_intel_filter(body, my_dir)
+    if hits:
+        if args.force_leak:
+            _write_force_leak_audit(mesh_dir, sender, args.to, hits)
+        else:
+            print("mesh-send: BLOCKED — potential secret / business intel detected:", file=sys.stderr)
+            for lineno, snippet, desc in hits:
+                print(f"  line {lineno}: [{desc}]  near: {snippet!r}", file=sys.stderr)
+            print("mesh-send: use --force-leak to override (creates audit entry in mesh/DECISIONS/)", file=sys.stderr)
+            sys.exit(4)
+
     body_bytes = body.encode("utf-8")
     size_tier = compute_size_tier(len(body_bytes))
     cap = KIND_CAPS_BYTES.get(args.kind)

@@ -183,3 +183,39 @@ node=$(mesh-pick-residential)
 # Dispatch (background task = safe during in_use; foreground = available only)
 echo "task body" | mesh-send --to "$node" --kind delegate --subject my-task
 ```
+
+## Intel leak filter
+
+`mesh-send` and `mesh-event publish` run an automatic pre-send filter that
+blocks messages containing secrets or client PII before they leave the agent.
+
+**Built-in patterns (always active):** HuggingFace tokens (`hf_*`), OpenAI/
+Anthropic keys (`sk-*`), JWTs (`eyJ*`), AWS keys (`AKIA*`), GitHub tokens
+(`ghp_*`, `github_pat_*`), AIA keys (`aia_sk_*`), PEM blocks, `password=`
+assignments, `Authorization:` header values.
+
+**Per-agent patterns:** Create `/agent-desk/private_context.md` with client-
+specific regex (client names, domains, custom secret formats). Template:
+`skill/private-context-template.md`.
+
+```
+# /agent-desk/private_context.md
+client: Northern Fire Cannabis
+domain: northernfire\.ca
+secret: MY_KEY_[A-Z0-9]{32}
+```
+
+**On block:** `mesh-send` exits 4 with the matched pattern + line number.
+Fix the message body, or use `--force-leak` to override (creates an audit
+entry in `mesh/DECISIONS/`).
+
+**Nightly reflections:** agents must review their reflection draft against
+their `private_context.md` patterns before publish. The reflection SKILL.md
+covers this as a prerequisite step.
+
+## Task-specific skills
+
+Some agent tasks have their own SKILL.md with full step-by-step runbooks.
+This global skill covers baseline mesh ops; these handle the specifics:
+
+- **Nightly reflection:** `skill/mesh-nightly-reflection/SKILL.md` — auto-triggers on `KIND: task` with subject `nightly-reflection-<date>`. Covers data gathering, seven-section template, mesh-event publish, BLACKBOARD write, failure modes, and post-synthesis reading.

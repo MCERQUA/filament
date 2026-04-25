@@ -8,6 +8,69 @@ No message broker. No database. No central server. A mounted directory and a han
 
 ---
 
+## Quickstart
+
+Get two agents talking in under 30 minutes.
+
+**Prerequisites:** Python 3.8+, Node.js ≥18 (MCP server only), sudo access.
+
+### 1. Clone and initialize
+
+```bash
+git clone https://github.com/MCERQUA/filament.git
+sudo bash filament/scripts/mesh-init.sh
+```
+
+`mesh-init.sh` creates `/opt/filament-mesh/` with the full directory tree, installs the CLIs to `/usr/local/bin/`, copies `PROTOCOL.md` into the mesh root, and enables the watchdog systemd service. It is idempotent — safe to re-run.
+
+### 2. Set your agent identity
+
+```bash
+export AGENT_URI=agent-a@mesh
+export MESH_ROOT=/opt/filament-mesh
+# Persist across sessions:
+echo 'export AGENT_URI=agent-a@mesh' >> ~/.profile
+echo 'export MESH_ROOT=/opt/filament-mesh' >> ~/.profile
+```
+
+### 3. Register on the mesh
+
+```bash
+sudo bash filament/scripts/agent-add.sh agent-a
+```
+
+This creates `agents/agent-a/{inbox,sent,snapshots,desk}/` with the correct permissions and writes the agent's registry row.
+
+### 4. Verify the setup
+
+```bash
+mesh-on
+```
+
+Expected output (green path):
+```
+mesh-on: swept 0 stale claim(s)
+mesh-on: PROTOCOL.md version 2.1.1 ...
+mesh-on: 0 unread / 0 acked in /opt/filament-mesh/agents/agent-a/inbox
+mesh-on: 1 peer(s) in REGISTRY: agent-a
+```
+
+If anything looks wrong, run `mesh-on --check` for a diagnostic that exits nonzero with a specific error message.
+
+### 5. Send your first message
+
+```bash
+# Self-ping to verify the full round-trip
+echo "hello mesh" | mesh-send --to agent-a@mesh --kind ping --subject hello
+mesh-recv
+```
+
+**Adding a second agent:** repeat steps 2–3 with a different `AGENT_URI` (`agent-b@mesh`), sharing the same `/opt/filament-mesh/` directory via Docker bind-mount, Tailscale, or SSH. Add a cross-peer inbox mount so each agent can write to the other's inbox (see [`examples/docker-compose.fragment.yml`](examples/docker-compose.fragment.yml)).
+
+**MCP server (Claude Code / Cursor):** see [MCP Server](#mcp-server) — requires `cd filament/mcp-server && npm install` before first use.
+
+---
+
 ## Why Filament?
 
 Modern AI deployments involve multiple agents working in parallel — some in Docker containers, some on remote machines, some running voice interfaces, some handling desktop automation. Getting them to coordinate without building a bespoke service for every project is hard.
@@ -642,10 +705,10 @@ cd /mnt/agent-mesh && git init && git add -A && git commit -m "mesh: initial lay
 ### 2. Add an agent
 
 ```bash
-bash scripts/agent-mesh/agent-mesh-add.sh my-agent my-tenant
+sudo bash scripts/agent-add.sh my-agent
 ```
 
-This creates `agents/my-agent/{inbox,sent,snapshots,desk}` and prints a compose fragment to add to the agent's `docker-compose.yml`.
+This creates `agents/my-agent/{inbox,sent,snapshots,desk}` with the correct permissions and writes `mesh/REGISTRY/my-agent.md`.
 
 ### 3. Configure bind mounts (Docker Compose fragment)
 
@@ -660,15 +723,22 @@ volumes:
 
 ### 4. Configure the MCP server (Claude Code `.claude/settings.json`)
 
+**Requires Node.js ≥18.** Install dependencies first:
+```bash
+cd /path/to/filament/mcp-server && npm install
+```
+
+Then add to `.claude/settings.json` (or equivalent MCP config):
 ```json
 {
   "mcpServers": {
-    "jambot-mesh": {
+    "filament-mesh": {
       "command": "node",
-      "args": ["/path/to/mesh-mcp-server/index.js"],
+      "args": ["/path/to/filament/mcp-server/index.js"],
       "env": {
         "AGENT_URI": "my-agent@mesh",
-        "MESH_ROOT": "/mnt/agent-mesh"
+        "MESH_ROOT": "/mnt/agent-mesh",
+        "MESH_BIN": "/usr/local/bin"
       }
     }
   }

@@ -19,6 +19,9 @@ Usage:
     mesh-on                 # full bootstrap
     mesh-on --quiet         # skip printing message contents, only counts
     mesh-on --sweep-only    # only do the stale-claim sweep and exit
+    mesh-on --check         # pre-flight diagnostic; exits nonzero with a specific
+                            # error message if AGENT_URI, mesh root, PROTOCOL.md,
+                            # REGISTRY, or inbox are missing/malformed
 """
 from __future__ import annotations
 
@@ -143,11 +146,80 @@ def list_inbox_summary(inbox: Path, quiet: bool) -> dict:
     return stats
 
 
+def run_checks(mesh_dir: Path, my_dir: Path) -> bool:
+    """Pre-flight diagnostic. Prints one line per problem; returns True if all pass."""
+    ok = True
+
+    # 1. AGENT_URI format
+    uri = os.environ.get("AGENT_URI", "")
+    if not uri:
+        print("mesh-on --check: FAIL AGENT_URI is not set. Export it: export AGENT_URI=my-agent@mesh", file=sys.stderr)
+        ok = False
+    elif not uri.endswith("@mesh"):
+        print(f"mesh-on --check: FAIL AGENT_URI must end with @mesh, got: {uri}", file=sys.stderr)
+        ok = False
+    else:
+        name = uri[: -len("@mesh")]
+        if not re.fullmatch(r"[a-z0-9][a-z0-9\-]*", name):
+            print(f"mesh-on --check: FAIL AGENT_URI agent name must be kebab-case, got: {name}", file=sys.stderr)
+            ok = False
+
+    # 2. mesh dir exists
+    if not mesh_dir.is_dir():
+        print(f"mesh-on --check: FAIL mesh dir not found: {mesh_dir}. Run scripts/mesh-init.sh or set MESH_ROOT.", file=sys.stderr)
+        ok = False
+    else:
+        # 3. PROTOCOL.md present inside mesh root
+        protocol = mesh_dir / "PROTOCOL.md"
+        if not protocol.is_file():
+            print(f"mesh-on --check: FAIL PROTOCOL.md missing at {protocol}. Re-run scripts/mesh-init.sh to restore it.", file=sys.stderr)
+            ok = False
+
+        # 4. REGISTRY has at least one entry
+        registry_file = mesh_dir / "REGISTRY.md"
+        reg_dir = mesh_dir / "REGISTRY"
+        has_registry = (registry_file.is_file() and registry_file.stat().st_size > 0) or (
+            reg_dir.is_dir() and any(True for _ in reg_dir.iterdir())
+        )
+        if not has_registry:
+            print(
+                "mesh-on --check: FAIL REGISTRY is empty — no agents registered. "
+                "Run: sudo bash scripts/agent-add.sh <your-agent-name>",
+                file=sys.stderr,
+            )
+            ok = False
+
+    # 5. This agent's inbox exists
+    inbox = my_dir / "inbox"
+    if not inbox.is_dir():
+        name = uri[: -len("@mesh")] if uri.endswith("@mesh") else uri
+        print(
+            f"mesh-on --check: FAIL inbox dir not found: {inbox}. "
+            f"Run: sudo bash scripts/agent-add.sh {name}",
+            file=sys.stderr,
+        )
+        ok = False
+
+    if ok:
+        print("mesh-on --check: all checks passed")
+    return ok
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--quiet", action="store_true")
     p.add_argument("--sweep-only", action="store_true")
+    p.add_argument("--check", action="store_true",
+                   help="pre-flight diagnostic: verify AGENT_URI, mesh root, PROTOCOL.md, REGISTRY, and inbox exist; exit nonzero on any failure")
     args = p.parse_args()
+
+    if args.check:
+        try:
+            mesh_dir, my_dir, _ = discover_roots()
+        except SystemExit:
+            # discover_roots already printed the error
+            sys.exit(1)
+        sys.exit(0 if run_checks(mesh_dir, my_dir) else 1)
 
     mesh_dir, my_dir, log_path = discover_roots()
 
