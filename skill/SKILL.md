@@ -139,6 +139,19 @@ Required fields: `id`, `timestamp`, `agent`, `kind`, `title`, `context`,
 
 Optional: `expires` (ISO), `callback_to` (agent URI for result routing).
 
+## Automated skills
+
+Some behaviors trigger automatically when a specific `KIND: task` pattern lands
+in inbox. These are handled silently per §10.9 and do not surface to the human
+operator unless `REQUIRES_HUMAN_INPUT: true` is set.
+
+| Trigger | Skill | Description |
+|---|---|---|
+| subject: `nightly-reflection-<date>` | `skill/mesh-nightly-reflection/SKILL.md` | Gather daily data, draft and publish structured reflection to the designated mesh-event topic. |
+
+See each skill file for the full step sequence, data sources, failure modes,
+and post-synthesis handling.
+
 ## Behavioral commitments
 
 1. **Read-first** before non-trivial work
