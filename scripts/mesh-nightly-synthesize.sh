@@ -38,11 +38,38 @@ log "synthesize start — date=${DATE}"
 
 mkdir -p "$BLACKBOARD_DIR"
 
-# ── 1. Collect reflection events (skip synthesis posts) ──────────────────────
+# ── 1. Collect reflection events (skip synthesis posts + validate AUTHOR) ──
+# Validation per josh's REFLECTION-PROTOCOL.md §Phase 3:
+#   - AUTHOR must be a registered agent (agents/<name>/ slot exists)
+#   - AUTHOR must be in this topic's subscribers/ (i.e. was invited at kickoff)
+# Forged reflections from non-subscribed agents are quarantined, not synthesized.
+SUBS_DIR="${TOPIC_DIR}/subscribers"
+AGENTS_DIR="${MESH_ROOT}/agents"
+QUARANTINE_DIR="${MESH_ROOT}/mesh/QUARANTINE"
+mkdir -p "$QUARANTINE_DIR"
+
 declare -a REFL_FILES=()
 for f in "${TOPIC_DIR}"/ev-*.md; do
     [[ -f "$f" ]] || continue
     if grep -q '^SYNTHESIS: true' "$f" 2>/dev/null; then continue; fi
+
+    author="$(awk -F': ' '/^AUTHOR:/ {gsub(/@mesh/,"",$2); gsub(/[[:space:]]/,"",$2); print $2; exit}' "$f")"
+    if [[ -z "$author" ]]; then
+        log "QUARANTINE $(basename "$f") — missing AUTHOR"
+        cp "$f" "${QUARANTINE_DIR}/$(basename "$f" .md)-no-author.md"
+        continue
+    fi
+    if [[ ! -d "${AGENTS_DIR}/${author}" ]]; then
+        log "QUARANTINE $(basename "$f") — unknown AUTHOR '${author}' (no agents/ slot)"
+        cp "$f" "${QUARANTINE_DIR}/$(basename "$f" .md)-unknown-author.md"
+        continue
+    fi
+    if [[ ! -f "${SUBS_DIR}/${author}" ]]; then
+        log "QUARANTINE $(basename "$f") — AUTHOR '${author}' not subscribed to topic"
+        cp "$f" "${QUARANTINE_DIR}/$(basename "$f" .md)-unsubscribed-author.md"
+        continue
+    fi
+
     REFL_FILES+=("$f")
 done
 

@@ -37,13 +37,51 @@ log "kickoff start — topic=${TOPIC} deadline=${DEADLINE}"
 # 1. Ensure topic + subscribers dir exist
 mkdir -p "${MESH_ROOT}/mesh/EVENTS/${TOPIC_SLUG}/subscribers"
 
-# 2. Subscribe every registered agent (except host) — idempotent via mesh-event subscribe
+# OFFLINE eligibility per josh's REFLECTION-PROTOCOL.md §Phase 1:
+#   skip any agent whose heartbeat is > 600s old at kickoff time and
+#   dead-letter them immediately (they can't respond before 04:00Z anyway).
+# Quarantine state is NOT used for eligibility — synthesis handles validation.
+HEARTBEAT_DIR="${MESH_ROOT}/mesh/HEARTBEAT"
+NOW_EPOCH="$(date -u +%s)"
+OFFLINE_THRESHOLD=600
+
+is_offline() {
+    local agent="$1"
+    local hb="${HEARTBEAT_DIR}/${agent}.last"
+    [[ -f "$hb" ]] || return 0  # no heartbeat file → offline
+    local mt
+    mt="$(stat -c %Y "$hb" 2>/dev/null || echo 0)"
+    (( NOW_EPOCH - mt > OFFLINE_THRESHOLD ))
+}
+
+dead_letter_offline() {
+    local agent="$1"
+    local dl_dir="${MESH_ROOT}/mesh/DEAD_LETTER/${agent}"
+    mkdir -p "$dl_dir"
+    cat > "${dl_dir}/${NOW_EPOCH}-nightly-skip-${DATE}.md" <<BODY
+---
+KIND: dead-letter
+AUTHOR: host@mesh
+REASON: offline-at-kickoff
+DATE: ${DATE}
+---
+${agent}@mesh was offline (heartbeat > ${OFFLINE_THRESHOLD}s old) at ${DATE}T03:15Z
+kickoff. Skipped from nightly-reflection task dispatch. No retry today.
+BODY
+}
+
+# 2. Subscribe every registered agent (except host + offline) — idempotent
 for reg in "${MESH_ROOT}/mesh/REGISTRY/"*.md; do
     [[ -f "$reg" ]] || continue
     agent="$(basename "$reg" .md)"
     case "$agent" in
         host|REGISTRY|"") continue ;;
     esac
+    if is_offline "$agent"; then
+        log "SKIP offline ${agent}"
+        dead_letter_offline "$agent"
+        continue
+    fi
     # Run as the target agent so their identity is on the subscriber record
     if ! AGENT_URI="${agent}@mesh" timeout 30 "$MESH_EVENT" subscribe "$TOPIC" \
          >/dev/null 2>&1; then
@@ -76,12 +114,14 @@ log "kickoff event published"
 
 # 4. Per-agent KIND:task with REPLY_TO_TOPIC + DEADLINE (carries the contract)
 #    These land in the agent's inbox and wake their mesh-watch.
+#    Offline agents are already dead-lettered above — skip here too.
 for reg in "${MESH_ROOT}/mesh/REGISTRY/"*.md; do
     [[ -f "$reg" ]] || continue
     agent="$(basename "$reg" .md)"
     case "$agent" in
         host|REGISTRY|"") continue ;;
     esac
+    is_offline "$agent" && continue
 
     task_body="$(cat <<BODY
 Nightly reflection for ${DATE}.
