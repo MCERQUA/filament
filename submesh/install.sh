@@ -51,8 +51,10 @@ mkdir -p "$SUBMESH_DIR/agents/manager/memory"
 
 # ── Commands + hooks ───────────────────────────────────────────────────────────
 echo "  → Installing commands..."
-cp "$SCRIPT_DIR/bin/"* "$BIN_DIR/"
-chmod +x "$BIN_DIR/"*
+for f in "$SCRIPT_DIR/bin/"*; do
+    cp "$f" "$BIN_DIR/"
+    chmod +x "$BIN_DIR/$(basename "$f")" 2>/dev/null || true
+done
 
 # ── tmux config ────────────────────────────────────────────────────────────────
 echo "  → Installing tmux config..."
