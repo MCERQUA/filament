@@ -1,0 +1,45 @@
+#!/bin/bash
+# start-submesh — creates the 4-pane 2x2 tmux session (no Konsole)
+# To open the grid view, use: submesh-grid
+# To open via the desktop icon, click Sub-Mesh (calls submesh-launch)
+
+SESSION="submesh"
+CLAUDE=/config/.local/bin/claude
+WORKSPACE=/config/submesh/agents/manager/workspace
+TEMPLATES=/config/submesh-templates
+
+mkdir -p "$WORKSPACE" /config/submesh/agents/manager/memory
+[ ! -f /config/submesh/agents/manager/CLAUDE.md ] && \
+    cp "$TEMPLATES/manager.md" /config/submesh/agents/manager/CLAUDE.md
+
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+    echo "Sub-mesh already running. Use submesh-grid to view it."
+    exit 0
+fi
+
+echo "Starting sub-mesh session..."
+
+tmux new-session -d -s "$SESSION" -n grid \
+    -e "AGENT_URI=manager@mesh" \
+    -e "PATH=/config/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+    -x 220 -y 50
+
+tmux send-keys -t "$SESSION:grid.0" \
+    "export AGENT_URI=manager@mesh; cd $WORKSPACE; $CLAUDE --dangerously-skip-permissions" Enter
+
+tmux split-window -h -t "$SESSION:grid.0"
+tmux send-keys -t "$SESSION:grid.1" \
+    "printf '\n  Slot 2 ready\n  Run: new-agent <name> [type]\n\n'" Enter
+
+tmux split-window -v -t "$SESSION:grid.0"
+tmux send-keys -t "$SESSION:grid.2" \
+    "printf '\n  Slot 3 ready\n  Run: new-agent <name> [type]\n\n'" Enter
+
+tmux split-window -v -t "$SESSION:grid.1"
+tmux send-keys -t "$SESSION:grid.3" \
+    "printf '\n  Slot 4 ready\n  Run: new-agent <name> [type]\n\n'" Enter
+
+tmux select-layout -t "$SESSION:grid" tiled
+tmux select-pane -t "$SESSION:grid.0"
+
+echo "Sub-mesh started. Use submesh-grid to open the view."

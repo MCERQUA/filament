@@ -1,0 +1,152 @@
+#!/bin/bash
+# submesh-launch — called by the desktop icon
+# Creates the 4-pane tmux grid (if needed) and opens ONE Konsole showing it.
+
+export DISPLAY=:1
+export XDG_RUNTIME_DIR=/config/.XDG
+export PATH=/config/mesh-tools/bin:/config/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+SESSION="submesh"
+CLAUDE=/config/.local/bin/claude
+WORKSPACE=/config/submesh/agents/manager/workspace
+TEMPLATES=/config/submesh-templates
+TMUX_CONF=/config/mesh-tools/tmux.conf
+SLOTS_FILE=/config/submesh/slots
+
+# detect desk prefix from hostname
+HN=$(hostname 2>/dev/null || cat /etc/hostname 2>/dev/null)
+if echo "$HN" | grep -qi "josh"; then
+    PREFIX="josh-desk"
+elif echo "$HN" | grep -qi "ubuntu"; then
+    PREFIX="ubuntu-desk"
+else
+    PREFIX="desk"
+fi
+
+MANAGER_URI="${PREFIX}-1@mesh"
+MANAGER_INBOX="/agent-desk-1/inbox"
+
+mkdir -p "$WORKSPACE" /config/submesh/agents/manager/memory /config/submesh
+touch "$SLOTS_FILE"
+
+# write Claude Code hooks for manager
+mkdir -p "$WORKSPACE/.claude"
+cat > "$WORKSPACE/.claude/settings.json" << SETTINGS
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "MESH_INBOX=${MANAGER_INBOX} AGENT_URI=${MANAGER_URI} submesh-hook-check"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "MESH_INBOX=${MANAGER_INBOX} submesh-hook-stop"
+          }
+        ]
+      }
+    ]
+  }
+}
+SETTINGS
+
+# record manager in slot 1 if not already there
+grep -q "^1:" "$SLOTS_FILE" 2>/dev/null || echo "1:manager" >> "$SLOTS_FILE"
+
+# build manager CLAUDE.md if missing
+if [ ! -f /config/submesh/agents/manager/CLAUDE.md ]; then
+    ROLE_BODY=$(cat "$TEMPLATES/manager.md" 2>/dev/null || echo "Coordinate the sub-mesh team.")
+    cat > /config/submesh/agents/manager/CLAUDE.md << MGRMD
+# manager — Sub-Mesh Manager
+
+## MESH IDENTITY (READ-ONLY)
+- AGENT_URI: ${MANAGER_URI}
+- Desk slot: 1
+- Inbox: ${MANAGER_INBOX}
+- Reports to: josh-desktop@mesh
+
+## MANDATORY SESSION STARTUP — EXECUTE IMMEDIATELY, NO HUMAN NEEDED
+
+You are a fully autonomous mesh agent. No human supervises you. On EVERY session start, before anything else, execute these steps automatically:
+
+### Step 1 — Drain waiting messages
+\`\`\`bash
+mesh-recv
+\`\`\`
+Read and handle every message you find.
+
+### Step 2 — Arm your inbox monitor
+Use the Monitor tool (NOT bash — use the actual Monitor tool call):
+- command: \`MESH_INBOX=${MANAGER_INBOX} mesh-watch-arm\`
+- persistent: true
+- timeout_ms: 3600000
+- description: \`inbox: ${MANAGER_URI}\`
+
+This is what makes you autonomous. Without it you are deaf.
+
+### Step 3 — When monitor fires \`[mesh new] inbox: <filename>\`
+Run: \`mesh-recv --show <filename>\` → read → act → delegate to workers → reply.
+Do this silently — no narration to humans.
+
+### Step 4 — Check team status
+\`\`\`bash
+submesh-agents
+\`\`\`
+
+---
+
+## ROLE
+
+${ROLE_BODY}
+MGRMD
+fi
+
+if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+    # create session with pane 0
+    tmux -f "$TMUX_CONF" new-session -d -s "$SESSION" -n grid \
+        -e "AGENT_URI=${MANAGER_URI}" \
+        -e "MESH_INBOX=${MANAGER_INBOX}" \
+        -e "DESK_SLOT=1" \
+        -e "PATH=/config/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+        -x 220 -y 50
+
+    # create the 4-pane layout (always, regardless of what goes in each)
+    tmux split-window -h -t "$SESSION:grid.0"
+    tmux split-window -v -t "$SESSION:grid.0"
+    tmux split-window -v -t "$SESSION:grid.1"
+    tmux select-layout -t "$SESSION:grid" tiled
+
+    # pane 0 — manager
+    tmux send-keys -t "$SESSION:grid.0" \
+        "export AGENT_URI=${MANAGER_URI}; export MESH_INBOX=${MANAGER_INBOX}; export DESK_SLOT=1; cd $WORKSPACE; $CLAUDE --dangerously-skip-permissions" Enter
+
+    # panes 1-3 — restore previously assigned agents or show ready prompt
+    for PANE in 1 2 3; do
+        SLOT=$((PANE + 1))
+        AGENT_URI="${PREFIX}-${SLOT}@mesh"
+        MESH_INBOX="/agent-desk-${SLOT}/inbox"
+        AGENT_NAME=$(grep "^${SLOT}:" "$SLOTS_FILE" 2>/dev/null | cut -d: -f2)
+
+        if [ -n "$AGENT_NAME" ] && [ -d "/config/submesh/agents/${AGENT_NAME}/workspace" ]; then
+            AGENT_DIR="/config/submesh/agents/${AGENT_NAME}"
+            tmux send-keys -t "$SESSION:grid.$PANE" \
+                "export AGENT_URI=${AGENT_URI}; export MESH_INBOX=${MESH_INBOX}; export DESK_SLOT=${SLOT}; cd $AGENT_DIR/workspace; $CLAUDE --dangerously-skip-permissions" Enter
+        else
+            tmux send-keys -t "$SESSION:grid.$PANE" \
+                "printf '\n  Slot $((PANE+1)) — ${AGENT_URI}\n  Run: new-agent <name> [type]\n\n'" Enter
+        fi
+    done
+
+    tmux select-pane -t "$SESSION:grid.0"
+fi
+
+exec konsole -e tmux -f "$TMUX_CONF" attach -t submesh

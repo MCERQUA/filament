@@ -1,0 +1,43 @@
+#!/bin/bash
+# stop-submesh [name] — stop one agent (frees its slot) or kill entire session
+
+NAME="$1"
+SLOTS_FILE=/config/submesh/slots
+SESSION="submesh"
+
+if [ -n "$NAME" ] && [ "$NAME" != "all" ]; then
+    if [ "$NAME" = "manager" ]; then
+        echo "Stopping manager kills the whole session. Use: stop-submesh all"
+        exit 1
+    fi
+    # remove from slots file so the slot is freed for next new-agent
+    if [ -f "$SLOTS_FILE" ]; then
+        grep -v ":${NAME}$" "$SLOTS_FILE" > "${SLOTS_FILE}.tmp" && mv "${SLOTS_FILE}.tmp" "$SLOTS_FILE"
+    fi
+    # find pane running this agent and clear it
+    for PANE in 1 2 3; do
+        CONTENT=$(tmux capture-pane -t "$SESSION:grid.$PANE" -p 2>/dev/null | grep -c "$NAME" || true)
+        if [ "$CONTENT" -gt 0 ]; then
+            tmux send-keys -t "$SESSION:grid.$PANE" "q" ""
+            tmux send-keys -t "$SESSION:grid.$PANE" "" ""
+            # find agent's slot
+            SLOT=$((PANE + 1))
+            HN=$(hostname 2>/dev/null || cat /etc/hostname 2>/dev/null)
+            if echo "$HN" | grep -qi "josh"; then PREFIX="josh-desk"; else PREFIX="ubuntu-desk"; fi
+            tmux send-keys -t "$SESSION:grid.$PANE" \
+                "printf '\n  Slot $((PANE+1)) — ${PREFIX}-${SLOT}@mesh\n  Run: new-agent <name> [type]\n\n'" Enter
+            echo "Agent '$NAME' stopped. Slot $SLOT freed."
+            break
+        fi
+    done
+    # also kill overflow window if it exists
+    tmux kill-window -t "$SESSION:$NAME" 2>/dev/null && echo "(overflow window closed)"
+else
+    echo "Stopping entire sub-mesh session..."
+    tmux kill-session -t "$SESSION" 2>/dev/null
+    # clear all slot assignments except slot 1 (manager persists)
+    if [ -f "$SLOTS_FILE" ]; then
+        grep "^1:" "$SLOTS_FILE" > "${SLOTS_FILE}.tmp" 2>/dev/null; mv "${SLOTS_FILE}.tmp" "$SLOTS_FILE"
+    fi
+    echo "Sub-mesh stopped. Run start-submesh or click the icon to restart."
+fi

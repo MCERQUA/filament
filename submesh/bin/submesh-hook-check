@@ -1,0 +1,35 @@
+#!/bin/bash
+# PostToolUse hook for sub-mesh agents.
+# Runs after EVERY tool call. Checks inbox + whisper file.
+# Any output goes directly into the agent's context — this is the whisper channel.
+# Exits 0 always (non-blocking).
+
+INBOX="${MESH_INBOX:-/agent-desk/inbox}"
+AGENT="${AGENT_URI:-unknown@mesh}"
+WHISPER_FILE="${INBOX%/inbox}/whisper.md"
+
+HAS_OUTPUT=false
+
+# -- whisper check (highest priority — another agent is trying to reach you) --
+if [ -f "$WHISPER_FILE" ]; then
+    WHISPER_FROM=$(head -1 "$WHISPER_FILE" | sed 's/^FROM: //')
+    WHISPER_BODY=$(tail -n +2 "$WHISPER_FILE")
+    mv "$WHISPER_FILE" "${WHISPER_FILE}.read-$(date +%s)" 2>/dev/null
+    echo "┌─ WHISPER from ${WHISPER_FROM} ─────────────────────────────"
+    echo "$WHISPER_BODY"
+    echo "└────────────────────────────────────────────────────────────"
+    echo ""
+    HAS_OUTPUT=true
+fi
+
+# -- inbox check (quick count, don't drain — that happens at Stop) --
+if [ -d "$INBOX" ]; then
+    UNREAD=$(ls -1 "$INBOX"/*.md 2>/dev/null | grep -v '\.acked$' | wc -l)
+    if [ "$UNREAD" -gt 0 ]; then
+        SENDERS=$(grep -h "^AUTHOR:" "$INBOX"/*.md 2>/dev/null | grep -v '\.acked' | sed 's/AUTHOR: *//' | sort -u | tr '\n' ', ' | sed 's/,$//')
+        echo "[MESH INBOX] $UNREAD unread from: ${SENDERS} — run mesh-recv to handle"
+        HAS_OUTPUT=true
+    fi
+fi
+
+exit 0

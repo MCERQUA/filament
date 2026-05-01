@@ -1,0 +1,41 @@
+#!/bin/bash
+# submesh-help — show all sub-mesh commands
+
+cat << 'HELP'
+╔══════════════════════════════════════════════════════════════╗
+║                   SUB-MESH COMMANDS                          ║
+╚══════════════════════════════════════════════════════════════╝
+
+STARTING
+  start-submesh                  Boot the manager + open 4-pane grid
+  submesh-grid                   Open the grid view (agents already running)
+
+AGENTS
+  submesh-agents                 List all agents + running status
+  new-agent <name> [type]        Create and start a new named agent
+  join-submesh <name>            Open that agent's terminal window
+  stop-submesh [name]            Stop one agent (or all if no name given)
+
+AGENT TYPES
+  manager                        Coordinator / project manager (auto-created)
+  coder                          Writes and edits code
+  researcher                     Web search and investigation
+  reviewer                       Code review and QA
+  general                        Flexible / general purpose (default)
+
+EXAMPLES
+  start-submesh
+  new-agent alice coder "refactor the auth module"
+  new-agent bob researcher "investigate rate limiting approaches"
+  join-submesh alice
+  join-submesh manager
+  submesh-agents
+  stop-submesh alice
+  stop-submesh                   (stops everything)
+
+MESH COMMUNICATION (from inside any agent)
+  mesh-send manager@mesh "done with auth refactor"
+  mesh-send alice@mesh "here are the findings: ..."
+  mesh-recv                      Check your inbox
+
+HELP

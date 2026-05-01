@@ -1,0 +1,177 @@
+#!/bin/bash
+# new-agent <name> [type] [context]
+# Assigns a real desk slot (josh-desk-N or ubuntu-desk-N), generates
+# a concrete CLAUDE.md with slot-specific inbox paths, and starts
+# Claude Code with full mesh env set. Agents are autonomous from first keystroke.
+
+NAME="$1"
+TYPE="${2:-general}"
+CONTEXT="$3"
+
+if [ -z "$NAME" ]; then
+    echo "Usage: new-agent <name> [type] [context]"
+    echo "Types: manager, coder, researcher, reviewer, general"
+    exit 1
+fi
+
+SESSION="submesh"
+CLAUDE=/config/.local/bin/claude
+TEMPLATES=/config/submesh-templates
+AGENT_DIR=/config/submesh/agents/$NAME
+SLOTS_FILE=/config/submesh/slots
+
+# -- detect desk prefix from hostname --
+HN=$(hostname 2>/dev/null || cat /etc/hostname 2>/dev/null)
+if echo "$HN" | grep -qi "josh"; then
+    PREFIX="josh-desk"
+elif echo "$HN" | grep -qi "ubuntu"; then
+    PREFIX="ubuntu-desk"
+else
+    PREFIX="desk"
+fi
+
+mkdir -p "$AGENT_DIR/workspace" "$AGENT_DIR/memory" /config/submesh
+
+# -- assign a numbered slot (1=manager, 2-4=workers) --
+# slot file: each line is "N:agentname"
+touch "$SLOTS_FILE"
+# find which slots 2-4 are free
+SLOT=""
+for N in 2 3 4; do
+    if ! grep -q "^${N}:" "$SLOTS_FILE" 2>/dev/null; then
+        SLOT=$N
+        break
+    fi
+done
+
+if [ -z "$SLOT" ]; then
+    echo "All desk slots (2-4) are occupied. Stop an agent first: stop-submesh <name>"
+    submesh-agents
+    exit 1
+fi
+
+AGENT_URI="${PREFIX}-${SLOT}@mesh"
+MESH_INBOX="/agent-desk-${SLOT}/inbox"
+# manager slot for workers to report to
+MANAGER_URI="${PREFIX}-1@mesh"
+
+# record slot assignment
+echo "${SLOT}:${NAME}" >> "$SLOTS_FILE"
+
+# -- build CLAUDE.md with concrete values --
+if [ ! -f "$AGENT_DIR/CLAUDE.md" ]; then
+    TEMPLATE="$TEMPLATES/${TYPE}.md"
+    [ ! -f "$TEMPLATE" ] && TEMPLATE="$TEMPLATES/general.md"
+
+    # Inject autonomous startup header with real slot values
+    cat > "$AGENT_DIR/CLAUDE.md" << HEADER
+# ${NAME} — ${TYPE} agent
+
+## MESH IDENTITY (READ-ONLY)
+- AGENT_URI: ${AGENT_URI}
+- Desk slot: ${SLOT}
+- Inbox: ${MESH_INBOX}
+- Manager: ${MANAGER_URI}
+
+## MANDATORY SESSION STARTUP — EXECUTE IMMEDIATELY, NO HUMAN NEEDED
+
+You are a fully autonomous mesh agent. No human supervises you. On EVERY session start, before anything else, execute these steps automatically:
+
+### Step 1 — Drain waiting messages
+\`\`\`bash
+mesh-recv
+\`\`\`
+Read and handle every message you find.
+
+### Step 2 — Arm your inbox monitor
+Use the Monitor tool (NOT bash — use the actual Monitor tool call):
+- command: \`MESH_INBOX=${MESH_INBOX} mesh-watch-arm\`
+- persistent: true
+- timeout_ms: 3600000
+- description: \`inbox: ${AGENT_URI}\`
+
+This is what makes you autonomous. Without it you are deaf.
+
+### Step 3 — When monitor fires \`[mesh new] inbox: <filename>\`
+Run: \`mesh-recv --show <filename>\` → read → act → reply if needed.
+Do this silently — no narration to humans.
+
+### Step 4 — Announce ready to manager
+\`\`\`bash
+mesh-send ${MANAGER_URI} "${NAME} online — slot ${SLOT} — monitoring active"
+\`\`\`
+
+---
+
+## ROLE
+
+HEADER
+
+    cat "$TEMPLATE" >> "$AGENT_DIR/CLAUDE.md"
+
+    if [ -n "$CONTEXT" ]; then
+        printf "\n## Current Task\n%s\n" "$CONTEXT" >> "$AGENT_DIR/CLAUDE.md"
+    fi
+fi
+
+# -- write Claude Code hooks config into the agent's workspace --
+mkdir -p "$AGENT_DIR/workspace/.claude"
+cat > "$AGENT_DIR/workspace/.claude/settings.json" << SETTINGS
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "MESH_INBOX=${MESH_INBOX} AGENT_URI=${AGENT_URI} submesh-hook-check"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "MESH_INBOX=${MESH_INBOX} submesh-hook-stop"
+          }
+        ]
+      }
+    ]
+  }
+}
+SETTINGS
+
+CMD="export AGENT_URI=${AGENT_URI}; export MESH_INBOX=${MESH_INBOX}; export DESK_SLOT=${SLOT}; cd $AGENT_DIR/workspace; $CLAUDE --dangerously-skip-permissions"
+
+if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+    echo "Sub-mesh not running. Use start-submesh first."
+    exit 1
+fi
+
+# -- place in empty grid slot or overflow window --
+FILLED=false
+for PANE in 1 2 3; do
+    CONTENT=$(tmux capture-pane -t "$SESSION:grid.$PANE" -p 2>/dev/null | grep -c "Slot.*ready" || true)
+    if [ "$CONTENT" -gt 0 ]; then
+        tmux send-keys -t "$SESSION:grid.$PANE" "q" ""
+        tmux send-keys -t "$SESSION:grid.$PANE" "" ""
+        tmux send-keys -t "$SESSION:grid.$PANE" "$CMD" Enter
+        echo "Agent '${NAME}' (${AGENT_URI}) started in grid slot $((PANE+1))."
+        FILLED=true
+        break
+    fi
+done
+
+if [ "$FILLED" = false ]; then
+    tmux new-window -t "$SESSION" -n "$NAME" \
+        -e "AGENT_URI=${AGENT_URI}" \
+        -e "MESH_INBOX=${MESH_INBOX}" \
+        -e "DESK_SLOT=${SLOT}" \
+        -e "PATH=/config/.local/bin:/usr/local/bin:/usr/bin:/bin"
+    tmux send-keys -t "$SESSION:$NAME" "$CMD" Enter
+    echo "Agent '${NAME}' (${AGENT_URI}) started in overflow window."
+    echo "Use: join-submesh $NAME"
+fi

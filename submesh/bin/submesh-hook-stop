@@ -1,0 +1,21 @@
+#!/bin/bash
+# Stop hook for sub-mesh agents.
+# Runs when the agent finishes a full turn (task complete, waiting for next input).
+# Drains the full inbox — every message gets processed here automatically.
+
+INBOX="${MESH_INBOX:-/agent-desk/inbox}"
+
+if [ ! -d "$INBOX" ]; then
+    exit 0
+fi
+
+UNREAD=$(ls -1 "$INBOX"/*.md 2>/dev/null | grep -v '\.acked$' | wc -l)
+[ "$UNREAD" -eq 0 ] && exit 0
+
+echo ""
+echo "═══ MESH INBOX: $UNREAD message(s) waiting — draining now ═══"
+MESH_INBOX="$INBOX" mesh-recv
+echo "═══ inbox drained ═══"
+echo ""
+
+exit 0

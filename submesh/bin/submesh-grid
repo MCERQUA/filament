@@ -1,0 +1,12 @@
+#!/bin/bash
+# submesh-grid — opens one Konsole window showing the full 2x2 tmux grid
+
+export DISPLAY=:1
+export XDG_RUNTIME_DIR=/config/.XDG
+
+if ! tmux has-session -t submesh 2>/dev/null; then
+    echo "Sub-mesh not running. Use start-submesh first."
+    exit 1
+fi
+
+konsole -e tmux attach -t submesh &

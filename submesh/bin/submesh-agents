@@ -1,0 +1,52 @@
+#!/bin/bash
+# submesh-agents — list all sub-mesh agents and their status
+
+AGENTS_DIR=/config/submesh/agents
+SLOTS_FILE=/config/submesh/slots
+SESSION="submesh"
+
+HN=$(hostname 2>/dev/null || cat /etc/hostname 2>/dev/null)
+if echo "$HN" | grep -qi "josh"; then PREFIX="josh-desk"; elif echo "$HN" | grep -qi "ubuntu"; then PREFIX="ubuntu-desk"; else PREFIX="desk"; fi
+
+echo "SUB-MESH AGENTS"
+echo "────────────────────────────────────────────────"
+printf "%-20s %-6s %-22s %-10s\n" "NAME" "SLOT" "AGENT_URI" "STATUS"
+echo "────────────────────────────────────────────────"
+
+for dir in "$AGENTS_DIR"/*/; do
+    [ -d "$dir" ] || continue
+    name=$(basename "$dir")
+
+    # get slot from slots file
+    slot=$(grep ":${name}$" "$SLOTS_FILE" 2>/dev/null | cut -d: -f1)
+    [ -z "$slot" ] && slot="-"
+    agent_uri="${PREFIX}-${slot}@mesh"
+    [ "$slot" = "-" ] && agent_uri="(unassigned)"
+
+    # detect running: check if any grid pane or window has this agent
+    running=false
+    if tmux has-session -t "$SESSION" 2>/dev/null; then
+        # check all panes and windows
+        if tmux list-panes -t "$SESSION:grid" -F "#{pane_index}" 2>/dev/null | while read -r p; do
+            tmux capture-pane -t "$SESSION:grid.$p" -p 2>/dev/null | grep -q "$name" && echo yes && break
+        done | grep -q yes; then
+            running=true
+        fi
+        tmux list-windows -t "$SESSION" -F "#{window_name}" 2>/dev/null | grep -qx "$name" && running=true
+    fi
+
+    if $running; then
+        status="● running"
+    else
+        status="○ stopped"
+    fi
+
+    printf "%-20s %-6s %-22s %-10s\n" "$name" "$slot" "$agent_uri" "$status"
+done
+
+echo ""
+echo "Commands:"
+echo "  new-agent <name> [type]      create & start an agent (assigns next free slot)"
+echo "  join-submesh <name>          open an agent's view in Konsole"
+echo "  stop-submesh <name>          stop one agent and free its slot"
+echo "  stop-submesh all             kill entire session"

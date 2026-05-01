@@ -1,0 +1,32 @@
+#!/bin/bash
+# join-submesh <name> — opens that agent's view in Konsole
+# Grid agents (panes 1-3) live inside submesh:grid — opens the full grid view
+# Overflow agents get their own window inside submesh — selects that window
+
+NAME="$1"
+SESSION="submesh"
+
+export DISPLAY=:1
+export XDG_RUNTIME_DIR=/config/.XDG
+
+if [ -z "$NAME" ]; then
+    echo "Usage: join-submesh <name>"
+    echo ""
+    submesh-agents
+    exit 1
+fi
+
+if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+    echo "Sub-mesh is not running. Use start-submesh first."
+    exit 1
+fi
+
+# Check if this agent has its own tmux window (overflow agents)
+if tmux list-windows -t "$SESSION" -F "#{window_name}" 2>/dev/null | grep -qx "$NAME"; then
+    tmux select-window -t "$SESSION:$NAME" 2>/dev/null
+    konsole -e tmux attach -t "$SESSION:$NAME" &
+else
+    # Grid-pane agent or manager — open full grid view
+    tmux select-window -t "$SESSION:grid" 2>/dev/null
+    konsole -e tmux attach -t "$SESSION" &
+fi

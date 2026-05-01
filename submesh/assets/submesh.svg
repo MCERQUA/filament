@@ -1,0 +1,94 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#0f1923;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#1a2535;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="panel" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#141e2b;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#0d1520;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="accent" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#00d4aa;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#0099ff;stop-opacity:1" />
+    </linearGradient>
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="1.5" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <!-- Outer rounded background -->
+  <rect width="256" height="256" rx="28" ry="28" fill="url(#bg)"/>
+
+  <!-- Subtle outer border -->
+  <rect width="256" height="256" rx="28" ry="28" fill="none" stroke="#1e3a5f" stroke-width="2"/>
+
+  <!-- Top-left terminal panel -->
+  <rect x="14" y="14" width="108" height="108" rx="8" ry="8" fill="url(#panel)" stroke="#1e3a5f" stroke-width="1"/>
+  <!-- TL titlebar -->
+  <rect x="14" y="14" width="108" height="18" rx="8" ry="8" fill="#162030"/>
+  <rect x="14" y="22" width="108" height="10" fill="#162030"/>
+  <!-- TL dots -->
+  <circle cx="27" cy="23" r="3.5" fill="#ff5f57"/>
+  <circle cx="38" cy="23" r="3.5" fill="#febc2e"/>
+  <circle cx="49" cy="23" r="3.5" fill="#28c840"/>
+  <!-- TL terminal lines -->
+  <text x="22" y="48" font-family="monospace" font-size="7" fill="#00d4aa" filter="url(#glow)">$ start-submesh</text>
+  <text x="22" y="59" font-family="monospace" font-size="7" fill="#4a9eff">Manager online ✓</text>
+  <text x="22" y="70" font-family="monospace" font-size="7" fill="#00d4aa">$ mesh-recv</text>
+  <text x="22" y="81" font-family="monospace" font-size="7" fill="#6b7a8d">inbox: 2 msgs</text>
+  <text x="22" y="92" font-family="monospace" font-size="7" fill="#00d4aa">$ <animate attributeName="opacity" values="1;0;1" dur="1.2s" repeatCount="indefinite"/></text>
+  <!-- TL label -->
+  <text x="22" y="114" font-family="monospace" font-size="6.5" fill="#4a9eff" font-weight="bold">MANAGER</text>
+
+  <!-- Top-right terminal panel -->
+  <rect x="134" y="14" width="108" height="108" rx="8" ry="8" fill="url(#panel)" stroke="#1e3a5f" stroke-width="1"/>
+  <rect x="134" y="14" width="108" height="18" rx="8" ry="8" fill="#162030"/>
+  <rect x="134" y="22" width="108" height="10" fill="#162030"/>
+  <circle cx="147" cy="23" r="3.5" fill="#ff5f57"/>
+  <circle cx="158" cy="23" r="3.5" fill="#febc2e"/>
+  <circle cx="169" cy="23" r="3.5" fill="#28c840"/>
+  <text x="142" y="48" font-family="monospace" font-size="7" fill="#00d4aa">$ new-agent alice</text>
+  <text x="142" y="59" font-family="monospace" font-size="7" fill="#28c840">coder agent ready</text>
+  <text x="142" y="70" font-family="monospace" font-size="7" fill="#6b7a8d">// auth.ts</text>
+  <text x="142" y="81" font-family="monospace" font-size="7" fill="#4a9eff">writing code...</text>
+  <text x="142" y="92" font-family="monospace" font-size="7" fill="#00d4aa">$ </text>
+  <text x="142" y="114" font-family="monospace" font-size="6.5" fill="#28c840" font-weight="bold">CODER</text>
+
+  <!-- Bottom-left terminal panel -->
+  <rect x="14" y="134" width="108" height="108" rx="8" ry="8" fill="url(#panel)" stroke="#1e3a5f" stroke-width="1"/>
+  <rect x="14" y="134" width="108" height="18" rx="8" ry="8" fill="#162030"/>
+  <rect x="14" y="142" width="108" height="10" fill="#162030"/>
+  <circle cx="27" cy="143" r="3.5" fill="#ff5f57"/>
+  <circle cx="38" cy="143" r="3.5" fill="#febc2e"/>
+  <circle cx="49" cy="143" r="3.5" fill="#28c840"/>
+  <text x="22" y="168" font-family="monospace" font-size="7" fill="#00d4aa">$ web_search</text>
+  <text x="22" y="179" font-family="monospace" font-size="7" fill="#febc2e">found 12 results</text>
+  <text x="22" y="190" font-family="monospace" font-size="7" fill="#6b7a8d">analyzing...</text>
+  <text x="22" y="201" font-family="monospace" font-size="7" fill="#4a9eff">→ 3 sources kept</text>
+  <text x="22" y="212" font-family="monospace" font-size="7" fill="#00d4aa">$ </text>
+  <text x="22" y="234" font-family="monospace" font-size="6.5" fill="#febc2e" font-weight="bold">RESEARCHER</text>
+
+  <!-- Bottom-right terminal panel -->
+  <rect x="134" y="134" width="108" height="108" rx="8" ry="8" fill="url(#panel)" stroke="#1e3a5f" stroke-width="1"/>
+  <rect x="134" y="134" width="108" height="18" rx="8" ry="8" fill="#162030"/>
+  <rect x="134" y="142" width="108" height="10" fill="#162030"/>
+  <circle cx="147" cy="143" r="3.5" fill="#ff5f57"/>
+  <circle cx="158" cy="143" r="3.5" fill="#febc2e"/>
+  <circle cx="169" cy="143" r="3.5" fill="#28c840"/>
+  <text x="142" y="168" font-family="monospace" font-size="7" fill="#00d4aa">$ review diff</text>
+  <text x="142" y="179" font-family="monospace" font-size="7" fill="#ff7b7b">✗ edge case L47</text>
+  <text x="142" y="190" font-family="monospace" font-size="7" fill="#28c840">✓ logic sound</text>
+  <text x="142" y="201" font-family="monospace" font-size="7" fill="#28c840">✓ tests pass</text>
+  <text x="142" y="212" font-family="monospace" font-size="7" fill="#00d4aa">$ </text>
+  <text x="142" y="234" font-family="monospace" font-size="6.5" fill="#ff7b7b" font-weight="bold">REVIEWER</text>
+
+  <!-- Center divider lines (cross) with gradient glow -->
+  <line x1="128" y1="10" x2="128" y2="246" stroke="url(#accent)" stroke-width="2.5" opacity="0.6"/>
+  <line x1="10" y1="128" x2="246" y2="128" stroke="url(#accent)" stroke-width="2.5" opacity="0.6"/>
+
+  <!-- Center node dot -->
+  <circle cx="128" cy="128" r="6" fill="url(#accent)" opacity="0.9" filter="url(#glow)"/>
+  <circle cx="128" cy="128" r="3" fill="#ffffff" opacity="0.8"/>
+</svg>
