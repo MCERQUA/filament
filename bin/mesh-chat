@@ -8,7 +8,7 @@ Subcommands:
     leave <slug>                                      unsubscribe
     list [--filter <prefix>]                          list chatroom.* topics
 
-Post size cap: 8KB (enforced by mesh-event --chat).
+Post size cap: 8KB (enforced here in cmd_post; mesh-event has no --chat mode).
 Topic format: chatroom.<slug>  (slug becomes chatroom-<slug> on disk via _slugify).
 """
 from __future__ import annotations
@@ -46,9 +46,22 @@ def run(cmd: list[str], **kw) -> int:
     return subprocess.run(cmd, **kw).returncode
 
 
+CHAT_BODY_CAP = 8192  # 8KB
+
 def cmd_post(args: argparse.Namespace) -> None:
     topic = topic_for(args.slug)
-    cmd = [mesh_event_bin(), "publish", topic, "--chat"]
+    # Enforce 8KB cap here (mesh-event has no --chat mode).
+    if args.body is not None:
+        if len(args.body.encode("utf-8")) > CHAT_BODY_CAP:
+            die(f"body exceeds chat cap {CHAT_BODY_CAP}B")
+    elif args.body_file:
+        try:
+            sz = Path(args.body_file).stat().st_size
+        except OSError as e:
+            die(f"body-file: {e}")
+        if sz > CHAT_BODY_CAP:
+            die(f"body-file exceeds chat cap {CHAT_BODY_CAP}B (size={sz}B)")
+    cmd = [mesh_event_bin(), "publish", topic]
     if args.body is not None:
         cmd += ["--body", args.body]
     elif args.body_file:
