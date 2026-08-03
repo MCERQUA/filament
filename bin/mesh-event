@@ -60,20 +60,62 @@ if str(_lib) not in sys.path:
 from write_atomic import write_atomic as _write_atomic, fsync_dir as _fsync_dir  # noqa: E402
 
 # ---------------------------------------------------------------------------
-# Intel leak filter — keep in sync with the equivalent block in bin/mesh-send.
+# Intel leak filter (PROTOCOL §19 — pre-send PII / secret check)
+#
+# SEC-032: patterns live in lib/intel_filter.py — ONE implementation shared by every
+# mesh CLI. Do NOT inline them here. Per-tool copies rot: the 2026-04-25 inline copy
+# that used to live in this file drifted for three months and passed 9 of 12 secret
+# classes (incl. sk-ant-* / sk-proj-*) that the current set blocks.
 # ---------------------------------------------------------------------------
-_BUILTIN_FILTER_PATTERNS: list[tuple[str, str]] = [
-    (r"\bhf_[A-Za-z0-9]{20,}\b",            "HuggingFace token (hf_...)"),
-    (r"\bsk-[A-Za-z0-9]{20,}\b",            "API key (sk-...)"),
-    (r"eyJ[A-Za-z0-9+/=]{30,}",             "JWT token (eyJ...)"),
-    (r"\bAKIA[A-Z0-9]{16}\b",               "AWS access key (AKIA...)"),
-    (r"\bghp_[A-Za-z0-9]{36}\b",            "GitHub PAT (ghp_...)"),
-    (r"\bgithub_pat_[A-Za-z0-9_]{59,}\b",   "GitHub fine-grained token"),
-    (r"\baia_sk_[A-Za-z0-9]{20,}\b",        "AIA secret key (aia_sk_...)"),
-    (r"-----BEGIN [A-Z ]+-----",            "PEM / private key block"),
-    (r"(?i)\bpassword\s*=\s*\S{4,}",        "password= assignment"),
-    (r"(?i)\bauthorization\s*:\s*\S+",      "Authorization header value"),
-]
+def _load_intel_filter():
+    """Import the shared PROTOCOL §19 filter. Fail CLOSED if unavailable."""
+    import importlib.util
+    import os as _os
+    import sys as _sys
+    from pathlib import Path as _Path
+    cands = []
+    env = _os.environ.get("MESH_INTEL_FILTER")
+    if env:
+        cands.append(_Path(env))
+    here = _Path(__file__).resolve().parent
+    cands.append(here.parent / "lib" / "intel_filter.py")
+    for _p in ("/mnt/system/base/skills/agent-mesh/lib",
+               "/mnt/shared-skills/agent-mesh/lib",
+               "/skills/agent-mesh/lib",
+               "/home/mike/filament/lib",
+               str(_Path.home() / ".local/lib/agent-mesh")):
+        cands.append(_Path(_p) / "intel_filter.py")
+    for c in cands:
+        try:
+            if c.is_file():
+                spec = importlib.util.spec_from_file_location("mesh_intel_filter", c)
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                return mod
+        except Exception:
+            continue
+    _sys.stderr.write(
+        "\n  FATAL: PROTOCOL \u00a719 intel filter lib (intel_filter.py) not found.\n"
+        "  Refusing to write to shared mesh space without a secret filter "
+        "(SEC-032, fail-closed).\n"
+        "  Searched: " + ", ".join(str(c) for c in cands) + "\n\n")
+    _sys.exit(4)
+
+
+_INTEL = _load_intel_filter()
+FILTER_VERSION = _INTEL.FILTER_VERSION
+
+
+def _run_intel_filter(body, agent_dir=None):
+    """Scan body for secrets / PII via the shared lib. Fails closed on error."""
+    import sys as _sys
+    try:
+        return _INTEL.run(body, agent_dir)
+    except Exception as exc:  # noqa: BLE001 — never pass a body through on filter error
+        _sys.stderr.write(
+            "\n  FATAL: PROTOCOL \u00a719 intel filter errored: %r\n"
+            "  Refusing to write to shared mesh space (fail-closed).\n\n" % (exc,))
+        _sys.exit(4)
 
 
 def _agent_dir() -> Path:
@@ -90,44 +132,8 @@ def _agent_dir() -> Path:
     return Path("/tmp")  # fallback — private_context.md won't be found
 
 
-def _load_private_context(agent_dir: Path) -> list[tuple[str, str]]:
-    ctx = agent_dir / "private_context.md"
-    if not ctx.is_file():
-        return []
-    patterns: list[tuple[str, str]] = []
-    labels = {"client": "client pattern", "domain": "domain pattern", "secret": "custom secret"}
-    try:
-        with ctx.open("r", encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                for prefix, label in labels.items():
-                    key = f"{prefix}: "
-                    if line.startswith(key):
-                        pat = line[len(key):]
-                        patterns.append((pat, f"{label}: {pat[:50]}"))
-                        break
-    except OSError:
-        pass
-    return patterns
 
 
-def _run_intel_filter(body: str, agent_dir: Path) -> list[tuple[int, str, str]]:
-    per_agent = _load_private_context(agent_dir)
-    hits: list[tuple[int, str, str]] = []
-    for lineno, line in enumerate(body.splitlines(), 1):
-        for pat, desc in _BUILTIN_FILTER_PATTERNS + per_agent:
-            try:
-                m = re.search(pat, line)
-            except re.error:
-                continue
-            if m:
-                start = max(0, m.start() - 15)
-                snippet = line[start:m.end() + 15].strip()
-                hits.append((lineno, snippet, desc))
-                break
-    return hits
 
 
 # ---------------------------------------------------------------------------
