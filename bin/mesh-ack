@@ -131,6 +131,33 @@ def ack_file(inbox: Path, filename: str, vote: str = "", rationale: str = "") ->
     return True
 
 
+def _cc_sweep(me: str, acked_names) -> int:
+    """Mark cc-overlay copies of acked messages as read.
+
+    mesh-ack has never known about /mesh/cc/<agent>/. The UserPromptSubmit banner
+    counts inbox + cc, so every cc copy stayed "unread" forever: on 2026-08-03 the
+    host banner read 347 unread against an inbox that was genuinely at 29 — 313 of
+    the 320 cc files were duplicates of messages already read and acked through the
+    inbox. A counter that cannot go down is not a counter, and it buries the handful
+    of cc-ONLY messages that nothing else delivers.
+
+    Renames to <name>.acked (the marker is_unread() already honours). Never deletes.
+    """
+    import os
+    cc = Path(os.environ.get("MESH_ROOT", "/mnt/agent-mesh")) / "mesh" / "cc" / me
+    if not cc.is_dir():
+        return 0
+    n = 0
+    for f in sorted(cc.glob("*.md")):
+        if f.name in acked_names:
+            try:
+                f.rename(f.with_name(f.name + ".acked"))
+                n += 1
+            except OSError:
+                pass
+    return n
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("filename", nargs="?", help="message filename to ack (relative, just base name)")
@@ -148,13 +175,25 @@ def main() -> None:
     inbox = discover_my_inbox()
     if not inbox.is_dir():
         die(f"inbox not found: {inbox}")
+    me = agent_name()
 
     if args.all:
         any_done = False
+        acked_names = set()
         for entry in list(inbox.iterdir()):
             if entry.is_file() and entry.suffix == ".md":
                 if ack_file(inbox, entry.name):
                     any_done = True
+                    acked_names.add(entry.name)
+        # cc overlay: mark copies of anything already read via the inbox, plus
+        # anything previously acked (inbox/.read), so the banner can reach zero.
+        read_dir = inbox / ".read"
+        if read_dir.is_dir():
+            acked_names.update(f.name for f in read_dir.glob("*.md"))
+        swept = _cc_sweep(me, acked_names)
+        if swept:
+            print(f"cc-overlay: marked {swept} duplicate(s) read")
+            any_done = True
         if not any_done:
             print("(nothing to ack)")
         return
@@ -164,6 +203,7 @@ def main() -> None:
 
     if not ack_file(inbox, args.filename, vote=args.vote or "", rationale=args.rationale):
         sys.exit(2)
+    _cc_sweep(me, {args.filename})
 
 
 if __name__ == "__main__":
