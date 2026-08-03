@@ -39,6 +39,7 @@ _lib = Path(__file__).resolve().parent.parent / "lib"
 if str(_lib) not in sys.path:
     sys.path.insert(0, str(_lib))
 from write_atomic import write_atomic  # noqa: E402
+from intel_filter import enforce as _intel_enforce  # noqa: E402  SEC-032 fail-closed gate
 
 BLOCKER_TYPES = ("github-push", "infra", "access", "other")
 FALLBACK_VALUES = ("proceed", "abort", "wait")
@@ -153,6 +154,7 @@ Resolution paths:
 {res_lines}
 """
 
+    _intel_enforce(content, tool="mesh-blocker")
     write_atomic(candidate, content)
 
     # send KIND:blocker to the blocked-on agent
@@ -179,10 +181,12 @@ Resolution paths:
     if inbox:
         # atomic write to peer inbox
         slot_path = inbox / f"{bid}.md"
+        _intel_enforce(content, tool="mesh-blocker")
         write_atomic(slot_path, content)
         sent_dir = my_dir / "sent"
         if sent_dir.is_dir():
             try:
+                _intel_enforce(content, tool="mesh-blocker")
                 write_atomic(sent_dir / f"{bid}.md", content)
             except OSError:
                 pass
@@ -302,6 +306,7 @@ def cmd_resolve(args: argparse.Namespace) -> None:
     content = re.sub(r"^STATUS: OPEN$", f"STATUS: RESOLVED", content, flags=re.MULTILINE)
     content += f"\nRESOLVED_AT: {ts}\nRESOLVED_BY: {resolver}\n"
 
+    _intel_enforce(content, tool="mesh-blocker")
     write_atomic(resolved_dir / f"{bid}.md", content)
     src.unlink()
 

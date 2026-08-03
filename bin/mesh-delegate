@@ -1,0 +1,386 @@
+#!/usr/bin/env python3
+"""mesh-delegate — dispatch a task to the residential IP pool.
+
+Picks the best available residential node via mesh-pick-residential.sh,
+writes KIND: delegate to its inbox. If no node is available, writes to
+mesh/DEAD_LETTER/residential-pool/ for replay when a node comes back online.
+
+The dead-letter file has the same format as a delegate message so the
+heartbeat-check replay path can deliver it verbatim.
+
+Stdlib-only. Python 3.8+.
+
+Env:
+    AGENT_URI     required, e.g. host@mesh, bun-desktop@mesh
+    MESH_ROOT     optional, default /mnt/agent-mesh (host) or /mesh (container)
+    PICK_SCRIPT   optional, path to mesh-pick-residential.sh override
+
+Usage:
+    echo "URL: https://target.com/data" | mesh-delegate \\
+        --task-type http-fetch \\
+        --intent "scrape competitor pricing — site blocks datacenter IPs" \\
+        --visibility background \\
+        [--deadline 2026-04-25T06:00:00Z] \\
+        [--fallback surface-to-user|dead-letter|drop] \\
+        [--subject <topic-slug>]
+
+Task types:
+    http-fetch       GET/POST request — safe during in_use (background)
+    browser-session  open browser window — only during available
+    form-submit      fill and submit form — only during available
+    file-download    download + save file — safe during in_use (background)
+
+Visibility:
+    background   no visible windows/audio; safe while human is at keyboard
+    foreground   opens windows, plays audio; only dispatched when available
+
+Fallback (when no residential node is available):
+    dead-letter        save to DEAD_LETTER/residential-pool/, replay on recovery (default)
+    surface-to-user    write STATE_CHECK alert for Mike to see
+    drop               silently discard
+
+Exit codes:
+    0   dispatched to a live residential node
+    1   no node available — dead-lettered or surfaced per --fallback
+    2   task dropped (--fallback drop)
+    3   validation / usage error
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+import sys as _s, pathlib as _pl
+_s.path.insert(0, str(_pl.Path(__file__).resolve().parent.parent / "lib"))
+from intel_filter import enforce as _intel_enforce  # noqa: E402  SEC-032 fail-closed gate
+
+
+def die(msg: str, code: int = 3) -> None:
+    print(f"mesh-delegate: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def agent_name() -> str:
+    uri = os.environ.get("AGENT_URI", "")
+    if not uri.endswith("@mesh"):
+        die("AGENT_URI env var required (e.g. AGENT_URI=bun-desktop@mesh)")
+    name = uri[:-len("@mesh")]
+    if not re.fullmatch(r"[a-z0-9][a-z0-9\-]*", name):
+        die(f"AGENT_URI agent name must be kebab-case, got: {name}")
+    return name
+
+
+def mesh_root() -> Path:
+    override = os.environ.get("MESH_ROOT")
+    if override:
+        return Path(override)
+    if Path("/mesh").is_dir() and Path("/agent-desk").is_dir():
+        # container topology — mesh_root for agents dir is not directly accessible
+        return Path("/")   # sentinel; paths handled below
+    if Path("/mnt/agent-mesh").is_dir():
+        return Path("/mnt/agent-mesh")
+    die("cannot discover mesh root — set MESH_ROOT or run on host/container with /mesh")
+
+
+def discover_paths() -> tuple[Path, Path]:
+    """Return (mesh_dir, agents_dir)."""
+    override = os.environ.get("MESH_ROOT")
+    if override:
+        root = Path(override)
+        return root / "mesh", root / "agents"
+    if Path("/mesh").is_dir():
+        return Path("/mesh"), Path("/mnt/agent-mesh/agents")  # fallback agents on host
+    if Path("/mnt/agent-mesh").is_dir():
+        root = Path("/mnt/agent-mesh")
+        return root / "mesh", root / "agents"
+    die("cannot discover mesh root")
+
+
+def now_ts() -> str:
+    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def now_epoch() -> int:
+    return int(time.time())
+
+
+# ── slot allocation (replicates mesh-send §5 without importing it) ──────────
+
+def sweep_stale_claims(directory: Path) -> None:
+    if not directory.is_dir():
+        return
+    cutoff = time.time() - 60
+    for entry in directory.iterdir():
+        if entry.is_dir() and entry.name.endswith(".claim"):
+            try:
+                if entry.stat().st_mtime < cutoff:
+                    entry.rmdir()
+            except OSError:
+                pass
+
+
+def find_start_seq(directory: Path, date: str) -> int:
+    if not directory.is_dir():
+        return 1
+    prefix_re = re.compile(rf"^{re.escape(date)}-(\d{{3}})-")
+    maxn = 0
+    for entry in directory.iterdir():
+        m = prefix_re.match(entry.name)
+        if m:
+            maxn = max(maxn, int(m.group(1)))
+    return maxn + 1 if maxn else 1
+
+
+def claim_slot(directory: Path, sender: str, topic: str) -> tuple[str, Path, Path]:
+    """Atomically reserve a write slot. Returns (slot_name, md_path, claim_path)."""
+    sweep_stale_claims(directory)
+    date = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d")
+    start = find_start_seq(directory, date)
+
+    def _try(rng):
+        for n in rng:
+            slot = f"{date}-{n:03d}-{sender}-{topic}"
+            claim = directory / f"{slot}.claim"
+            try:
+                claim.mkdir(mode=0o755)
+                return slot, directory / f"{slot}.md", claim
+            except FileExistsError:
+                continue
+        return None
+
+    result = _try(range(start, 1000)) or _try(range(1, start))
+    if result is None:
+        die("no free slot in 999 tries", code=1)
+    return result  # type: ignore[return-value]
+
+
+def release_claim(claim: Path) -> None:
+    try:
+        claim.rmdir()
+    except OSError:
+        pass
+
+
+# ── pick best residential node ───────────────────────────────────────────────
+
+def pick_residential(visibility: str, allow_in_use: bool) -> str | None:
+    """Call mesh-pick-residential.sh. Returns agent URI or None."""
+    script_candidates = [
+        os.environ.get("PICK_SCRIPT", ""),
+        str(Path(__file__).parent / "mesh-pick-residential.sh"),
+        "/home/mike/MIKE-AI/scripts/agent-mesh/mesh-pick-residential.sh",
+    ]
+    script = next((s for s in script_candidates if s and Path(s).exists()), None)
+    if script is None:
+        print("mesh-delegate: WARNING: mesh-pick-residential.sh not found — treating as no-node", file=sys.stderr)
+        return None
+
+    flags = []
+    if allow_in_use or visibility == "background":
+        flags.append("--allow-in-use")
+
+    try:
+        result = subprocess.run(
+            ["bash", script] + flags,
+            capture_output=True, text=True, timeout=10
+        )
+        agent = result.stdout.strip()
+        if agent and agent != "none":
+            return agent
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        print(f"mesh-delegate: WARNING: pick-residential failed: {e}", file=sys.stderr)
+    return None
+
+
+def node_status(agents_dir: Path, agent_uri: str) -> str:
+    """Read node_status from heartbeat.txt. Returns 'available', 'in_use', etc."""
+    name = agent_uri.replace("@mesh", "")
+    hb = agents_dir / name / "status" / "heartbeat.txt"
+    if not hb.exists():
+        return "unknown"
+    try:
+        for line in hb.read_text().splitlines():
+            if line.startswith("node_status:"):
+                return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return "unknown"
+
+
+# ── write delegate message ───────────────────────────────────────────────────
+
+def build_delegate_body(args: argparse.Namespace, body: str) -> str:
+    ts = now_ts()
+    sender = agent_name()
+    parts = [
+        "---",
+        "KIND: delegate",
+        f"AUTHOR: {sender}@mesh",
+        f"TASK_TYPE: {args.task_type}",
+        f"VISIBILITY: {args.visibility}",
+        f"DEADLINE: {args.deadline or ''}",
+        f"FALLBACK: {args.fallback}",
+        f"INTENT: {args.intent}",
+        f"DELEGATED_AT: {ts}",
+        "---",
+        "",
+    ]
+    return "\n".join(parts) + body
+
+
+def write_to_inbox(
+    inbox: Path, sender: str, topic: str,
+    content: str, sent_dir: Path | None
+) -> Path:
+    inbox.mkdir(parents=True, exist_ok=True)
+    slot, md_path, claim = claim_slot(inbox, sender, topic)
+    try:
+        _intel_enforce(content, tool="mesh-delegate")
+        md_path.write_text(content, encoding="utf-8")
+        if sent_dir and sent_dir.is_dir():
+            try:
+                (sent_dir / f"{slot}.md").write_text(content, encoding="utf-8")
+            except OSError:
+                pass
+    finally:
+        release_claim(claim)
+    return md_path
+
+
+def write_dead_letter(
+    dead_dir: Path, sender: str, topic: str,
+    content: str, retry_policy: str
+) -> Path:
+    dead_dir.mkdir(parents=True, exist_ok=True)
+    slot, md_path, claim = claim_slot(dead_dir, sender, topic)
+    # Append dead-letter metadata
+    ts = now_ts()
+    full_content = content.rstrip("\n") + f"\n\nDEAD_LETTERED_AT: {ts}\nRETRY_POLICY: {retry_policy}\n"
+    try:
+        _intel_enforce(full_content, tool="mesh-delegate")
+        md_path.write_text(full_content, encoding="utf-8")
+    finally:
+        release_claim(claim)
+    return md_path
+
+
+def write_state_check(state_check_dir: Path, sender: str, msg: str) -> None:
+    state_check_dir.mkdir(parents=True, exist_ok=True)
+    ts = now_ts()
+    ts_file = ts.replace(":", "").replace("-", "")
+    out = state_check_dir / f"{ts_file}-{sender}-delegate-no-residential.md"
+    _intel_enforce(f"## {sender}@mesh @ {ts}\n- event: delegate-no-residential\n- detail: {msg}\n", tool="mesh-delegate")
+    out.write_text(f"## {sender}@mesh @ {ts}\n- event: delegate-no-residential\n- detail: {msg}\n")
+
+
+# ── main ─────────────────────────────────────────────────────────────────────
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Dispatch a task to the residential IP pool.")
+    p.add_argument("--task-type", default="http-fetch",
+                   choices=["http-fetch", "browser-session", "form-submit", "file-download"],
+                   help="type of task (affects dispatch eligibility)")
+    p.add_argument("--intent", required=True,
+                   help="human-readable description of what this task should accomplish")
+    p.add_argument("--visibility", default="background",
+                   choices=["background", "foreground"],
+                   help="background=safe while human is at keyboard; foreground=needs exclusive desktop")
+    p.add_argument("--deadline", default=None,
+                   help="ISO timestamp; drop task if not dispatched by this time")
+    p.add_argument("--fallback", default="dead-letter",
+                   choices=["dead-letter", "surface-to-user", "drop"],
+                   help="what to do when no residential node is available")
+    p.add_argument("--subject", default=None,
+                   help="topic slug for the message filename (default: derived from intent)")
+    p.add_argument("--allow-in-use", action="store_true",
+                   help="also dispatch to nodes where human is actively using the desktop (background tasks only)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="show what would happen without writing")
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    sender = agent_name()
+    mesh_dir, agents_dir = discover_paths()
+
+    body = sys.stdin.read()
+    content = build_delegate_body(args, body)
+
+    topic_raw = args.subject or args.intent
+    topic = re.sub(r"[^a-z0-9]+", "-", topic_raw.lower()).strip("-")[:50]
+
+    # ── check deadline before even trying to dispatch ──
+    if args.deadline:
+        try:
+            deadline_epoch = int(_dt.datetime.fromisoformat(
+                args.deadline.replace("Z", "+00:00")
+            ).timestamp())
+            if now_epoch() > deadline_epoch:
+                print(f"mesh-delegate: task deadline already passed ({args.deadline}), dropping", file=sys.stderr)
+                sys.exit(2)
+        except ValueError:
+            print(f"mesh-delegate: WARNING: could not parse deadline '{args.deadline}', ignoring", file=sys.stderr)
+
+    # ── pick residential node ──
+    target_agent = pick_residential(args.visibility, args.allow_in_use)
+
+    if target_agent:
+        # Verify VISIBILITY constraint: don't send foreground tasks to in_use nodes
+        if args.visibility == "foreground":
+            status = node_status(agents_dir, target_agent)
+            if status == "in_use":
+                print(f"mesh-delegate: node {target_agent} is in_use, cannot dispatch foreground task", file=sys.stderr)
+                target_agent = None
+
+    if target_agent:
+        agent_short = target_agent.replace("@mesh", "")
+        inbox = agents_dir / agent_short / "inbox"
+        sent_dir = agents_dir / sender / "sent"
+
+        if args.dry_run:
+            print(f"dry-run: would write KIND: delegate to {target_agent}/inbox/ (topic: {topic})")
+            print(f"dry-run: task-type={args.task_type} visibility={args.visibility}")
+            sys.exit(0)
+
+        path = write_to_inbox(inbox, sender, topic, content, sent_dir)
+        print(f"delegated: {path}")
+        sys.exit(0)
+
+    # ── no node available ──
+    if args.fallback == "drop":
+        print(f"mesh-delegate: no residential node available, dropping ({args.intent})", file=sys.stderr)
+        sys.exit(2)
+
+    if args.fallback == "surface-to-user":
+        state_check_dir = mesh_dir / "STATE_CHECK"
+        msg = f"intent={args.intent!r} task_type={args.task_type} visibility={args.visibility}"
+        if args.dry_run:
+            print(f"dry-run: would write STATE_CHECK alert: {msg}")
+            sys.exit(1)
+        write_state_check(state_check_dir, sender, msg)
+        print(f"mesh-delegate: no residential node — STATE_CHECK alert written", file=sys.stderr)
+        sys.exit(1)
+
+    # default: dead-letter
+    dead_dir = mesh_dir / "DEAD_LETTER" / "residential-pool"
+    retry_policy = "on-availability"
+    if args.deadline:
+        retry_policy = f"on-availability deadline={args.deadline}"
+
+    if args.dry_run:
+        print(f"dry-run: would write DEAD_LETTER/residential-pool/ (retry: {retry_policy})")
+        sys.exit(1)
+
+    path = write_dead_letter(dead_dir, sender, topic, content, retry_policy)
+    print(f"mesh-delegate: no residential node available — dead-lettered: {path}", file=sys.stderr)
+    sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

@@ -36,6 +36,7 @@ _lib = Path(__file__).resolve().parent.parent / "lib"
 if str(_lib) not in sys.path:
     sys.path.insert(0, str(_lib))
 from write_atomic import write_atomic as _write_atomic, fsync_dir as _fsync_dir  # noqa: E402
+from intel_filter import enforce as _intel_enforce  # noqa: E402  SEC-032 fail-closed gate
 
 
 def die(msg: str, code: int = 3) -> None:
@@ -116,6 +117,7 @@ def cmd_claim(args: argparse.Namespace) -> None:
             new_lines.append(f'CLAIMED_BY: "{me}@mesh"\n')
             new_lines.append(f"CLAIMED_AT: \"{ts}\"\n")
 
+        _intel_enforce("".join(new_lines), tool="mesh-task-claim")
         _write_atomic(dest, "".join(new_lines))
         task.unlink()
     finally:
