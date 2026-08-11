@@ -56,6 +56,7 @@ _lib = Path(__file__).resolve().parent.parent / "lib"
 if str(_lib) not in sys.path:
     sys.path.insert(0, str(_lib))
 from write_atomic import write_atomic as _write_atomic  # noqa: E402
+from intel_filter import enforce as _intel_enforce  # noqa: E402  SEC-032 fail-closed gate
 
 
 def die(msg: str, code: int = 3) -> None:
@@ -112,14 +113,18 @@ def load_manifest(pl_path: Path) -> dict:
 
 def save_manifest(pl_path: Path, manifest: dict) -> None:
     mf = pl_path / "manifest.json"
-    _write_atomic(mf, json.dumps(manifest, indent=2))
+    payload = json.dumps(manifest, indent=2)
+    _intel_enforce(payload, tool="mesh-pipeline")
+    _write_atomic(mf, payload)
 
 
 def append_log(pl_path: Path, entry: str) -> None:
     log = pl_path / "log.md"
     ts = now_ts()
+    text = f"\n## {ts}\n\n{entry}\n"
+    _intel_enforce(text, tool="mesh-pipeline")
     with log.open("a") as f:
-        f.write(f"\n## {ts}\n\n{entry}\n")
+        f.write(text)
 
 
 def send_pipeline_step(agents_dir: Path, target_agent: str, manifest: dict, step_idx: int) -> Path | None:
@@ -185,6 +190,7 @@ Write your result to: /mesh/PIPELINES/{manifest["pipeline_id"]}/step-{step_idx}-
 On success, next step routes to: {on_success}
 On failure, escalation routes to: {on_failure}
 """
+    _intel_enforce(content, tool="mesh-pipeline")
     _write_atomic(md_path, content)
 
     # Mirror to sender's sent/
@@ -345,15 +351,16 @@ def cmd_step_done(args: argparse.Namespace) -> None:
                 default=0
             )
             fail_path = fail_inbox / f"{date}-{maxn+1:03d}-pipeline-{m['pipeline_id']}-step-{step_idx}-failed.md"
-            _write_atomic(
-                fail_path,
+            fail_content = (
                 f"---\nKIND: announcement\nAUTHOR: {me}\nREADERS: [{on_failure}]\n"
                 f"REPLIES-TO: null\nSIZE: short\nEND-OF-TURN: {on_failure}\n---\n\n"
                 f"# Pipeline Failure: {m['name']}\n\n"
                 f"Step {step_idx} ({steps[step_idx]['name']}) FAILED.\n"
                 f"Reason: {reason or 'none given'}\n"
-                f"Pipeline ID: {m['pipeline_id']}\n",
+                f"Pipeline ID: {m['pipeline_id']}\n"
             )
+            _intel_enforce(fail_content, tool="mesh-pipeline")
+            _write_atomic(fail_path, fail_content)
             log_entry += f"\nFailure notification sent to {on_failure}."
         append_log(pl_path, log_entry)
         print(f"Step {step_idx} FAILED. Notified {on_failure}.", file=sys.stderr)
