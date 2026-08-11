@@ -91,6 +91,19 @@ Filament is designed for any deployment with multiple AI agents that need to coo
 - **Heterogeneous nodes** -- a long-running orchestrator on a VPS, ephemeral laptop nodes, mobile phones with intermittent connectivity. The same files work for everyone.
 - **Embedded into existing systems** -- if your orchestration today is "scripts that produce files in a known place," Filament probably already maps to your mental model.
 
+## Master Checklist (post-install verification)
+
+Single source of truth: `/mnt/agent-mesh/mesh/BLACKBOARD/master-checklist/LATEST.md`
+Mirror: `/home/mike/filament/docs/MASTER-CHECKLIST.md`
+JamBot copy: `/home/mike/MIKE-AI/docs/jambot/mesh-master-checklist.md`
+
+23-section checklist (A-W) covering directory tree, CLIs, protocol compliance,
+watchdog/heartbeat, cron+timer, Layer 3, residential pool, HITL, patch/blocker
+flow, canvas dashboard, capabilities, security, decisions/RFC voting, rebuild
+protocol, bootstrap, nightly reflection, MCP server, agent-side empowerment,
+onboarding, backups, doc routing, observability, gotchas. Run after every
+fresh install or major upgrade.
+
 ## Status
 
 Filament is in active use. The protocol is stable at v2.x; CLIs and operator scripts are stable. The MCP server, canvas dashboard, and patch-apply workflow are newer (April 2026) and continue to evolve.

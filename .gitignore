@@ -7,6 +7,11 @@ mesh-root/
 *.claim/
 *.tmp.*
 *.bak-*
+*.pre-sec032-*
+
+# Python
+__pycache__/
+*.pyc
 
 # OS
 .DS_Store
