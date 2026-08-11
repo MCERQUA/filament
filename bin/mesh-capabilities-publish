@@ -26,6 +26,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+_lib = Path(__file__).resolve().parent.parent / "lib"
+if str(_lib) not in sys.path:
+    sys.path.insert(0, str(_lib))
+from intel_filter import enforce as _intel_enforce  # noqa: E402  SEC-032 fail-closed gate
+
 
 AGENT_URI = os.environ.get("AGENT_URI", "danielle-desktop@mesh")
 AGENT_NAME = AGENT_URI.replace("@mesh", "")
@@ -201,13 +206,15 @@ def _relay_to_host(content: str, out_path: Path) -> None:
         sys.exit(f"REGISTRY ro and /peer-inbox/host not found — cannot write or relay {out_path}")
     ts = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H%M%SZ")
     relay = host_inbox / f"{ts[:10]}-001-{AGENT_NAME}-capabilities-declaration.md"
-    relay.write_text(
+    relay_content = (
         f"---\nKIND: attachment\nAUTHOR: {AGENT_URI}\nREADERS: [host@mesh]\n"
         f"REPLIES-TO: null\nSIZE: short\n"
         f"END-OF-TURN: host@mesh — reply expected\n---\n"
         f"Please write the following to {out_path} on the host filesystem:\n\n"
         f"```\n{content}```\n"
     )
+    _intel_enforce(relay_content, tool="mesh-capabilities-publish")
+    relay.write_text(relay_content)
     print(f"mesh-capabilities-publish: REGISTRY ro — relayed to host via {relay}")
 
 
@@ -238,6 +245,7 @@ def main() -> None:
         return
 
     out_path = REGISTRY_DIR / f"{AGENT_NAME}-CAPABILITIES.md"
+    _intel_enforce(doc, tool="mesh-capabilities-publish")
     try:
         out_path.write_text(doc)
         print(f"mesh-capabilities-publish: wrote {out_path}")
