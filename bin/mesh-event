@@ -241,7 +241,13 @@ def load_frontmatter(path: Path) -> dict:
             break
         if ":" in line:
             k, _, v = line.partition(":")
-            fm[k.strip()] = v.strip()
+            # FIRST-WINS, not last-wins (bun-desktop, 2026-08-13). Some backfilled events carry a
+            # DOUBLED header block and no closing fence, so the parse region runs to the first
+            # `---` anywhere — swallowing both blocks. Under last-wins the second, WRONG
+            # PUBLISHED_AT overwrote the real one, and the opening-fence fix above turned a visible
+            # `?` into a plausible wrong timestamp for 15 of 81 rooms. Absent is detectable;
+            # confidently-wrong is not. The genuine header comes first, so first-wins recovers it.
+            fm.setdefault(k.strip(), v.strip())
     return fm
 
 
