@@ -19,6 +19,19 @@ import subprocess
 import sys
 from pathlib import Path
 
+# SEC-032 fail-closed gate. mesh-chat shells out to mesh-event, so it was protected only
+# TRANSITIVELY — by whichever mesh-event its sibling lookup or PATH happened to find. That
+# is exactly how it went unprotected: on 2026-08-13 the desks' /usr/local/bin/mesh-event
+# was a 2026-04-24 build with ZERO filter refs, so a chat post carrying a key would have
+# shelled straight into an unfiltered writer. It reads BLOCKED today only because that
+# sibling was symlinked to the filtered copy hours earlier — and an image rebuild restores
+# the old one. Double-filtering is cheap; depending on a sibling lookup for a security
+# property is not.
+_lib = Path(__file__).resolve().parent.parent / "lib"
+if str(_lib) not in sys.path:
+    sys.path.insert(0, str(_lib))
+from intel_filter import enforce as _intel_enforce  # noqa: E402
+
 
 CHAT_PREFIX = "chatroom."
 
@@ -54,6 +67,7 @@ def cmd_post(args: argparse.Namespace) -> None:
     if args.body is not None:
         if len(args.body.encode("utf-8")) > CHAT_BODY_CAP:
             die(f"body exceeds chat cap {CHAT_BODY_CAP}B")
+        _intel_enforce(args.body, tool="mesh-chat")
     elif args.body_file:
         try:
             sz = Path(args.body_file).stat().st_size
@@ -61,6 +75,12 @@ def cmd_post(args: argparse.Namespace) -> None:
             die(f"body-file: {e}")
         if sz > CHAT_BODY_CAP:
             die(f"body-file exceeds chat cap {CHAT_BODY_CAP}B (size={sz}B)")
+        # The FILE'S CONTENTS are what gets published, so that is what must be gated.
+        # Checking only the path would filter the envelope, not the letter.
+        try:
+            _intel_enforce(Path(args.body_file).read_text(errors="replace"), tool="mesh-chat")
+        except OSError as e:
+            die(f"body-file unreadable for secret scan: {e}")
     cmd = [mesh_event_bin(), "publish", topic]
     if args.body is not None:
         cmd += ["--body", args.body]
