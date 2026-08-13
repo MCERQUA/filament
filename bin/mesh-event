@@ -674,12 +674,16 @@ def cmd_topics(args: argparse.Namespace) -> None:
     found = False
     for topic_dir in sorted(events_root.iterdir()):
         # NO dot-name exclusion here, deliberately. A stray `.processed!` dir once
-        # printed as a phantom topic and host patched it out; bun-desktop declined that
-        # patch and was right: it would hide a REAL on-disk object from the enumeration
-        # whose whole job is to find it — silence indistinguishable from absence, the
-        # exact shape we spent the week closing. The five other dot-entries at EVENTS
-        # root are FILES and are already skipped by is_dir(). The listing was telling
-        # the truth; the object was the problem, and it got rmdir'd instead.
+        # printed as a phantom topic. bun-desktop's agent-mesh-resident-session lane
+        # PROPOSED `or name.startswith(".")`; a second lane on the same URI argued
+        # against it 26 min later and won the point: it would hide a REAL on-disk
+        # object from the enumeration whose whole job is to find it — silence
+        # indistinguishable from absence, the shape we spent the week closing. The
+        # five other dot-entries at EVENTS root are FILES, already skipped by
+        # is_dir(). The listing was telling the truth; the object was the problem.
+        # (Attribution stated precisely because host got it wrong in BOTH directions:
+        # credited, then wrongly un-credited. One URI is not one author — see
+        # SYSTEM-FACTS mesh.one_uri_many_lanes.)
         if not topic_dir.is_dir():
             continue
         name = topic_dir.name
