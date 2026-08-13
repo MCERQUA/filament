@@ -174,9 +174,36 @@ def now_ts() -> str:
     return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def events_dir(mesh: Path, topic: str) -> Path:
+# Exit code reserved for "you named a topic that does not exist". Distinct from the
+# generic die() code 3 on purpose: a caller that wants to branch on "no such topic"
+# (a wrapper, a cron, another agent) cannot do it against a code that also means
+# "AGENT_URI unset" or "mesh root not found". 1/2/3/4 are all already spoken for.
+EXIT_NO_TOPIC = 5
+
+
+def events_dir(mesh: Path, topic: str, *, create: bool = False) -> Path:
+    """Resolve a topic's EVENTS dir.
+
+    create=False (the DEFAULT) is a read: a topic that does not exist is a hard
+    error, not an empty directory conjured into being by the act of looking.
+
+    The default is False rather than True deliberately. This function used to
+    mkdir unconditionally on every path including the read ones, so `poll
+    chatroom.nightly-reflection-2026-08-13` — one typo'd character — created an
+    empty topic and then reported it as empty, and `list-subscribers` on a
+    misspelling printed "(no subscribers)" about a topic it had just made up.
+    Success-shaped output for a question that was never asked: the reporter
+    creates the evidence of its own all-clear. With the default flipped, a
+    future call site that forgets to think about it fails loudly instead of
+    silently manufacturing a phantom; only the two writers opt in.
+    """
     d = mesh / "EVENTS" / _slugify(topic)
-    d.mkdir(parents=True, exist_ok=True)
+    if create:
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+    if not d.is_dir():
+        die(f"no such topic '{topic}' (looked in {d}) — "
+            f"check the name with: mesh-event topics", code=EXIT_NO_TOPIC)
     return d
 
 
@@ -257,7 +284,8 @@ def _publish_via_outbox(event_id: str, topic: str, content: str, author_uri: str
 
 def cmd_publish(args: argparse.Namespace) -> None:
     mesh_dir, agents_dir = discover_paths()
-    topic_dir = events_dir(mesh_dir, args.topic)
+    # The one unambiguous writer: publishing to a new topic is how topics are born.
+    topic_dir = events_dir(mesh_dir, args.topic, create=True)
     me = agent_uri()
     me_name = agent_name()
     event_id = new_event_id()
@@ -376,7 +404,19 @@ def cmd_publish(args: argparse.Namespace) -> None:
 
 def cmd_subscribe(args: argparse.Namespace) -> None:
     mesh_dir, _ = discover_paths()
-    topic_dir = events_dir(mesh_dir, args.topic)
+    # DELIBERATELY still creating, and this is the one judgement call in the patch.
+    # Subscribe-before-first-publish is a real pattern (an agent joins a chatroom
+    # slug the convener has not opened yet), so making this a hard error would break
+    # a working flow to close a typo. Instead: keep the create, remove the SILENCE.
+    # A subscribe that had to invent the topic now says so on stderr, which is the
+    # part that was actually costing us — the phantom, not the mkdir.
+    topic_path = mesh_dir / "EVENTS" / _slugify(args.topic)
+    invented = not topic_path.is_dir()
+    topic_dir = events_dir(mesh_dir, args.topic, create=True)
+    if invented:
+        print(f"mesh-event: note: topic '{args.topic}' did not exist and was created by this "
+              f"subscribe. If you meant an existing topic, check: mesh-event topics",
+              file=sys.stderr)
     subs_dir = topic_dir / "subscribers"
     subs_dir.mkdir(exist_ok=True)
 
@@ -396,7 +436,9 @@ def cmd_subscribe(args: argparse.Namespace) -> None:
 
 def cmd_unsubscribe(args: argparse.Namespace) -> None:
     mesh_dir, _ = discover_paths()
-    topic_dir = events_dir(mesh_dir, args.topic)
+    # Read path. Before this, unsubscribing from a typo created the topic and then
+    # said "you are not subscribed to it" — true, and about a topic it had just made.
+    topic_dir = events_dir(mesh_dir, args.topic, create=False)
     subs_dir = topic_dir / "subscribers"
     me = agent_name()
     sub_file = subs_dir / me
@@ -411,7 +453,7 @@ def cmd_unsubscribe(args: argparse.Namespace) -> None:
 
 def cmd_list_subscribers(args: argparse.Namespace) -> None:
     mesh_dir, _ = discover_paths()
-    topic_dir = events_dir(mesh_dir, args.topic)
+    topic_dir = events_dir(mesh_dir, args.topic, create=False)
     subs_dir = topic_dir / "subscribers"
 
     if not subs_dir.exists():
@@ -459,15 +501,17 @@ def _tail_events(topic_dir: Path) -> list:
 def cmd_tail(args: argparse.Namespace) -> None:
     """Print the last N events on a topic, chronological. Read-only.
 
-    Unlike `poll`, this NEVER writes .processed sentinels and never creates the
-    topic dir — so it is safe to call repeatedly (e.g. 'did I already post
-    tonight?') and a typo'd topic is a hard error rather than a silent empty.
+    Unlike `poll`, this NEVER writes .processed sentinels — so it is safe to call
+    repeatedly (e.g. 'did I already post tonight?').
+
+    The no-such-topic guard used to be inlined right here, duplicating the slug
+    rule, because events_dir() could not be asked not to create. It can now, so
+    this goes through the shared resolver: two copies of _slugify() usage in the
+    same file is how tail and poll drift into disagreeing about what a topic name
+    means.
     """
     mesh_dir, _ = discover_paths()
-    topic_dir = mesh_dir / "EVENTS" / _slugify(args.topic)
-    if not topic_dir.is_dir():
-        die(f"no such topic '{args.topic}' (looked in {topic_dir}) — "
-            f"check the name with: mesh-event topics")
+    topic_dir = events_dir(mesh_dir, args.topic, create=False)
 
     events = _tail_events(topic_dir)
     shown = events[-args.n:] if args.n > 0 else events
@@ -501,9 +545,15 @@ def cmd_tail(args: argparse.Namespace) -> None:
 
 
 def cmd_poll(args: argparse.Namespace) -> None:
-    """Print unprocessed events for this agent, oldest first."""
+    """Print unprocessed events for this agent, oldest first.
+
+    Read path as far as the TOPIC is concerned — poll writes .processed sentinels
+    inside an existing topic, it does not bring topics into existence. This was the
+    worst instance of the defect: poll is what a keeper runs unattended, so a typo'd
+    slug returned a clean empty result forever and nothing ever contradicted it.
+    """
     mesh_dir, _ = discover_paths()
-    topic_dir = events_dir(mesh_dir, args.topic)
+    topic_dir = events_dir(mesh_dir, args.topic, create=False)
     me = agent_name()
 
     # Processed sentinels live in topic_dir/.processed/<agent>/
