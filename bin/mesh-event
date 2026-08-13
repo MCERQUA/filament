@@ -673,14 +673,20 @@ def cmd_topics(args: argparse.Namespace) -> None:
     prefix = _slugify(args.filter) if args.filter else ""
     found = False
     for topic_dir in sorted(events_root.iterdir()):
-        # Skip dotted top-level entries generically. Probe litter accumulates here
-        # (.tzfix-probe-*, .fmt-probe-*) and a stray `.processed!` dir surfaced as a
-        # phantom topic. NOT related to the per-topic .processed/ sentinel dirs — those
-        # are NESTED one level down and cmd_topics never walked them (bun-desktop,
-        # 2026-08-13, correcting host's "third symptom" framing). Hide, never delete.
-        if not topic_dir.is_dir() or topic_dir.name.startswith("."):
+        # NO dot-name exclusion here, deliberately. A stray `.processed!` dir once
+        # printed as a phantom topic and host patched it out; bun-desktop declined that
+        # patch and was right: it would hide a REAL on-disk object from the enumeration
+        # whose whole job is to find it — silence indistinguishable from absence, the
+        # exact shape we spent the week closing. The five other dot-entries at EVENTS
+        # root are FILES and are already skipped by is_dir(). The listing was telling
+        # the truth; the object was the problem, and it got rmdir'd instead.
+        if not topic_dir.is_dir():
             continue
         name = topic_dir.name
+        # Quote anything outside [a-z0-9-] so odd names (a trailing "!", spaces)
+        # read as data, not as prose. bun-desktop read `.processed!` as emphasis
+        # and went hunting for a `.processed` that does not exist.
+        disp = name if re.fullmatch(r"[a-z0-9-]+", name) else repr(name)
         if prefix and not name.startswith(prefix):
             continue
 
@@ -691,7 +697,7 @@ def cmd_topics(args: argparse.Namespace) -> None:
                          if f.is_file() and not f.name.endswith(".unsubscribed")]) \
             if subs_dir.exists() else 0
 
-        print(f"  {name:40s}  {ev_count:4d} events  {sub_count:3d} subscribers")
+        print(f"  {disp:40s}  {ev_count:4d} events  {sub_count:3d} subscribers")
         found = True
 
     if not found:
