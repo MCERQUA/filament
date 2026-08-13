@@ -28,6 +28,9 @@ Exit codes:
     2  rate-limit hit (urgent 1/hr)
     3  validation failure (unknown kind, missing AGENT_URI, etc.)
     4  intel filter blocked — body matched a secret/PII pattern; use --force-leak to override
+    5  force-leak REFUSED — the override's audit record could not be written. Distinct
+       from 4 on purpose: 4 means "you may override this", 5 means "your override was
+       denied". Sharing a code would make them indistinguishable to retry logic.
 """
 from __future__ import annotations
 
@@ -111,8 +114,19 @@ def _run_intel_filter(body, agent_dir=None):
 
 
 def _write_force_leak_audit(mesh_dir: Path, sender: str, recipient: str,
-                            hits: list[tuple[int, str, str]]) -> None:
-    """Append a force-leak audit entry to mesh/DECISIONS/ (best-effort)."""
+                            hits: list[tuple[int, str, str]]) -> "Path | None":
+    """Append a force-leak audit entry to mesh/DECISIONS/. Returns the path, or None.
+
+    NOT best-effort as of 2026-08-13. It was `except OSError: pass` inside a branch that
+    had already decided to send, with no return value and no check at the call site — so
+    an unwritable DECISIONS silently removed the audit and the override proceeded. The
+    tool even advertised the guarantee it was not keeping ("creates audit entry in
+    mesh/DECISIONS/"). An audit the audited party can skip by failing is not a control.
+
+    Found by bun-desktop@mesh while checking whether desk `src` — whose compose declares
+    no DECISIONS bind at all — would refuse or silently proceed. It was silently proceed,
+    on EVERY desk, since all four symlink this one binary.
+    """
     decisions_dir = mesh_dir / "DECISIONS"
     try:
         decisions_dir.mkdir(parents=True, exist_ok=True)
@@ -136,8 +150,11 @@ def _write_force_leak_audit(mesh_dir: Path, sender: str, recipient: str,
         for lineno, snippet, desc in hits:
             lines.append(f"- Line {lineno}: [{desc}] near: {snippet!r}")
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    except OSError:
-        pass  # audit is best-effort; don't block the send
+        return path
+    except OSError as e:
+        print(f"mesh-send: force-leak audit could not be written to {decisions_dir}: {e}",
+              file=sys.stderr)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -429,7 +446,13 @@ def main() -> None:
     hits = _run_intel_filter(body, my_dir)
     if hits:
         if args.force_leak:
-            _write_force_leak_audit(mesh_dir, sender, args.to, hits)
+            # Fail CLOSED: no audit record, no override. See _write_force_leak_audit.
+            if _write_force_leak_audit(mesh_dir, sender, args.to, hits) is None:
+                print("mesh-send: REFUSED — --force-leak requires an audit record in "
+                      "mesh/DECISIONS/ and it could not be written.", file=sys.stderr)
+                print("mesh-send: the override is DENIED, not downgraded. Nothing was sent.",
+                      file=sys.stderr)
+                sys.exit(5)
         else:
             print("mesh-send: BLOCKED — potential secret / business intel detected:", file=sys.stderr)
             for lineno, snippet, desc in hits:
