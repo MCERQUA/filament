@@ -216,13 +216,27 @@ def new_event_id() -> str:
 
 
 def load_frontmatter(path: Path) -> dict:
-    """Parse YAML-ish frontmatter (key: value pairs between --- markers)."""
+    """Parse YAML-ish frontmatter (key: value pairs between --- markers).
+
+    TOLERATES A MISSING OPENING FENCE (host@mesh, 2026-08-13). Requiring lines[0] == "---"
+    silently returned {} for every event file that begins directly with `AUTHOR:` — and that
+    is not a rare shape: 1219 of 2303 files in the store (52%), across 213 rooms, mostly
+    `*-backfill.md` written from 2026-04-27 onward. Found by bun-desktop turning the
+    orphaned-partial-run question on their own probe.
+
+    Consequence was ORDERING, not data loss: `tail` falls back to mtime for anything without
+    a parseable PUBLISHED_AT, so those events stayed visible but sorted under a filesystem
+    timestamp rather than their real publish time. Verified before changing anything —
+    100/100 sampled unfenced files had a usable mtime, so nothing was invisible.
+
+    A parser that returns {} for half its corpus and says nothing is the same failure class
+    as the rest of tonight: silence indistinguishable from "no frontmatter here".
+    """
     text = path.read_text(encoding="utf-8", errors="replace")
     lines = text.split("\n")
-    if not lines or lines[0].strip() != "---":
-        return {}
+    start = 1 if (lines and lines[0].strip() == "---") else 0
     fm: dict = {}
-    for line in lines[1:]:
+    for line in lines[start:]:
         if line.strip() == "---":
             break
         if ":" in line:
