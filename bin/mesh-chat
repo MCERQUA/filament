@@ -93,7 +93,11 @@ def cmd_post(args: argparse.Namespace) -> None:
 
 def cmd_tail(args: argparse.Namespace) -> None:
     topic = topic_for(args.slug)
-    cmd = [mesh_event_bin(), "poll", topic, "--tail", str(args.n)]
+    # `poll` is a consuming per-agent cursor (it writes .processed sentinels and
+    # returns nothing on a second call) and has no --tail/--follow — this used to
+    # build `poll --tail N`, which argparse rejected, so `mesh-chat tail` exited
+    # rc=2 unconditionally. `mesh-event tail` is the read-only lane.
+    cmd = [mesh_event_bin(), "tail", topic, "--n", str(args.n)]
     if args.follow:
         cmd.append("--follow")
     sys.exit(run(cmd))

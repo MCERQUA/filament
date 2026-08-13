@@ -51,6 +51,7 @@ import json
 import os
 import re
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -432,6 +433,73 @@ def cmd_list_subscribers(args: argparse.Namespace) -> None:
         print(f"(no active subscribers for topic '{args.topic}')")
 
 
+def _tail_events(topic_dir: Path) -> list:
+    """Return (published_at, path) for every event in topic_dir, chronological.
+
+    Sorted by PUBLISHED_AT, NOT by filename: event ids are random hex
+    (new_event_id -> uuid4), so name order is arbitrary. Events missing a
+    parseable PUBLISHED_AT sort last under their mtime so they stay visible.
+    """
+    out = []
+    for ev_path in topic_dir.iterdir():
+        if not (ev_path.name.startswith("ev-") and ev_path.suffix == ".md"):
+            continue
+        pub = load_frontmatter(ev_path).get("PUBLISHED_AT", "")
+        try:
+            key = _dt.datetime.strptime(pub, "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=_dt.timezone.utc)
+        except ValueError:
+            key = _dt.datetime.fromtimestamp(ev_path.stat().st_mtime,
+                                             _dt.timezone.utc)
+        out.append((key, ev_path))
+    out.sort(key=lambda t: t[0])
+    return out
+
+
+def cmd_tail(args: argparse.Namespace) -> None:
+    """Print the last N events on a topic, chronological. Read-only.
+
+    Unlike `poll`, this NEVER writes .processed sentinels and never creates the
+    topic dir — so it is safe to call repeatedly (e.g. 'did I already post
+    tonight?') and a typo'd topic is a hard error rather than a silent empty.
+    """
+    mesh_dir, _ = discover_paths()
+    topic_dir = mesh_dir / "EVENTS" / _slugify(args.topic)
+    if not topic_dir.is_dir():
+        die(f"no such topic '{args.topic}' (looked in {topic_dir}) — "
+            f"check the name with: mesh-event topics")
+
+    events = _tail_events(topic_dir)
+    shown = events[-args.n:] if args.n > 0 else events
+    for _key, ev_path in shown:
+        fm = load_frontmatter(ev_path)
+        print(f"## {ev_path.stem}  [{fm.get('PUBLISHED_AT', '?')}] "
+              f"from {fm.get('AUTHOR', '?')}")
+        body = event_body(ev_path)
+        print(body)
+        if not body.endswith("\n"):
+            print()
+
+    if not shown:
+        print(f"(topic '{args.topic}' exists but has no events yet)")
+
+    if not args.follow:
+        return
+
+    seen = {p for _k, p in events}
+    while True:
+        time.sleep(2)
+        for key, ev_path in _tail_events(topic_dir):
+            if ev_path in seen:
+                continue
+            seen.add(ev_path)
+            fm = load_frontmatter(ev_path)
+            print(f"## {ev_path.stem}  [{fm.get('PUBLISHED_AT', '?')}] "
+                  f"from {fm.get('AUTHOR', '?')}", flush=True)
+            body = event_body(ev_path)
+            print(body, flush=True)
+
+
 def cmd_poll(args: argparse.Namespace) -> None:
     """Print unprocessed events for this agent, oldest first."""
     mesh_dir, _ = discover_paths()
@@ -595,6 +663,11 @@ def main() -> None:
     po.add_argument("--since-id", default=None)
     po.add_argument("--limit", type=int, default=50)
 
+    ta = sub.add_parser("tail", help="print the last N events on a topic (read-only)")
+    ta.add_argument("topic")
+    ta.add_argument("--n", type=int, default=20)
+    ta.add_argument("-f", "--follow", action="store_true")
+
     tp = sub.add_parser("topics", help="list all event topics")
     tp.add_argument("--filter", default=None)
 
@@ -608,6 +681,7 @@ def main() -> None:
         "unsubscribe": cmd_unsubscribe,
         "list-subscribers": cmd_list_subscribers,
         "poll": cmd_poll,
+        "tail": cmd_tail,
         "topics": cmd_topics,
         "gc": cmd_gc,
     }[args.cmd](args)
