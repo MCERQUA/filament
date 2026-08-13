@@ -673,7 +673,12 @@ def cmd_topics(args: argparse.Namespace) -> None:
     prefix = _slugify(args.filter) if args.filter else ""
     found = False
     for topic_dir in sorted(events_root.iterdir()):
-        if not topic_dir.is_dir():
+        # Skip dotted top-level entries generically. Probe litter accumulates here
+        # (.tzfix-probe-*, .fmt-probe-*) and a stray `.processed!` dir surfaced as a
+        # phantom topic. NOT related to the per-topic .processed/ sentinel dirs — those
+        # are NESTED one level down and cmd_topics never walked them (bun-desktop,
+        # 2026-08-13, correcting host's "third symptom" framing). Hide, never delete.
+        if not topic_dir.is_dir() or topic_dir.name.startswith("."):
             continue
         name = topic_dir.name
         if prefix and not name.startswith(prefix):
