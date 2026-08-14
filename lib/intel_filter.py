@@ -96,6 +96,62 @@ def load_private_context(agent_dir) -> list[tuple[str, str]]:
     return patterns
 
 
+# ---------------------------------------------------------------------------
+# CONDITIONAL RULES (SEC-032 shape coverage / SEC-038 groundwork).
+# A plain (regex, desc) tuple cannot express "match, THEN exempt when the capture
+# is obviously a placeholder" — these two need a predicate, so they live here.
+#
+# Landed 2026-08-14 from bun-desktop@mesh's canonical block VERBATIM, with
+# security-officer@mesh's ship ruling. Measured before landing: 0 false positives
+# across 6,809 (host) and 7,192 (bun) INDEPENDENT corpora; positive controls block;
+# 9/9 URLCRED. The 16,211 figure that circulated earlier was a SUM of overlapping
+# sets — the real union is 6,809.
+#
+# DO NOT reconstruct these from prose. The one recurring failure in this workstream
+# was paraphrasing an artifact: a STOP-list paraphrase added `app`/`secret` and
+# reopened a hole. Apply from the canonical block or not at all.
+# ---------------------------------------------------------------------------
+
+# Trimming this list re-enables the rule's self-censorship: documentation of a credential URL is
+# written in these placeholder forms, and this exemption is the ONLY thing that stops the rule
+# blocking its own ticket/reviews. Two properties are required and non-obvious:
+#   (1) NO single letters — reintroduces the redis://u:p@ miss
+#   (2) NO word plausible as a real short password (secret, app, test, dev, prod) — each re-opens a gap
+# It shrinks under pressure, never grows.
+URLCRED_STOP = {
+    "admin", "bar", "changeme", "foo", "pass", "password", "pw", "service",
+    "svc", "user", "username", "xxx", "your_password", "your_user", "yyy",
+}
+
+_ASSIGN_RE = re.compile(r"\b([A-Z][A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|KEY))\s*=\s*(\S{16,})")
+_ASSIGN_REF_PREFIXES = ("os.", "self.", "process.", "$", "{", "<", '"', "'", "`", "...", "\u2026")
+_ASSIGN_REF_SUBSTR = ("<", ">", "{", "}", "$", "*", "REDACTED", "...", "\u2026", "XXX",
+                      "YOUR_", "environ", "getenv", "placeholder", "PASTE", "example")
+
+_URLCRED_RE = re.compile(
+    r"://([A-Za-z0-9._~%+-]{1,64}):([^@\s/\\\[\]{}()|^$*?]{1,128})@"
+    r"([A-Za-z0-9.-]+\.[A-Za-z]{2,}|localhost|\d{1,3}(?:\.\d{1,3}){3})"
+)
+
+
+def _conditional_hits(line: str):
+    """Rules that match then EXEMPT obvious placeholders. Returns [(snippet, desc)]."""
+    out = []
+    m = _ASSIGN_RE.search(line)
+    if m:
+        val = m.group(2)
+        head = val[:60]
+        if not (val.startswith(_ASSIGN_REF_PREFIXES)
+                or any(t in head for t in _ASSIGN_REF_SUBSTR)):
+            out.append((m.group(0)[:80], "credential ASSIGNMENT (NAME=<literal>)"))
+    m = _URLCRED_RE.search(line)
+    if m:
+        # exempt ONLY when BOTH halves are placeholder words — one real half still blocks
+        if not (m.group(1).lower() in URLCRED_STOP and m.group(2).lower() in URLCRED_STOP):
+            out.append((m.group(0)[:80], "credential in URL (scheme://user:pass@host)"))
+    return out
+
+
 def run(body: str, agent_dir=None) -> list[tuple[int, str, str]]:
     """Scan body lines for secrets / PII. Returns [(line_no, snippet, description)]."""
     all_patterns = BUILTIN_FILTER_PATTERNS + load_private_context(agent_dir)
@@ -111,6 +167,11 @@ def run(body: str, agent_dir=None) -> list[tuple[int, str, str]]:
                 snippet = line[start:m.end() + 15].strip()
                 hits.append((lineno, snippet, desc))
                 break  # one hit per line is enough
+        else:
+            # no builtin pattern matched this line — try the conditional rules
+            for snippet, desc in _conditional_hits(line):
+                hits.append((lineno, snippet, desc))
+                break
     return hits
 
 
