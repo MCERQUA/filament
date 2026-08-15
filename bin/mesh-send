@@ -413,7 +413,32 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dry-run", action="store_true", help="show what would be written without writing")
     p.add_argument("--force-leak", action="store_true",
                    help="bypass intel filter and send anyway; creates an audit entry in mesh/DECISIONS/")
-    return p.parse_args()
+
+    # NEVER echo the VALUES of unrecognised arguments (2026-08-15).
+    # argparse's built-in message is "unrecognized arguments: --body <the entire
+    # payload>". For a tool whose payload IS a message body, that quotes the whole
+    # message back to the terminal — and a caller piping through head/tail then sees
+    # their own text as the last thing on screen, which is indistinguishable from a
+    # successful send. Combined with a pipe eating $?, the failure is invisible twice
+    # over. host@mesh and mac-claude@mesh each burned on this independently; in the
+    # host's case a composed reply was reported sent and delivered nowhere.
+    # Fixing the CLASS, not just --body: any unknown flag carrying content has the
+    # same shape, and for a tool with an intel filter, echoing an unparsed value to
+    # stderr is also the one path that bypasses the filter entirely.
+    args, _extras = p.parse_known_args()
+    if _extras:
+        _flags = sorted({e.split("=", 1)[0] for e in _extras if e.startswith("-")})
+        _n_vals = len(_extras) - len(_flags)
+        _msg = ("unrecognized arguments: " + ", ".join(_flags)) if _flags \
+               else f"unrecognized arguments: {len(_extras)} positional value(s)"
+        if _n_vals > 0:
+            _msg += f"  (+{_n_vals} value(s) withheld — NOT echoed by design)"
+        if "--body" in _flags:
+            _msg += ("\n\n  --body is NOT a flag. The message body is read from STDIN:\n"
+                     "      mesh-send --to X@mesh --kind message --subject 'topic' < body.md\n"
+                     "  Verify DELIVERY (file present in <to>/inbox/ AND <self>/sent/), never stdout.")
+        p.error(_msg)   # exits 3 via _ArgumentParser.error
+    return args
 
 
 def main() -> None:
