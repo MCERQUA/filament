@@ -292,6 +292,30 @@ if __name__ == "__main__":
             "the sk- prefix is used by openai": False,
             "branch feat/sk-rewrite-cache": False,
             "see https://example.com/v1//path": False,
+            # ── ASSIGN + URLCRED coverage (SEC-038, 2026-08-15) ──────────────
+            # The ASSIGN/URLCRED rules were LIVE but the self-test never exercised
+            # them. bun-desktop's canonical fixture set (BLACKBOARD/sec-038/
+            # intel-filter-selftest-negative-controls.md): "positives-green with
+            # negatives-unrun is not a pass; it is an unmeasured rule." The
+            # negatives are the only fixtures that separate a correct ASSIGN from
+            # a blanket refuser. Values assembled from repeated chars so no literal
+            # secret ships in source (same reason as the value-keyed cases above).
+            # ASSIGN positives (NAME=<literal> must BLOCK; one in `export` form):
+            "BRIDGE_TOKEN=" + "A" * 32: True,
+            "export TWILIO_AUTH_TOKEN=" + "B" * 32: True,
+            "CLIENT_SECRET=" + "C" * 32: True,
+            "DB_PASSWORD=" + "D" * 32: True,
+            "API_KEY=" + "E" * 32: True,
+            # ASSIGN negatives (LOAD-BEARING — each tests a distinct pass path):
+            "OVUI_GROUND_TAG_W=1024": False,                     # no keyword / value too short
+            "the bridge token is rotated nightly": False,        # prose, no assignment
+            "BRIDGE_TOKEN = os.environ.get('BRIDGE_TOKEN')": False,  # value is a reference (os.)
+            "API_KEY=<your_api_key_placeholder_here>": False,    # placeholder (< + 'placeholder')
+            # URLCRED positive (real-looking user:pass@host must BLOCK):
+            "redis://appuser:" + "R" * 12 + "@10.0.0.5:6379": True,
+            # URLCRED negatives (BOTH halves placeholder → exempt, must PASS):
+            "postgresql://user:password@host.example.com": False,
+            "redis://your_user:your_password@localhost": False,
         }
         bad = 0
         for text, should_block in cases.items():
