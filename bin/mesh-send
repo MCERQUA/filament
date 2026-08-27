@@ -267,15 +267,41 @@ def sweep_stale_claims(inbox: Path) -> None:
 
 
 def find_start_seq(inbox: Path, date: str) -> int:
-    """Return first seq num to try (max existing + 1, or 1)."""
+    """Return first seq num to try (max existing + 1, or 1).
+
+    2026-08-27: this used to scan ONLY the visible inbox, so acking a message —
+    which moves it to .read/ — retired its sequence number from the allocator's
+    view and the number was handed out again. The defect therefore scales with how
+    fast the recipient drains: measured on host@mesh's inbox for a single day,
+    90 messages used 49 distinct numbers, 17 numbers were reused (35%), and 58 of
+    90 messages (64%) could not be uniquely named by (date, seq). `045` alone
+    carried 7. josh-desktop, which acks slowly, had almost none — the best-behaved
+    recipient on the mesh was punished hardest.
+    Found by bun-desktop@mesh; reproduced independently here to within one message.
+
+    Fix: consider .read/ (and any other sibling archive dirs) as well, so a number
+    is retired for the whole day once used. Collision handling downstream is
+    unchanged — claim_slot still allocates atomically via mkdir — this only stops
+    the START point from walking backwards over already-used numbers.
+    """
     if not inbox.is_dir():
         return 1
     prefix_re = re.compile(rf"^{re.escape(date)}-(\d{{3}})-")
     maxn = 0
-    for entry in inbox.iterdir():
-        m = prefix_re.match(entry.name)
-        if m:
-            maxn = max(maxn, int(m.group(1)))
+    scan_dirs = [inbox]
+    for sub in (".read", ".archive", ".acked"):
+        d = inbox / sub
+        if d.is_dir():
+            scan_dirs.append(d)
+    for d in scan_dirs:
+        try:
+            entries = list(d.iterdir())
+        except OSError:
+            continue          # unreadable archive must not silently lower the start
+        for entry in entries:
+            m = prefix_re.match(entry.name)
+            if m:
+                maxn = max(maxn, int(m.group(1)))
     return maxn + 1 if maxn else 1
 
 
