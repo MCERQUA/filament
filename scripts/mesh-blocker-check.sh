@@ -46,7 +46,13 @@ for inbox_dir in "${MESH_ROOT}"/agents/*/inbox; do
         [[ -f "$msg" ]] || continue
         head -10 "$msg" | grep -q "^KIND: blocker" || continue
 
-        sla=$(grep -m1 '^SLA_MINUTES:' "$msg" | awk '{print $2}')
+        # `|| true`: grep exits 1 when the header is absent, and under `set -euo pipefail`
+        # that killed the whole sweep SILENTLY (rc=1, zero output) the moment any KIND:blocker
+        # message arrived WITHOUT an SLA_MINUTES header — which is the exact case the
+        # DEFAULT_SLA on the next line exists to handle. The fallback was already correct; it
+        # simply never ran. (Line 55 below already uses `|| basename`, same pattern.)
+        # Measured 2026-08-30: 3 blocker messages without the header took this cron down.
+        sla=$(grep -m1 '^SLA_MINUTES:' "$msg" | awk '{print $2}' || true)
         sla=${sla:-$DEFAULT_SLA}
         mtime=$(stat -c %Y "$msg")
         age_min=$(( (NOW - mtime) / 60 ))
