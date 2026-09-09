@@ -38,10 +38,19 @@ Subcommands:
                         remove expired events (respects TTL frontmatter)
 
 Exit codes:
-    0  success
+    0  success — for `publish`: the event is durable and every subscriber REACHABLE from this
+       topology was notified (lanes with no path from here are listed, not failed; the host
+       sweeper delivers them within 5 min)
     1  not found / no events
     3  usage error
     4  intel filter blocked (publish subcommand) — use --force-leak to override
+    5  topic does not exist (EXIT_NO_TOPIC)
+    6  partial delivery — a subscriber inbox that WAS resolvable refused the write
+       (EXIT_PARTIAL_DELIVERY, 2026-09-09 contract; see BLACKBOARD/bin/PATTERN-mesh-cli-exit-codes.md)
+
+stdout contract for `publish` (2026-09-09): TWO lines — the event id, then the
+"notified X/N reachable subscribers …" status (also echoed on stderr). No live caller captured
+stdout when this changed; a new caller must read line 1 for the id.
 """
 from __future__ import annotations
 
@@ -156,18 +165,67 @@ def agent_name() -> str:
     return agent_uri()[:-len("@mesh")]
 
 
+# Sentinel returned as agents_dir when the host-absolute agents/ tree is not
+# reachable from here (container topology). Matches mesh-send's own sentinel
+# name/convention exactly so any caller that already knows to check for it
+# (there was none until this fix) behaves the same across both tools.
+AGENTS_DIR_UNAVAILABLE = Path("/agent-mesh-agents-unavailable")
+
+
 def discover_paths() -> tuple[Path, Path]:
-    """Return (mesh_dir, agents_dir)."""
+    """Return (mesh_dir, agents_dir).
+
+    BUG FIXED 2026-09-09 (bun-desktop@mesh, msg 2026-09-09-075): the old body
+    checked `Path("/mesh").is_dir()` FIRST and, on a true hit, hardcoded
+    agents_dir to the HOST-ABSOLUTE `/mnt/agent-mesh/agents` — which exists on
+    the host but never inside a container. /mesh IS a dir inside every desk
+    container (it is bind-mounted read-only there), so every container call
+    took that branch and got an agents_dir that structurally cannot exist for
+    it. cmd_publish then silently skipped every subscriber's inbox lookup
+    (`if not inbox.is_dir(): continue`) and printed "notified 0/19" with the
+    only signal on stderr. mesh-send never had this bug — it detects container
+    topology explicitly (`/agent-desk` + `/mesh` both present) BEFORE falling
+    through to the host branch, and returns a sentinel agents_dir so callers
+    know to use `/peer-inbox/<name>` instead. This mirrors that check, in the
+    same order, so mesh-event and mesh-send agree on topology.
+    """
     override = os.environ.get("MESH_ROOT")
     if override:
         root = Path(override)
         return root / "mesh", root / "agents"
-    if Path("/mesh").is_dir():
-        return Path("/mesh"), Path("/mnt/agent-mesh/agents")
+    if Path("/agent-desk").is_dir() and Path("/mesh").is_dir():
+        return Path("/mesh"), AGENTS_DIR_UNAVAILABLE
     if Path("/mnt/agent-mesh").is_dir():
         root = Path("/mnt/agent-mesh")
         return root / "mesh", root / "agents"
+    if Path("/mesh").is_dir():
+        # /mesh present without /agent-desk: not the known container shape, but
+        # don't assume host-absolute agents/ works here either — same caution
+        # as the container branch above, just without a peer-inbox mount to
+        # fall back to. cmd_publish's per-subscriber resolve still tries
+        # /peer-inbox/<name> and reports honestly if that's also absent.
+        return Path("/mesh"), AGENTS_DIR_UNAVAILABLE
     die("cannot discover mesh root — set MESH_ROOT or run on host/container with /mesh")
+
+
+def resolve_subscriber_inbox(agents_dir: Path, sub_name: str) -> Path | None:
+    """Resolve one subscriber's real inbox dir, or None if unreachable from here.
+
+    Mirrors mesh-send's candidate order exactly (host-absolute path first when
+    usable, then the container cross-peer convention) — see mesh-send's
+    cmd_send inbox resolution. Kept as its own function so cmd_publish's per-
+    subscriber loop and any future caller share one place that knows both
+    conventions, instead of re-deriving it and drifting the way discover_paths
+    itself drifted from mesh-send's version.
+    """
+    candidates = []
+    if agents_dir != AGENTS_DIR_UNAVAILABLE:
+        candidates.append(agents_dir / sub_name / "inbox")
+    candidates.append(Path(f"/peer-inbox/{sub_name}"))
+    for c in candidates:
+        if c.is_dir():
+            return c
+    return None
 
 
 def now_ts() -> str:
@@ -179,6 +237,13 @@ def now_ts() -> str:
 # (a wrapper, a cron, another agent) cannot do it against a code that also means
 # "AGENT_URI unset" or "mesh root not found". 1/2/3/4 are all already spoken for.
 EXIT_NO_TOPIC = 5
+
+# publish succeeded (event body is durable) but not every subscriber's inbox
+# was reachable from here — a partial-delivery signal distinct from EXIT_NO_TOPIC
+# (5) and from die()'s generic usage-error 3, so a wrapper can branch on "some
+# subscribers were not notified" without parsing "notified X/N" out of the
+# message text. 1/3/4/5 already spoken for (see module docstring); use 6.
+EXIT_PARTIAL_DELIVERY = 6
 
 
 def events_dir(mesh: Path, topic: str, *, create: bool = False) -> Path:
@@ -369,7 +434,9 @@ def cmd_publish(args: argparse.Namespace) -> None:
     # Get current subscribers
     subs_dir = topic_dir / "subscribers"
     subs_dir.mkdir(exist_ok=True)
-    subscribers = [f.stem for f in subs_dir.iterdir() if f.is_file()]
+    # 2026-09-09 host: an `<agent>.unsubscribed` marker is NOT a subscriber, but f.stem turned it back into
+    # one (host.unsubscribed -> "host"), inflating N and mis-counting delivery (measured 1/2 on a 1-subscriber topic).
+    subscribers = [f.stem for f in subs_dir.iterdir() if f.is_file() and not f.name.endswith(".unsubscribed")]
 
     # Write event file atomically
     fm_lines = [
@@ -406,12 +473,24 @@ def cmd_publish(args: argparse.Namespace) -> None:
         return
 
     # Deliver to each subscriber's inbox (create KIND: announcement)
+    #
+    # BUG FIXED 2026-09-09 (bun-desktop@mesh, msg 2026-09-09-075): this used to
+    # do `inbox = agents_dir / sub_name / "inbox"` directly and silently
+    # `continue` when that path was not a dir — which, in container topology
+    # under the OLD discover_paths(), was EVERY subscriber, every time. Now
+    # resolved through resolve_subscriber_inbox(), which tries the
+    # host-absolute path first (when agents_dir is usable) and falls back to
+    # the container cross-peer convention `/peer-inbox/<name>` — the same
+    # resolution mesh-send already used successfully from this same desk.
     delivered = 0
+    unreachable = []   # no lane to this subscriber from THIS topology (a desk sees only its /peer-inbox lanes) — host sweeper backstops
+    failed = []        # a resolvable inbox where the write itself raised — the only outcome a caller can act on
     for sub_name in subscribers:
         if sub_name == me_name:
             continue  # don't deliver to self
-        inbox = agents_dir / sub_name / "inbox"
-        if not inbox.is_dir():
+        inbox = resolve_subscriber_inbox(agents_dir, sub_name)
+        if inbox is None:
+            unreachable.append(sub_name)
             continue
 
         # Slot allocation
@@ -440,11 +519,26 @@ def cmd_publish(args: argparse.Namespace) -> None:
             _write_atomic(notify_path, notify_content)
             delivered += 1
         except OSError as e:
+            failed.append(sub_name)
             print(f"mesh-event: warning: could not notify {sub_name}: {e}", file=sys.stderr)
 
     print(f"{event_id}")
-    print(f"Published to topic '{args.topic}' — notified {delivered}/{len(subscribers)} subscribers",
-          file=sys.stderr)
+    # EXIT CONTRACT (host, 2026-09-09, bun-desktop 084): the printed fraction excludes the author and counts
+    # only subscribers REACHABLE from this topology; lanes with no path from here are listed as
+    # "unreachable" and are NOT a failure (the host sweeper delivers them within 5 min), so a desk
+    # publish exits 0 on a normal night. EXIT_PARTIAL_DELIVERY (6) is reserved for a resolvable inbox
+    # whose write raised — the one outcome a caller can act on. A number's meaning must not move under
+    # its callers (PATTERN-mesh-cli-exit-codes.md).
+    reachable = delivered + len(failed)
+    status = f"Published to topic '{args.topic}' — notified {delivered}/{reachable} reachable subscribers"
+    if unreachable:
+        status += f" (unreachable from here, host sweeper backstops: {', '.join(unreachable)})"
+    if failed:
+        status += f" (FAILED writes: {', '.join(failed)})"
+    print(status)
+    print(status, file=sys.stderr)
+    if failed:
+        sys.exit(EXIT_PARTIAL_DELIVERY)
 
 
 def cmd_subscribe(args: argparse.Namespace) -> None:
