@@ -11,7 +11,7 @@
 #   mesh-semaphore force-release <name>  release lock regardless of holder (admin only)
 #
 # Env:
-#   AGENT_URI              required (e.g. bun-desktop@mesh)
+#   AGENT_URI              required (e.g. alice-desktop@mesh)
 #   MESH_ROOT              optional
 #   MESH_ADMINS            space-separated list of admin URIs allowed to force-release
 #                          (in addition to host@mesh, which is always allowed)
@@ -38,7 +38,7 @@ MESH_DIR=$(discover_mesh)
 SEM_DIR="${MESH_DIR}/SEMAPHORES"
 mkdir -p "$SEM_DIR"
 
-[[ -z "${AGENT_URI:-}" ]] && die "AGENT_URI env var required (e.g. AGENT_URI=bun-desktop@mesh)"
+[[ -z "${AGENT_URI:-}" ]] && die "AGENT_URI env var required (e.g. AGENT_URI=alice-desktop@mesh)"
 AGENT_NAME="${AGENT_URI%@mesh}"
 
 CMD="${1:-}"

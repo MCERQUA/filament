@@ -41,19 +41,39 @@ from pathlib import Path
 from collections import Counter, defaultdict
 
 MESH_ROOT = Path(os.environ.get("MESH_ROOT", "/mnt/agent-mesh"))
-LOG = Path("/home/mike/MIKE-AI/logs/extract-agent-transcripts.log")
+LOG = Path(os.environ.get("LOG_DIR", str(Path.home() / ".local/state/filament/logs"))) \
+    / "extract-agent-transcripts.log"
 
-AGENTS = [
-    ("bun-desktop",        "docker", "webtop-ubuntu-os"),
-    ("josh-desktop",       "docker", "webtop-ubuntu-os-josh"),
-    ("danielle-desktop",   "docker", "webtop-ubuntu-os-danielle"),
-    ("src-desktop",        "docker", "webtop-ubuntu-os-src"),
-    ("host",               "local",  "/home/mike/.claude/projects"),
-    ("residential-laptop", "ssh",    "residential-laptop"),
+# Transcript sources: (agent, mode, target). mode is one of
+#   docker  target = container name (reads DOCKER_CC inside it)
+#   local   target = a Claude Code projects dir on this machine
+#   ssh     target = an ssh host alias (reads LAPTOP_CC on it)
+# Override with TRANSCRIPT_AGENTS="agent:mode:target,agent:mode:target,...".
+_DEFAULT_AGENTS = [
+    ("alice-desktop",  "docker", "webtop-alice"),
+    ("bob-desktop",    "docker", "webtop-bob"),
+    ("carol-desktop",  "docker", "webtop-carol"),
+    ("host",           "local",  str(Path.home() / ".claude/projects")),
+    ("remote-laptop",  "ssh",    "remote-laptop"),
 ]
 
-DOCKER_CC = "/config/.claude/projects"
-LAPTOP_CC = "/root/.claude/projects"
+
+def _agents_from_env():
+    raw = os.environ.get("TRANSCRIPT_AGENTS", "").strip()
+    if not raw:
+        return _DEFAULT_AGENTS
+    out = []
+    for item in raw.split(","):
+        parts = item.strip().split(":", 2)
+        if len(parts) == 3 and all(parts):
+            out.append(tuple(parts))
+    return out
+
+
+AGENTS = _agents_from_env()
+
+DOCKER_CC = os.environ.get("DOCKER_CC", "/config/.claude/projects")
+LAPTOP_CC = os.environ.get("LAPTOP_CC", "~/.claude/projects")
 
 # Pivot indicators in user text — moments where the user corrected, redirected,
 # or expressed dissatisfaction. These mark important learning beats.
@@ -618,4 +638,13 @@ def main(date_str: str | None = None) -> int:
 
 if __name__ == "__main__":
     arg_date = sys.argv[1] if len(sys.argv) > 1 else None
+    if arg_date in ("-h", "--help"):
+        print("usage: extract-agent-transcripts.py [YYYY-MM-DD]   (default: yesterday UTC)\n"
+              "env: MESH_ROOT, LOG_DIR, TRANSCRIPT_AGENTS=agent:mode:target,..., DOCKER_CC, LAPTOP_CC")
+        sys.exit(0)
+    if arg_date is not None:
+        try:
+            _dt.date.fromisoformat(arg_date)
+        except ValueError:
+            sys.exit(f"extract-agent-transcripts: bad date {arg_date!r} (want YYYY-MM-DD)")
     sys.exit(main(arg_date))

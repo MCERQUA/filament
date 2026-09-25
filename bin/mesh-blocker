@@ -2,7 +2,7 @@
 """mesh-blocker — raise, list, and resolve KIND:blocker entries on the mesh.
 
 Blockers are coordination signals: one agent declares it cannot proceed until
-another agent (or Mike) takes a specific action.  Each blocker is stored as a
+another agent (or the operator) takes a specific action.  Each blocker is stored as a
 local state file in /agent-desk/blockers/ AND sent as a KIND:blocker message
 to the blocked-on agent's inbox.
 
@@ -19,7 +19,7 @@ Usage:
         --blocks sprint4-implementation \\
         --sla 30 \\
         --fallback proceed \\
-        --resolution "git push origin main from /home/mike/filament" \\
+        --resolution "git push origin main from $FILAMENT_REPO" \\
         < body.txt
 
     mesh-blocker list                     # show all OPEN blockers (raised or received)

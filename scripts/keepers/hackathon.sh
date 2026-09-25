@@ -19,13 +19,18 @@ REDROP_QUIET_SEC=$((10 * 60))      # 30 min of repo silence ⇒ redrop
 REDROP_INTERVAL_SEC=$((10 * 60))   # don't re-drop more often than this
 ESCALATE_AFTER_REDROPS=4
 
-declare -A REPO=(
-  [bun-desktop]=ovui-lite-bun-desktop
-  [josh-desktop]=ovui-lite-josh-desktop
-  [danielle-desktop]=ovui-lite-danielle-desktop
-  [src-desktop]=ovui-lite-src-desktop
-  [residential-laptop]=ovui-lite-residential-laptop
-)
+# agent -> submission repo name. Override with HACKATHON_REPOS="agent=repo agent=repo ...".
+declare -A REPO=()
+for _pair in ${HACKATHON_REPOS:-alice-desktop=ovui-lite-alice-desktop bob-desktop=ovui-lite-bob-desktop carol-desktop=ovui-lite-carol-desktop dave-desktop=ovui-lite-dave-desktop remote-laptop=ovui-lite-remote-laptop}; do
+  REPO[${_pair%%=*}]=${_pair#*=}
+done
+# agent -> docker container that runs its claude-mesh tmux session (for the wake poke).
+# Override with AGENT_CONTAINERS="agent=container ...". Agents without an entry are not poked.
+declare -A AGENT_CTN=()
+for _pair in ${AGENT_CONTAINERS:-alice-desktop=webtop-alice bob-desktop=webtop-bob carol-desktop=webtop-carol dave-desktop=webtop-dave}; do
+  AGENT_CTN[${_pair%%=*}]=${_pair#*=}
+done
+unset _pair
 
 HACK_DIR="${MESH_ROOT}/mesh/BLACKBOARD/ovui-lite"
 
@@ -160,13 +165,7 @@ EOF
     # Filing a task into inbox is necessary but not sufficient — Claude Code's
     # Monitor sees the [mesh new] event but doesn't auto-start a new turn.
     # We need to literally TYPE into the agent's prompt to wake it up.
-    case "$agent" in
-        bun-desktop)        ctn=webtop-ubuntu-os ;;
-        josh-desktop)       ctn=webtop-ubuntu-os-josh ;;
-        danielle-desktop)   ctn=webtop-ubuntu-os-danielle ;;
-        src-desktop)        ctn=webtop-ubuntu-os-src ;;
-        *)                  ctn="" ;;
-    esac
+    ctn="${AGENT_CTN[$agent]:-}"
     if [[ -n "$ctn" ]] && docker inspect "$ctn" >/dev/null 2>&1; then
         # Send typed prompt + Enter to the claude-mesh tmux session
         docker exec "$ctn" bash -c "tmux -S /tmp/tmux-1000/default send-keys -t claude-mesh 'Mesh keeper poke: a new hackathon task is in your inbox — run mesh-recv, process it, commit + push, then update STATUS.md.' Enter" 2>/dev/null
@@ -208,7 +207,7 @@ New mandatory submission gate (announced mid-hackathon): every app must capture 
 
 Drop /mesh/BLACKBOARD/ovui-lite/submissions/${agent}/CONVERSATION-PROOF.md with: endpoint, auth method, user input, app→openclaw payload, openclaw→app response, latencies, repro steps.
 
-Endpoint to use (per-tenant openclaw on jambot-shared network):
+Endpoint to use (per-tenant openclaw on the shared docker network):
   ws://openclaw-\$(echo ${agent} | sed 's/-desktop//'):18789
 
 Without this file, your submission is incomplete. Reviewers will block.

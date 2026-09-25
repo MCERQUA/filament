@@ -14,13 +14,15 @@
 
 set -uo pipefail
 
-if [[ -f /home/mike/MIKE-AI/scripts/agent-mesh/filament-env.sh ]]; then
-    # shellcheck disable=SC1091
-    . /home/mike/MIKE-AI/scripts/agent-mesh/filament-env.sh
+# Optional site bindings (MESH_ROOT, LOG_DIR, ...). Nothing is sourced unless
+# FILAMENT_ENV names an existing file.
+if [[ -n "${FILAMENT_ENV:-}" && -f "${FILAMENT_ENV}" ]]; then
+    # shellcheck disable=SC1090
+    . "${FILAMENT_ENV}"
 fi
 MESH_ROOT="${MESH_ROOT:-/mnt/agent-mesh}"
 HACK_DIR="${MESH_ROOT}/mesh/BLACKBOARD/ovui-lite"
-LOG="${LOG_DIR:-/home/mike/MIKE-AI/logs}/hackathon-watcher.log"
+LOG="${LOG_DIR:-${HOME}/.local/state/filament/logs}/hackathon-watcher.log"
 mkdir -p "$(dirname "${LOG}")"
 
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -41,13 +43,14 @@ elif (( NOW_EPOCH < P2_DEADLINE )); then PHASE="2-build"
 elif (( NOW_EPOCH < P3_DEADLINE )); then PHASE="3-benchmark"
 elif (( NOW_EPOCH < P4_DEADLINE )); then PHASE="4-cross-review"
 elif (( NOW_EPOCH < P5_DEADLINE )); then PHASE="5-vote"
-else PHASE="6-mike-review"
+else PHASE="6-operator-review"
 fi
 
 log "watcher run — phase=${PHASE}"
 
 declare -A AGENT_PHASE AGENT_ANGLE AGENT_REPO AGENT_LAST_UPDATE
-AGENTS=(bun-desktop josh-desktop danielle-desktop src-desktop residential-laptop)
+# Participants: space-separated agent names (no @mesh). Override per event.
+read -r -a AGENTS <<< "${HACKATHON_AGENTS:-alice-desktop bob-desktop carol-desktop dave-desktop remote-laptop}"
 
 for agent in "${AGENTS[@]}"; do
     sub_dir="${HACK_DIR}/submissions/${agent}"
@@ -113,7 +116,7 @@ for agent in "${AGENTS[@]}"; do
             n_votes=$(ls "${MESH_ROOT}/mesh/BLACKBOARD/votes/"*"/${agent}.md" 2>/dev/null | wc -l)
             AGENT_PHASE[$agent]="votes-cast-${n_votes}/4"
             ;;
-        6-mike-review)
+        6-operator-review)
             AGENT_PHASE[$agent]="hackathon-complete"
             ;;
     esac
@@ -238,10 +241,11 @@ if (( ${#STALLED_AGENTS[@]} > 0 )); then
 fi
 
 # At Phase 6 entry — auto-run aggregator
-if [[ "$PHASE" == "6-mike-review" && ! -r "${HACK_DIR}/RESULTS.md" ]]; then
-    if [[ -x /home/mike/MIKE-AI/scripts/agent-mesh/hackathon-aggregate.sh ]]; then
+if [[ "$PHASE" == "6-operator-review" && ! -r "${HACK_DIR}/RESULTS.md" ]]; then
+    AGGREGATE="${HACKATHON_AGGREGATE:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/hackathon-aggregate.sh}"
+    if [[ -x "$AGGREGATE" ]]; then
         log "  Phase 6 entered — running hackathon-aggregate.sh"
-        bash /home/mike/MIKE-AI/scripts/agent-mesh/hackathon-aggregate.sh >> "${LOG}" 2>&1
+        bash "$AGGREGATE" >> "${LOG}" 2>&1
     fi
 fi
 

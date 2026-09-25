@@ -2,31 +2,43 @@
 # submesh-launch — called by the desktop icon
 # Creates the 4-pane tmux grid (if needed) and opens ONE Konsole showing it.
 
+# In-container home of the submesh (webtop convention: /config). Override for other layouts.
+SUBMESH_HOME="${SUBMESH_HOME:-/config}"
+
 export DISPLAY=:1
-export XDG_RUNTIME_DIR=/config/.XDG
-export PATH=/config/mesh-tools/bin:/config/.local/bin:/usr/local/bin:/usr/bin:/bin
+export XDG_RUNTIME_DIR=${SUBMESH_HOME}/.XDG
+export PATH=${SUBMESH_HOME}/mesh-tools/bin:${SUBMESH_HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin
 
 SESSION="submesh"
-CLAUDE=/config/.local/bin/claude
-WORKSPACE=/config/submesh/agents/manager/workspace
-TEMPLATES=/config/submesh-templates
-TMUX_CONF=/config/mesh-tools/tmux.conf
-SLOTS_FILE=/config/submesh/slots
+CLAUDE=${SUBMESH_HOME}/.local/bin/claude
+WORKSPACE=${SUBMESH_HOME}/submesh/agents/manager/workspace
+TEMPLATES=${SUBMESH_HOME}/submesh-templates
+TMUX_CONF=${SUBMESH_HOME}/mesh-tools/tmux.conf
+SLOTS_FILE=${SUBMESH_HOME}/submesh/slots
 
-# detect desk prefix from hostname
-HN=$(hostname 2>/dev/null || cat /etc/hostname 2>/dev/null)
-if echo "$HN" | grep -qi "josh"; then
-    PREFIX="josh-desk"
-elif echo "$HN" | grep -qi "ubuntu"; then
-    PREFIX="ubuntu-desk"
+# Desk prefix — single source of truth in desk-prefix.sh. This block used to match
+# hostname substrings generic-last, so every desktop whose hostname shared the common
+# base resolved to ONE desktop's namespace. Here that also set
+# MANAGER_URI="${PREFIX}-1@mesh", so the manager identity collided too.
+# Guarded: an older deployment without the helper still resolves correctly.
+if [ -r "${0%/*}/desk-prefix.sh" ]; then
+    . "${0%/*}/desk-prefix.sh"
 else
-    PREFIX="desk"
+    # minimal fallback — keep in step with desk-prefix.sh resolution order
+    case "${AGENT_URI:-}" in
+        *-desktop@*) PREFIX="${AGENT_URI%%-desktop@*}-desk" ;;
+        *)           PREFIX="desk" ;;
+    esac
+    [ -n "${SUBMESH_DESK_PREFIX:-}" ] && PREFIX="$SUBMESH_DESK_PREFIX"
 fi
 
 MANAGER_URI="${PREFIX}-1@mesh"
+# Who the manager reports to: the desktop agent that owns this submesh. Resolved BEFORE
+# AGENT_URI is re-exported below as the manager/worker identity.
+PARENT_URI="${SUBMESH_PARENT_URI:-${AGENT_URI:-host@mesh}}"
 MANAGER_INBOX="/agent-desk-1/inbox"
 
-mkdir -p "$WORKSPACE" /config/submesh/agents/manager/memory /config/submesh
+mkdir -p "$WORKSPACE" ${SUBMESH_HOME}/submesh/agents/manager/memory ${SUBMESH_HOME}/submesh
 touch "$SLOTS_FILE"
 
 # write Claude Code hooks for manager
@@ -34,6 +46,17 @@ mkdir -p "$WORKSPACE/.claude"
 cat > "$WORKSPACE/.claude/settings.json" << SETTINGS
 {
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${SUBMESH_HOME}/mesh-tools/bin/render-guard.py"
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": ".*",
@@ -63,16 +86,16 @@ SETTINGS
 grep -q "^1:" "$SLOTS_FILE" 2>/dev/null || echo "1:manager" >> "$SLOTS_FILE"
 
 # build manager CLAUDE.md if missing
-if [ ! -f /config/submesh/agents/manager/CLAUDE.md ]; then
+if [ ! -f ${SUBMESH_HOME}/submesh/agents/manager/CLAUDE.md ]; then
     ROLE_BODY=$(cat "$TEMPLATES/manager.md" 2>/dev/null || echo "Coordinate the sub-mesh team.")
-    cat > /config/submesh/agents/manager/CLAUDE.md << MGRMD
+    cat > ${SUBMESH_HOME}/submesh/agents/manager/CLAUDE.md << MGRMD
 # manager — Sub-Mesh Manager
 
 ## MESH IDENTITY (READ-ONLY)
 - AGENT_URI: ${MANAGER_URI}
 - Desk slot: 1
 - Inbox: ${MANAGER_INBOX}
-- Reports to: josh-desktop@mesh
+- Reports to: ${PARENT_URI}
 
 ## MANDATORY SESSION STARTUP — EXECUTE IMMEDIATELY, NO HUMAN NEEDED
 
@@ -110,13 +133,13 @@ ${ROLE_BODY}
 MGRMD
 fi
 
-if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+if ! tmux has-session -t="$SESSION" 2>/dev/null; then
     # create session with pane 0
     tmux -f "$TMUX_CONF" new-session -d -s "$SESSION" -n grid \
         -e "AGENT_URI=${MANAGER_URI}" \
         -e "MESH_INBOX=${MANAGER_INBOX}" \
         -e "DESK_SLOT=1" \
-        -e "PATH=/config/.local/bin:/usr/local/bin:/usr/bin:/bin" \
+        -e "PATH=${SUBMESH_HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin" \
         -x 220 -y 50
 
     # create the 4-pane layout (always, regardless of what goes in each)
@@ -125,7 +148,12 @@ if ! tmux has-session -t "$SESSION" 2>/dev/null; then
     tmux split-window -v -t "$SESSION:grid.1"
     tmux select-layout -t "$SESSION:grid" tiled
 
+    # Panes are TAGGED with the tmux user option @submesh_agent=<name>. stop-submesh and
+    # submesh-agents find an agent by that tag, never by grepping screen text: a screen grep
+    # for "a1" also matches "a12", a path, or a chat line, and a stop aimed at the wrong
+    # pane kills the wrong agent.
     # pane 0 — manager
+    tmux set-option -p -t "$SESSION:grid.0" @submesh_agent manager
     tmux send-keys -t "$SESSION:grid.0" \
         "export AGENT_URI=${MANAGER_URI}; export MESH_INBOX=${MANAGER_INBOX}; export DESK_SLOT=1; cd $WORKSPACE; $CLAUDE --dangerously-skip-permissions" Enter
 
@@ -136,17 +164,22 @@ if ! tmux has-session -t "$SESSION" 2>/dev/null; then
         MESH_INBOX="/agent-desk-${SLOT}/inbox"
         AGENT_NAME=$(grep "^${SLOT}:" "$SLOTS_FILE" 2>/dev/null | cut -d: -f2)
 
-        if [ -n "$AGENT_NAME" ] && [ -d "/config/submesh/agents/${AGENT_NAME}/workspace" ]; then
-            AGENT_DIR="/config/submesh/agents/${AGENT_NAME}"
+        if [ -n "$AGENT_NAME" ] && [ -d "${SUBMESH_HOME}/submesh/agents/${AGENT_NAME}/workspace" ]; then
+            AGENT_DIR="${SUBMESH_HOME}/submesh/agents/${AGENT_NAME}"
+            tmux set-option -p -t "$SESSION:grid.$PANE" @submesh_agent "$AGENT_NAME"
             tmux send-keys -t "$SESSION:grid.$PANE" \
                 "export AGENT_URI=${AGENT_URI}; export MESH_INBOX=${MESH_INBOX}; export DESK_SLOT=${SLOT}; cd $AGENT_DIR/workspace; $CLAUDE --dangerously-skip-permissions" Enter
         else
+            # The word "ready" is load-bearing: new-agent and stop-submesh find a free
+            # pane by grepping "Slot.*ready". Without it every new agent went to an
+            # overflow window and the grid panes were never reused.
             tmux send-keys -t "$SESSION:grid.$PANE" \
-                "printf '\n  Slot $((PANE+1)) — ${AGENT_URI}\n  Run: new-agent <name> [type]\n\n'" Enter
+                "printf '\n  Slot ${SLOT} ready — ${AGENT_URI}\n  Run: new-agent <name> [type]\n\n'" Enter
         fi
     done
 
     tmux select-pane -t "$SESSION:grid.0"
 fi
 
-exec konsole -e tmux -f "$TMUX_CONF" attach -t submesh
+SUBMESH_TERM="${SUBMESH_TERM:-konsole -e}"
+exec $SUBMESH_TERM tmux -f "$TMUX_CONF" attach -t submesh

@@ -12,5 +12,5 @@ mesh-send <MANAGER_URI> "Review: APPROVED / NEEDS CHANGES: [specifics]"
 
 ## Sending feedback directly to author
 ```bash
-mesh-send josh-desk-2@mesh "Review feedback: [specific issues]"
+mesh-send bob-desk-2@mesh "Review feedback: [specific issues]"
 ```

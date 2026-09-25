@@ -7,11 +7,17 @@
 #   bash submesh/install.sh <config-dir>
 #
 # Examples:
-#   bash submesh/install.sh /mnt/clients/ubuntu-os/config
-#   bash submesh/install.sh /mnt/clients/ubuntu-os-josh/config
+#   bash submesh/install.sh /srv/tenants/desk-a/config
+#   bash submesh/install.sh /srv/tenants/desk-b/config
+#
+# <config-dir> is the HOST path of the directory the container sees as SUBMESH_HOME
+# (default /config — the webtop convention). Set SUBMESH_HOME if your container mounts
+# it elsewhere; it is baked into the desktop entry and the .bashrc PATH line.
 #
 # What it installs:
 #   - All submesh commands + hook scripts → <config-dir>/mesh-tools/bin/
+#       incl. desk-prefix.sh (the ONE desk-identity resolver every tool sources) and
+#       render-guard.py (blocking PreToolUse hook: no video renders on this node)
 #   - 5 agent role templates → <config-dir>/submesh-templates/
 #   - Manager workspace scaffolding → <config-dir>/submesh/agents/manager/
 #   - Custom 4-terminal grid SVG icon → <config-dir>/.local/share/icons/
@@ -25,7 +31,7 @@ set -euo pipefail
 CONFIG_DIR="${1:-}"
 if [ -z "$CONFIG_DIR" ]; then
     echo "Usage: $0 <config-dir>"
-    echo "  e.g. $0 /mnt/clients/ubuntu-os/config"
+    echo "  e.g. $0 /srv/tenants/desk-a/config"
     exit 1
 fi
 
@@ -41,6 +47,8 @@ ICON_DIR="$CONFIG_DIR/.local/share/icons"
 APP_DIR="$CONFIG_DIR/.local/share/applications"
 DESKTOP_DIR="$CONFIG_DIR/Desktop"
 SUBMESH_DIR="$CONFIG_DIR/submesh"
+# In-container path of <config-dir> (what the agents themselves see).
+SUBMESH_HOME="${SUBMESH_HOME:-/config}"
 
 echo "Installing Filament sub-mesh to: $CONFIG_DIR"
 
@@ -52,6 +60,7 @@ mkdir -p "$SUBMESH_DIR/agents/manager/memory"
 # ── Commands + hooks ───────────────────────────────────────────────────────────
 echo "  → Installing commands..."
 for f in "$SCRIPT_DIR/bin/"*; do
+    [ -f "$f" ] || continue   # skip __pycache__ and other dirs (cp of a dir aborts under set -e)
     cp "$f" "$BIN_DIR/"
     chmod +x "$BIN_DIR/$(basename "$f")" 2>/dev/null || true
 done
@@ -76,8 +85,8 @@ Type=Application
 Name=Sub-Mesh
 GenericName=Agent Sub-Mesh
 Comment=Open the collaborative agent terminal grid
-Exec=/config/mesh-tools/bin/submesh-launch
-Icon=/config/.local/share/icons/submesh.svg
+Exec=${SUBMESH_HOME}/mesh-tools/bin/submesh-launch
+Icon=${SUBMESH_HOME}/.local/share/icons/submesh.svg
 Categories=Development;
 Keywords=mesh;agents;claude;submesh;filament;
 StartupNotify=false
@@ -89,7 +98,8 @@ cp "$DESKTOP_DIR/submesh.desktop" "$APP_DIR/submesh.desktop"
 BASHRC="$CONFIG_DIR/.bashrc"
 if [ -f "$BASHRC" ] && ! grep -q "mesh-tools/bin" "$BASHRC"; then
     echo "  → Adding mesh-tools/bin to PATH in .bashrc..."
-    echo 'case ":$PATH:" in *":/config/mesh-tools/bin:"*) ;; *) export PATH="/config/mesh-tools/bin:$PATH" ;; esac' >> "$BASHRC"
+    printf 'case ":$PATH:" in *":%s/mesh-tools/bin:"*) ;; *) export PATH="%s/mesh-tools/bin:$PATH" ;; esac\n' \
+        "$SUBMESH_HOME" "$SUBMESH_HOME" >> "$BASHRC"
 fi
 
 # ── Slots state file ───────────────────────────────────────────────────────────
@@ -106,6 +116,10 @@ echo "  join-submesh      open a specific agent's terminal"
 echo "  stop-submesh      stop one agent or the whole session"
 echo "  mesh-whisper      inject a note into a running agent's context"
 echo "  submesh-help      full command reference"
+echo ""
+echo "Hooks registered in every agent workspace:"
+echo "  render-guard.py   PreToolUse, BLOCKS video renders (set RENDER_GUARD_HANDOFF_URI)"
+echo "  desk-prefix.sh    sourced by every tool — set SUBMESH_DESK_PREFIX per desktop"
 echo ""
 echo "To refresh the KDE desktop icon in a running container:"
 echo "  docker exec -u abc <container-name> bash -c \\"

@@ -3,11 +3,14 @@
 # Grid agents (panes 1-3) live inside submesh:grid — opens the full grid view
 # Overflow agents get their own window inside submesh — selects that window
 
+# In-container home of the submesh (webtop convention: /config). Override for other layouts.
+SUBMESH_HOME="${SUBMESH_HOME:-/config}"
+
 NAME="$1"
 SESSION="submesh"
 
 export DISPLAY=:1
-export XDG_RUNTIME_DIR=/config/.XDG
+export XDG_RUNTIME_DIR=${SUBMESH_HOME}/.XDG
 
 if [ -z "$NAME" ]; then
     echo "Usage: join-submesh <name>"
@@ -16,7 +19,7 @@ if [ -z "$NAME" ]; then
     exit 1
 fi
 
-if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+if ! tmux has-session -t="$SESSION" 2>/dev/null; then
     echo "Sub-mesh is not running. Use start-submesh first."
     exit 1
 fi
@@ -24,9 +27,9 @@ fi
 # Check if this agent has its own tmux window (overflow agents)
 if tmux list-windows -t "$SESSION" -F "#{window_name}" 2>/dev/null | grep -qx "$NAME"; then
     tmux select-window -t "$SESSION:$NAME" 2>/dev/null
-    konsole -e tmux attach -t "$SESSION:$NAME" &
+    ${SUBMESH_TERM:-konsole -e} tmux attach -t "$SESSION:$NAME" &
 else
     # Grid-pane agent or manager — open full grid view
     tmux select-window -t "$SESSION:grid" 2>/dev/null
-    konsole -e tmux attach -t "$SESSION" &
+    ${SUBMESH_TERM:-konsole -e} tmux attach -t "$SESSION" &
 fi

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# hackathon-aggregate.sh — Phase 6: build the comparison matrix for Mike.
+# hackathon-aggregate.sh — Phase 6: build the comparison matrix for the operator.
 #
 # Reads every submission's ANGLE.md / BENCH.md / votes / reviews and
 # produces a single RESULTS.md + a canvas-page comparison.
@@ -9,20 +9,23 @@
 
 set -uo pipefail
 
-if [[ -f /home/mike/MIKE-AI/scripts/agent-mesh/filament-env.sh ]]; then
-    # shellcheck disable=SC1091
-    . /home/mike/MIKE-AI/scripts/agent-mesh/filament-env.sh
+# Optional site bindings (MESH_ROOT, LOG_DIR, ...). Nothing is sourced unless
+# FILAMENT_ENV names an existing file.
+if [[ -n "${FILAMENT_ENV:-}" && -f "${FILAMENT_ENV}" ]]; then
+    # shellcheck disable=SC1090
+    . "${FILAMENT_ENV}"
 fi
 MESH_ROOT="${MESH_ROOT:-/mnt/agent-mesh}"
 HACK_DIR="${MESH_ROOT}/mesh/BLACKBOARD/ovui-lite"
 RESULTS="${HACK_DIR}/RESULTS.md"
-LOG="${LOG_DIR:-/home/mike/MIKE-AI/logs}/hackathon-aggregate.log"
+LOG="${LOG_DIR:-${HOME}/.local/state/filament/logs}/hackathon-aggregate.log"
 mkdir -p "$(dirname "${LOG}")"
 
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { echo "[$(ts)] $*" >> "${LOG}"; }
 
-AGENTS=(bun-desktop josh-desktop danielle-desktop src-desktop residential-laptop)
+# Participants: space-separated agent names (no @mesh). Override per event.
+read -r -a AGENTS <<< "${HACKATHON_AGENTS:-alice-desktop bob-desktop carol-desktop dave-desktop remote-laptop}"
 
 log "aggregate run start"
 
@@ -130,15 +133,15 @@ log "aggregate run start"
 
     echo "---"
     echo
-    echo "## Mike's call"
+    echo "## Operator's call"
     echo
-    echo "Mike picks one or more submissions for production. Others remain archived."
-    echo "Production winner: _(Mike fills in)_"
+    echo "The operator picks one or more submissions for production. Others remain archived."
+    echo "Production winner: _(operator fills in)_"
 } > "${RESULTS}"
 
 log "wrote ${RESULTS}"
 
-# Also drop a notification to host inbox so Mike sees a clear ping
+# Also drop a notification to host inbox so the operator sees a clear ping
 host_inbox="${MESH_ROOT}/agents/host/inbox"
 date_pfx=$(date -u +%Y-%m-%d)
 for n in $(seq -w 001 999); do
@@ -149,13 +152,13 @@ done
     echo "---"
     echo "KIND: announcement"
     echo "AUTHOR: host@mesh"
-    echo "READERS: [host@mesh, mike-direct]"
+    echo "READERS: [host@mesh, operator-direct]"
     echo "REPLIES-TO: null"
     echo "SIZE: medium"
-    echo "END-OF-TURN: mike-direct — pick winner(s)"
+    echo "END-OF-TURN: operator-direct — pick winner(s)"
     echo "---"
     echo
-    echo "OVUI-Lite Hackathon RESULTS aggregated — Mike review pending."
+    echo "OVUI-Lite Hackathon RESULTS aggregated — operator review pending."
     echo
     echo "  /mesh/BLACKBOARD/ovui-lite/RESULTS.md"
     echo

@@ -3,7 +3,7 @@
 #
 # The watcher reports state. The keeper makes things happen.
 #
-# For every workstream registered under scripts/agent-mesh/keepers/<name>.sh,
+# For every workstream registered under $KEEPER_DIR/<name>.sh (default: scripts/keepers/),
 # the keeper runs the workstream's check_and_redrop() function. If progress
 # is stale, the workstream's policy decides whether to re-drop a task,
 # escalate to host, or kick a synthesis script.
@@ -23,14 +23,16 @@
 
 set -uo pipefail
 
-if [[ -f /home/mike/MIKE-AI/scripts/agent-mesh/filament-env.sh ]]; then
-    # shellcheck disable=SC1091
-    . /home/mike/MIKE-AI/scripts/agent-mesh/filament-env.sh
+# Optional site bindings (MESH_ROOT, LOG_DIR, MESH_SEND_BIN, ...). Point
+# FILAMENT_ENV at a file that exports them; nothing is sourced when unset.
+if [[ -n "${FILAMENT_ENV:-}" && -f "${FILAMENT_ENV}" ]]; then
+    # shellcheck disable=SC1090
+    . "${FILAMENT_ENV}"
 fi
 MESH_ROOT="${MESH_ROOT:-/mnt/agent-mesh}"
-KEEPER_DIR="/home/mike/MIKE-AI/scripts/agent-mesh/keepers"
+KEEPER_DIR="${KEEPER_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/keepers}"
 STATE_DIR="${MESH_ROOT}/mesh/keepers/state"
-LOG="${LOG_DIR:-/home/mike/MIKE-AI/logs}/mesh-keeper.log"
+LOG="${LOG_DIR:-${HOME}/.local/state/filament/logs}/mesh-keeper.log"
 mkdir -p "${STATE_DIR}" "$(dirname "${LOG}")"
 
 ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }

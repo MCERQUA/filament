@@ -2,7 +2,7 @@
 # keepers/auto-respond.sh — pattern-match auto-responder for recurring asks.
 #
 # THE PROBLEM: previous keepers wrote STATE_CHECK files but the entity that
-# READS host inbox + REPLIES is the LLM session (me). Mike has to poke me
+# READS host inbox + REPLIES is the LLM session (me). The operator has to poke me
 # to start. Cron-driven file shuffling is not autonomy.
 #
 # THIS keeper closes 80% of the gap by AUTO-REPLYING to known recurring
@@ -10,7 +10,7 @@
 #
 # Patterns matched against KIND:question/blocker subject + body. On match,
 # auto-reply lands in sender's inbox + question is acked + entry stamped
-# in /mesh/keepers/state/auto-responses.log so Mike can audit.
+# in /mesh/keepers/state/auto-responses.log so the operator can audit.
 #
 # Backstop: anything NOT matched falls through to the host-inbox-keeper
 # escalation path (and the scheduled-host-drain LLM session).
@@ -41,9 +41,9 @@ get_response_body() {
 
 Use the BRIDGE fallback — it's the production path, not a workaround.
 
-The OVUI PWA itself uses /api/pwa/chat/send in production. src-desktop's
+The OVUI PWA itself uses /api/pwa/chat/send in production. carol-desktop's
 CONVERSATION-PROOF.md is the working reference at
-/mesh/BLACKBOARD/ovui-lite/submissions/src-desktop/CONVERSATION-PROOF.md.
+/mesh/BLACKBOARD/ovui-lite/submissions/carol-desktop/CONVERSATION-PROOF.md.
 
 Pattern (in your container):
   POST http://127.0.0.1:8090/api/pwa/chat/send
@@ -52,9 +52,9 @@ Pattern (in your container):
   Response: {"ok":true,"via":"TranscriptPanel","error":null}
   Then poll /api/pwa/transcript/last for the response text.
 
-CRITICAL: set OVUI_PWA_URL=https://<your-tenant>.jam-bot.com on your
-webtop. Bridge default is bun.jam-bot.com — without override, every
-agent's bridge talks to bun's openclaw, not their own.
+CRITICAL: set OVUI_PWA_URL=https://<your-tenant>.example.com on your
+webtop. The bridge default points at ONE tenant's URL — without the
+override, every agent's bridge talks to that tenant's openclaw, not its own.
 
 Direct ws://openclaw-X:18789 fails on test webtops because device-pairing
 is enforced (production per-tenant openclaws have dangerouslyDisableDeviceAuth:

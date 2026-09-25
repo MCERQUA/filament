@@ -6,7 +6,7 @@ capability data. Agents run `mesh-capabilities-publish` to refresh.
 ## Frontmatter schema
 
 ---
-agent: <agent-uri>              # e.g. danielle-desktop@mesh
+agent: <agent-uri>              # e.g. dave-desktop@mesh
 last_updated: <ISO-8601-UTC>
 languages:                      # interpreters on PATH + versions
   - python3.13==Python 3.13.9

@@ -13,9 +13,12 @@ Stdlib-only.
 Env:
     AGENT_URI    required
     MESH_ROOT    optional
+    MESH_INBOX   optional — this agent's inbox dir, wins over every guess
+    MESH_LOG     optional — audit log path
+    MESH_ACK_SEQ_WINDOW  optional — seconds; enables the same-seq loop guard (default 0 = off)
 
 Usage:
-    mesh-ack <filename>                         # mark the named file read
+    mesh-ack <filename> [<filename> ...]        # mark the named file(s) read (FULL names)
     mesh-ack --all                              # ack every unread file
     mesh-ack --vote yes|no|abstain|block \\
              [--rationale "text"] <filename>   # ack + record RFC vote
@@ -25,6 +28,7 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -50,20 +54,58 @@ def agent_name() -> str:
     return uri[: -len("@mesh")]
 
 
-def discover_my_inbox() -> Path:
+def resolve_my_desk_dir() -> Path:
+    """Return this agent's own desk-root directory, robust to a container that
+    bind-mounts MULTIPLE agents' desks at once.
+
+    Resolution order:
+      1. MESH_ROOT env override (explicit host-mesh layout).
+      2. /agent-desk-<N> when AGENT_URI carries a "-desk-<N>" suffix — checked
+         BEFORE the bare /agent-desk mount, trusted only if that exact dir exists.
+      3. /agent-desk — ONLY when AGENT_URI has NO "-desk-<N>" suffix.
+      4. Host path /mnt/agent-mesh/agents/<name>.
+
+    Bug this fixes: a multi-desk container mounts the parent agent's desk at
+    /agent-desk and bob-desk-1's OWN desk at /agent-desk-1. Checking /agent-desk
+    first made every desk-N identity silently ack the PARENT's mail.
+    """
     override = os.environ.get("MESH_ROOT")
     if override:
-        return Path(override) / "agents" / agent_name() / "inbox"
-    if Path("/agent-desk").is_dir():
-        return Path("/agent-desk/inbox")
+        return Path(override) / "agents" / agent_name()
+
+    name = agent_name()
+    m = re.match(r"^(.+)-desk-(\d+)$", name)
+    if m:
+        desk_n_dir = Path(f"/agent-desk-{m.group(2)}")
+        if desk_n_dir.is_dir():
+            return desk_n_dir
+        # A "-desk-N" identity with no matching numbered mount: do NOT fall back to
+        # /agent-desk — that is another agent's desk.
+    elif Path("/agent-desk").is_dir():
+        return Path("/agent-desk")
+
     if Path("/mnt/agent-mesh").is_dir():
-        return Path("/mnt/agent-mesh/agents") / agent_name() / "inbox"
-    die("cannot discover mesh root — set MESH_ROOT")
+        return Path("/mnt/agent-mesh/agents") / name
+    die("cannot discover mesh root — set MESH_ROOT (or MESH_INBOX)")
+
+
+def discover_my_inbox() -> Path:
+    # MESH_INBOX, when set, names THIS desk's own inbox directly and wins over
+    # every path-guessing fallback.
+    inbox_override = os.environ.get("MESH_INBOX")
+    if inbox_override:
+        return Path(inbox_override)
+    return resolve_my_desk_dir() / "inbox"
 
 
 def log_drop(message: str) -> None:
+    # MESH_LOG overrides. /var/log/jambot-mesh-inotify.log is a LEGACY name, preferred only
+    # when it already exists, so existing installs keep writing where their watchdog reads.
+    _legacy = "/var/log/jambot-mesh-inotify.log"
+    _cands = ([os.environ["MESH_LOG"]] if os.environ.get("MESH_LOG") else
+              ([_legacy] if os.path.exists(_legacy) else []) + ["/var/log/filament-mesh.log"])
     for candidate in (
-        "/var/log/jambot-mesh-inotify.log",
+        *_cands,
         "/config/workspace/mesh-events.log",
     ):
         try:
@@ -72,6 +114,13 @@ def log_drop(message: str) -> None:
             return
         except OSError:
             continue
+    # Fail LOUD when EVERY candidate fails. A silent-everywhere logger is
+    # indistinguishable from a quiet night — one desk's audit file was root:root and
+    # swallowed 13,275 acks while every ack still printed success. The ack itself still
+    # succeeds (the file move is what matters); we only surface the audit gap.
+    print("mesh-ack: WARNING audit log_drop failed on all candidates "
+          "(set MESH_LOG, or check perms) — ack recorded, audit line lost",
+          file=sys.stderr)
 
 
 def discover_mesh_root() -> Path | None:
@@ -108,12 +157,71 @@ def record_vote(filename: str, vote: str, rationale: str) -> None:
 
 
 def ack_file(inbox: Path, filename: str, vote: str = "", rationale: str = "") -> bool:
+    # Reduce to a bare basename FIRST. If a caller passes an absolute path
+    # (`mesh-ack /mnt/agent-mesh/agents/host/inbox/foo.md`), pathlib's `base / abs`
+    # DISCARDS the base and returns `abs` — so `read_dir / filename` pointed back at the
+    # ORIGINAL file, `dest.exists()` was true, and the file got renamed in-place to
+    # `foo.md.dup-<ts>` in the inbox instead of moving to .read/. That was the dup-file
+    # mechanism reproduced across three desks. Normalizing to .name fixes it.
+    filename = Path(filename).name
     src = inbox / filename
     if not src.is_file():
         print(f"mesh-ack: file not found: {filename}", file=sys.stderr)
         return False
     read_dir = inbox / ".read"
     read_dir.mkdir(exist_ok=True, mode=0o755)
+    # THE LOOP GUARD (opt-in). `for f in <date>-266-*.md; do mesh-ack "$f"; done` is one name
+    # per call, so the argv guard in main() never sees the collision — and such a loop acked
+    # two unread messages from two authors in one second. What distinguishes a blind loop from
+    # a reader acking two same-seq files one at a time is SPEED: nobody reads two messages in
+    # under ten seconds. The last ack per lane is kept; a second ack whose date-seq matches the
+    # previous one inside the window is refused.
+    # DEFAULT OFF: `-001-` is where almost every author's first daily message lands (99 files
+    # from 20 authors shared one `-001-` prefix in a busy host inbox), so a default-on window
+    # tripped on ordinary work and was overridden daily — a guard overridden daily is a guard
+    # nobody reads. Enable per lane with MESH_ACK_SEQ_WINDOW=<seconds>.
+    try:
+        import time as _time, json as _json
+        _m = re.match(r"^(\d{4}-\d{2}-\d{2}-\d{3})-", filename)
+        _win = float(os.environ.get("MESH_ACK_SEQ_WINDOW", "0"))
+        # State lives in .read/ (every tool treats it as "not unread"), NOT in the inbox —
+        # a state file in the mail directory IS mail to mesh-recv / mesh-watch-arm.
+        _state = read_dir / ".last-ack.json"
+        if _m and _win > 0 and os.environ.get("MESH_ACK_ALLOW_SEQ") != "1":
+            _prev = {}
+            if _state.is_file():
+                try:
+                    _prev = _json.loads(_state.read_text())
+                except Exception:
+                    _prev = {}
+            _seq, _now = _m.group(1), _time.time()
+            # The filename slug CANNOT name the author (a non-greedy capture stops at the first
+            # hyphen, so bob-desk-3 and bob-desk-9 both read as "bob"). The AUTHOR: header is
+            # the only honest source; compare headers, and say "author unknown" when missing.
+            def _author_of(_p):
+                try:
+                    with open(_p, "r", encoding="utf-8", errors="replace") as _fh:
+                        for _i, _ln in enumerate(_fh):
+                            if _i > 30:
+                                break
+                            if _ln.startswith("AUTHOR:"):
+                                return _ln.split(":", 1)[1].strip()
+                except OSError:
+                    pass
+                return ""
+            _cur_author = _author_of(src)
+            _prev_author = str(_prev.get("author") or "")
+            _author_word = ("author unknown" if not (_cur_author and _prev_author)
+                            else ("same author" if _cur_author == _prev_author else "different author"))
+            if _prev.get("seq") == _seq and _prev.get("file") != filename and (_now - float(_prev.get("ts", 0))) < _win:
+                print(f"mesh-ack: REFUSED — {filename} shares sequence {_seq} with {_prev.get('file')} acked "
+                      f"{_now - float(_prev.get('ts', 0)):.1f}s ago ({_author_word}). Two messages in under "
+                      f"{_win:.0f}s is a loop over a colliding prefix, not two reads. Read it, then ack it again — "
+                      f"or, having read it, pass --allow-seq-collision (same as MESH_ACK_ALLOW_SEQ=1).", file=sys.stderr)
+                return False
+            _state.write_text(_json.dumps({"seq": _seq, "file": filename, "ts": _now, "author": _cur_author}))
+    except Exception:
+        pass  # the guard must never break an ack it cannot evaluate
     dest = read_dir / filename
     # if an older ack file with the same name exists, keep both
     if dest.exists():
@@ -144,7 +252,12 @@ def _cc_sweep(me: str, acked_names) -> int:
     Renames to <name>.acked (the marker is_unread() already honours). Never deletes.
     """
     import os
-    cc = Path(os.environ.get("MESH_ROOT", "/mnt/agent-mesh")) / "mesh" / "cc" / me
+    if os.environ.get("MESH_ROOT"):
+        cc = Path(os.environ["MESH_ROOT"]) / "mesh" / "cc" / me
+    elif Path("/mesh").is_dir():            # container topology
+        cc = Path("/mesh") / "cc" / me
+    else:
+        cc = Path("/mnt/agent-mesh") / "mesh" / "cc" / me
     if not cc.is_dir():
         return 0
     n = 0
@@ -160,13 +273,16 @@ def _cc_sweep(me: str, acked_names) -> int:
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("filename", nargs="?", help="message filename to ack (relative, just base name)")
+    p.add_argument("filename", nargs="*", help="message filename(s) to ack (FULL base names)")
     p.add_argument("--all", action="store_true", help="ack every currently-unread file in inbox")
     p.add_argument(
         "--vote", choices=VALID_VOTES,
         help="record a vote on this RFC alongside the ack (yes|no|abstain|block)",
     )
     p.add_argument("--rationale", default="", help="one-line rationale for the vote")
+    p.add_argument("--allow-seq-collision", action="store_true",
+                   help="override BOTH sequence-collision guards (the argv check on a glob like <date>-266-*.md, "
+                        "and the opt-in same-seq loop window) for files you have actually read; = MESH_ACK_ALLOW_SEQ=1")
     args = p.parse_args()
 
     if args.rationale and not args.vote:
@@ -181,7 +297,9 @@ def main() -> None:
         any_done = False
         acked_names = set()
         for entry in list(inbox.iterdir()):
-            if entry.is_file() and entry.suffix == ".md":
+            # no .md filter: a peer may write a non-.md artifact (report.html, a
+            # worker .flag) — a silent suffix skip made it unobservable entirely
+            if entry.is_file():
                 if ack_file(inbox, entry.name):
                     any_done = True
                     acked_names.add(entry.name)
@@ -200,10 +318,46 @@ def main() -> None:
 
     if not args.filename:
         die("provide a filename, or pass --all")
+    names = list(args.filename)
+    if args.vote and len(names) != 1:
+        die("--vote records a vote on ONE rfc — pass exactly one filename")
 
-    if not ack_file(inbox, args.filename, vote=args.vote or "", rationale=args.rationale):
-        sys.exit(2)
-    _cc_sweep(me, {args.filename})
+    # SEQUENCE NUMBERS ARE NOT UNIQUE IN AN INBOX: the cc-relay lane carries the SENDER's
+    # slot name, so two authors can land under the same YYYY-MM-DD-NNN prefix, and
+    # `mesh-ack <date>-266-*.md` expands to two files from two authors and acks both — a
+    # desk measured two messages acked at the same second that it had never read. A prefix
+    # is not a name. Refuse a multi-file call whose names collapse to one date-seq unless the
+    # caller says so explicitly; an explicit list of DISTINCT seqs still works.
+    if args.allow_seq_collision:
+        # ONE override for BOTH guards: the flag also sets the env the loop guard honours.
+        os.environ["MESH_ACK_ALLOW_SEQ"] = "1"
+    if len(names) > 1 and not args.allow_seq_collision:
+        by_seq: dict = {}
+        for n in names:
+            m = re.match(r"^(\d{4}-\d{2}-\d{2}-\d{3})-", os.path.basename(n))
+            if m:
+                by_seq.setdefault(m.group(1), []).append(os.path.basename(n))
+        clashes = {k: v for k, v in by_seq.items() if len(v) > 1}
+        if clashes:
+            for k, v in clashes.items():
+                print(f"mesh-ack: REFUSED — {len(v)} files share sequence {k}:", file=sys.stderr)
+                for x in v:
+                    print(f"    {x}", file=sys.stderr)
+            print("mesh-ack: a date-seq prefix is not a unique name on this mesh. Read each file, then ack it by "
+                  "its FULL name — or pass --allow-seq-collision if you really have read all of them.",
+                  file=sys.stderr)
+            sys.exit(3)
+
+    rc = 0
+    done = set()
+    for n in names:
+        if ack_file(inbox, n, vote=args.vote or "", rationale=args.rationale):
+            done.add(Path(n).name)
+        else:
+            rc = 2
+    if done:
+        _cc_sweep(me, done)
+    sys.exit(rc)
 
 
 if __name__ == "__main__":

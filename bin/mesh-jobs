@@ -54,7 +54,7 @@ def die(msg: str, code: int = 3) -> None:
 def agent_name() -> str:
     uri = os.environ.get("AGENT_URI", "")
     if not uri.endswith("@mesh"):
-        die("AGENT_URI env var required (e.g. AGENT_URI=bun-desktop@mesh)")
+        die("AGENT_URI env var required (e.g. AGENT_URI=alice-desktop@mesh)")
     return uri[:-len("@mesh")]
 
 

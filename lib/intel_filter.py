@@ -36,15 +36,15 @@ BUILTIN_FILTER_PATTERNS: list[tuple[str, str]] = [
     (r"\bhf_[A-Za-z0-9]{20,}\b",            "HuggingFace token (hf_...)"),
     (r"\bAIza[A-Za-z0-9_-]{30,}\b",         "Google API key (AIza...)"),
     # Google OAuth REFRESH token (1//...). Lookbehind excludes base64-only chars
-    # [A-Za-z0-9+/] before — kills embedded-base64 FPs (bun's 1.7MB img blob) — but NOT
+    # [A-Za-z0-9+/] before — kills embedded-base64 FPs (a desk's 1.7MB img blob) — but NOT
     # '=', because refresh_token=1//... is the #1 real context and must still block.
     # {50,} floor: real tokens are 100+ chars; short 1// (URL /v1//, paths) passes.
     (r"(?<![A-Za-z0-9+/])1//[A-Za-z0-9_-]{50,}", "Google OAuth refresh token (1//...)"),
-    # sk- SHAPED, not broad (host decision 2026-07-28, src/bun cost data): a real key
+    # sk- SHAPED, not broad (host decision 2026-07-28, two desks' cost data): a real key
     # always ends in an unbroken 20+ alnum run; prose/branch slugs are hyphen-separated
     # short words and pass. Catches sk-proj-* / sk-ant-* (the old pattern MISSED both —
     # the hyphen after proj/ant broke the run, so real modern keys sailed through while
-    # src's broad per-desk rule was blocking branch names). Broad-class rejected: a
+    # a desk's broad per-desk rule was blocking branch names). Broad-class rejected: a
     # filter that cries wolf gets --force-leak'd into decay.
     (r"\bsk-(?:[A-Za-z0-9]+-)*[A-Za-z0-9_]{20,}\b", "API key (sk-...)"),
     (r"\bsk_(?:live|test)_[A-Za-z0-9]{16,}\b",      "Stripe secret key (sk_live_/sk_test_)"),
@@ -52,14 +52,14 @@ BUILTIN_FILTER_PATTERNS: list[tuple[str, str]] = [
     (r"eyJ[A-Za-z0-9+/=]{30,}",             "JWT token (eyJ...)"),
     (r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b",      "AWS access key (AKIA/ASIA...)"),
     # {30,} floor, NOT {36} exact: trailing \b makes an exact-length pattern silently
-    # PASS any longer token (bun/src proved it live). ghr_ included — refresh tokens
+    # PASS any longer token (two desks proved it live). ghr_ included — refresh tokens
     # have the longest leak tail: they mint new access tokens until revoked.
     (r"\bgh[opsur]_[A-Za-z0-9]{30,}\b",      "GitHub token (ghp/gho/ghs/ghu/ghr_...)"),
     (r"\bgithub_pat_[A-Za-z0-9_]{59,}\b",   "GitHub fine-grained token"),
     (r"\baia_sk_[A-Za-z0-9]{20,}\b",        "AIA secret key (aia_sk_...)"),
     # Z.AI / GLM key (SEC-048, 2026-08-25): <32 hex>.<16 alnum>, 49 chars. Added after a
     # LIVE ZAI_API_KEY was pasted plaintext into a mesh message and this filter PASSED it
-    # (bun-desktop, third missed shape). No zai rule existed in ANY copy of this lib —
+    # (alice-desktop, third missed shape). No zai rule existed in ANY copy of this lib —
     # the shape was simply never covered, so the miss was structural, not a tuning error.
     # Anchored on the literal dot + exact segment lengths: a bare 32-hex md5 does not match,
     # and a filename like <md5>.tar.gz does not reach 16 alnum in one unbroken run.
@@ -135,9 +135,9 @@ def load_private_context(agent_dir) -> list[tuple[str, str]]:
 # A plain (regex, desc) tuple cannot express "match, THEN exempt when the capture
 # is obviously a placeholder" — these two need a predicate, so they live here.
 #
-# Landed 2026-08-14 from bun-desktop@mesh's canonical block VERBATIM, with
-# security-officer@mesh's ship ruling. Measured before landing: 0 false positives
-# across 6,809 (host) and 7,192 (bun) INDEPENDENT corpora; positive controls block;
+# Landed 2026-08-14 from alice-desktop@mesh's canonical block VERBATIM, with
+# sec-reviewer@mesh's ship ruling. Measured before landing: 0 false positives
+# across 6,809 (host) and 7,192 (alice) INDEPENDENT corpora; positive controls block;
 # 9/9 URLCRED. The 16,211 figure that circulated earlier was a SUM of overlapping
 # sets — the real union is 6,809.
 #
@@ -276,7 +276,7 @@ def _load_intel_filter():
     for p in ("/mnt/system/base/skills/agent-mesh/lib",
               "/mnt/shared-skills/agent-mesh/lib",
               "/skills/agent-mesh/lib",
-              "/home/mike/filament/lib",
+              "/opt/filament/lib",
               str(Path.home() / ".local/lib/agent-mesh")):
         cands.append(Path(p) / "intel_filter.py")
     for c in cands:
@@ -333,7 +333,7 @@ if __name__ == "__main__":
             "see https://example.com/v1//path": False,
             # ── ASSIGN + URLCRED coverage (SEC-038, 2026-08-15) ──────────────
             # The ASSIGN/URLCRED rules were LIVE but the self-test never exercised
-            # them. bun-desktop's canonical fixture set (BLACKBOARD/sec-038/
+            # them. alice-desktop's canonical fixture set (BLACKBOARD/sec-038/
             # intel-filter-selftest-negative-controls.md): "positives-green with
             # negatives-unrun is not a pass; it is an unmeasured rule." The
             # negatives are the only fixtures that separate a correct ASSIGN from
@@ -351,7 +351,7 @@ if __name__ == "__main__":
             "BRIDGE_TOKEN = os.environ.get('BRIDGE_TOKEN')": False,  # value is a reference (os.)
             "API_KEY=<your_api_key_placeholder_here>": False,    # placeholder (< + 'placeholder')
             # URLCRED positive (real-looking user:pass@host must BLOCK):
-            "redis://appuser:" + "R" * 12 + "@10.0.0.5:6379": True,
+            "redis://appuser:" + "R" * 12 + "@192.0.2.5:6379": True,
             # URLCRED negatives (BOTH halves placeholder → exempt, must PASS):
             "postgresql://user:password@host.example.com": False,
             "redis://your_user:your_password@localhost": False,

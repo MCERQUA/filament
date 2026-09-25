@@ -38,4 +38,23 @@ MESH COMMUNICATION (from inside any agent)
   mesh-send alice@mesh "here are the findings: ..."
   mesh-recv                      Check your inbox
 
+IDENTITY  (desk-prefix.sh — one definition shared by every tool)
+  Agents are <PREFIX>-<slot>@mesh (slot 1 = manager, 2-4 = workers).
+  PREFIX resolves: SUBMESH_DESK_PREFIX > AGENT_URI=<name>-desktop@mesh -> <name>-desk
+                   > SUBMESH_HOST_PREFIX_MAP (hostname globs, most-specific FIRST) > desk
+  Two desktops on one mesh MUST resolve different prefixes.
+
+HOOKS written into every agent workspace (.claude/settings.json)
+  PostToolUse  submesh-hook-check   inbox count + whisper delivery after each tool call
+  Stop         submesh-hook-stop    drain reminder at end of turn
+  PreToolUse   render-guard.py      BLOCKS video renders on this node (route them to
+                                    $RENDER_GUARD_HANDOFF_URI, default gpu-node@mesh)
+
+ENVIRONMENT
+  SUBMESH_HOME            in-container home (default /config)
+  SUBMESH_TERM            terminal launcher (default "konsole -e")
+  SUBMESH_PARENT_URI      who the manager reports to (default $AGENT_URI, else host@mesh)
+  SUBMESH_DESK_PREFIX     force the desk prefix
+  SUBMESH_HOST_PREFIX_MAP hostname fallback map, "glob=prefix;glob=prefix"
+
 HELP

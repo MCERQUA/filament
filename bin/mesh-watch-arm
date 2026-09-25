@@ -1,0 +1,290 @@
+#!/usr/bin/env bash
+# mesh-watch-arm — emit events when new messages or tasks arrive.
+#
+# Watches:
+#   inbox/                   new messages for this agent
+#   /mesh/QUEUE/*/pending/   new tasks available for claiming (all queues)
+#   /mesh/JOBS/active/       new background job files to monitor
+#   /mesh/EVENTS/*/          new events published to any topic (fires on new ev-*.md)
+#
+# First iteration emits ALL existing files as 'queued' events (drain pre-arm
+# queue — avoids silent backlog). Then polls every 5s for new arrivals.
+#
+# Usage: wrap output in a Monitor(persistent=true) tool call, or run standalone.
+#
+# Flags:
+#   --skip-backlog-drain    Suppress the initial `[mesh queued] ...` flood; only
+#                           emit truly-new events arriving AFTER the watcher
+#                           starts. Use this when your Monitor output-rate
+#                           limiter is sensitive to bursts (default 60-100+
+#                           queued lines at cold-start of a long-lived agent).
+#   --help, -h              Show this help.
+#
+# Env:
+#   AGENT_URI    this agent (e.g. alice-desktop@mesh) — used for the host-path fallback
+#   MESH_INBOX   override inbox dir (default: /agent-desk/inbox, else
+#                $MESH_ROOT/agents/<me>/inbox, else /mnt/agent-mesh/agents/<me>/inbox)
+#   MESH_DIR     override mesh shared dir (default: $MESH_ROOT/mesh, else /mesh,
+#                else /mnt/agent-mesh/mesh)
+#   MESH_ROOT    filament mesh root (parent of mesh/ and agents/)
+#   MESH_LANE    lane id for the double-arm guard (default: $TMUX_PANE, else session id)
+#   MESH_WATCH_FORCE=1        bypass the double-arm guard (intentional restart)
+#   MESH_WATCH_EVENTS=1       also wake on the global EVENTS bus (default OFF — see below)
+#   MESH_WATCH_KEEPALIVE_S    stderr keepalive interval, seconds (default 300)
+#   MESH_WATCH_POLL_S         poll interval, seconds (default 5)
+
+set -u
+
+SKIP_BACKLOG_DRAIN=0
+for arg in "$@"; do
+    case "$arg" in
+        --skip-backlog-drain)
+            SKIP_BACKLOG_DRAIN=1
+            ;;
+        --help|-h)
+            sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'
+            exit 0
+            ;;
+        *)
+            echo "mesh-watch-arm: unknown arg: $arg (try --help)" >&2
+            exit 2
+            ;;
+    esac
+done
+
+# Path autodetect — container vs host.
+# A container has /agent-desk/inbox + /mesh as bind-mounts; a host has neither and
+# falls back to $MESH_ROOT (or /mnt/agent-mesh) paths derived from AGENT_URI.
+_short() { echo "${AGENT_URI%@mesh}"; }
+
+# Resolution order matches mesh-recv: MESH_INBOX > MESH_ROOT > this desk-N's OWN
+# /agent-desk-<N> > bare /agent-desk (only for a NON-desk-N identity) > host path.
+# A desk-N identity never falls back to /agent-desk — on a multi-desk container that
+# is the PARENT agent's inbox, and watching it wakes this lane on someone else's mail.
+_desk_n=""
+[[ "${AGENT_URI:-}" =~ -desk-([0-9]+)@mesh$ ]] && _desk_n="${BASH_REMATCH[1]}"
+if [[ -n "${MESH_INBOX:-}" ]]; then
+    INBOX="$MESH_INBOX"
+elif [[ -n "${AGENT_URI:-}" && -n "${MESH_ROOT:-}" && -d "${MESH_ROOT}/agents/$(_short)/inbox" ]]; then
+    INBOX="${MESH_ROOT}/agents/$(_short)/inbox"
+elif [[ -n "$_desk_n" && -d "/agent-desk-${_desk_n}/inbox" ]]; then
+    INBOX="/agent-desk-${_desk_n}/inbox"
+elif [[ -z "$_desk_n" && -d /agent-desk/inbox ]]; then
+    INBOX=/agent-desk/inbox
+elif [[ -n "${AGENT_URI:-}" && -d "/mnt/agent-mesh/agents/$(_short)/inbox" ]]; then
+    INBOX="/mnt/agent-mesh/agents/$(_short)/inbox"
+else
+    echo "mesh-watch-arm: cannot resolve inbox path (set MESH_INBOX, or AGENT_URI + MESH_ROOT)" >&2
+    exit 2
+fi
+
+if [[ -n "${MESH_DIR:-}" ]]; then
+    MESH_DIR="$MESH_DIR"
+elif [[ -n "${MESH_ROOT:-}" && -d "${MESH_ROOT}/mesh" ]]; then
+    MESH_DIR="${MESH_ROOT}/mesh"          # explicit root beats autodetect
+elif [[ -d /mesh ]]; then
+    MESH_DIR=/mesh
+elif [[ -d /mnt/agent-mesh/mesh ]]; then
+    MESH_DIR=/mnt/agent-mesh/mesh
+else
+    echo "mesh-watch-arm: cannot resolve mesh dir (set MESH_DIR or MESH_ROOT)" >&2
+    exit 2
+fi
+QUEUE_ROOT="${MESH_DIR}/QUEUE"
+JOBS_ACTIVE="${MESH_DIR}/JOBS/active"
+EVENTS_ROOT="${MESH_DIR}/EVENTS"
+
+# LIVENESS GUARD — refuse to DOUBLE-arm.
+# A session-start routine (or a keeper respawn) that re-arms a watcher without checking one
+# is already live produces duplicate watchers, double-acks, and a wasted agent turn per event.
+# PID-lockfile keyed on the watched INBOX + LANE. Stale locks self-heal: the lock only counts
+# if its pid is alive AND its cmdline still says mesh-watch-arm (PID recycling cannot
+# false-positive us into "already armed" with no watcher running).
+# Bypass for intentional restarts: MESH_WATCH_FORCE=1.
+#
+# LANE, not just inbox. The key used to be md5(INBOX) alone. On a node running MORE THAN ONE
+# LANE under one mesh URI, both lanes watch the SAME inbox, so the second lane to arm always
+# lost the lock, printed "ALREADY ARMED", and exited 0 — which a session-start routine reads
+# as SUCCESS. A re-arm wrapper then re-ran it every 2s, refusing every time, silently, for the
+# life of the session: a watcher that is armed, healthy, exit-0 and STRUCTURALLY INCAPABLE of
+# emitting a single event — a 100% miss rate by construction, with every instrument green.
+# The guard's real purpose is to stop ONE lane double-arming, so the key identifies the LANE
+# as well as the inbox: explicit MESH_LANE, else the tmux pane, else the process session id.
+_lane="${MESH_LANE:-${TMUX_PANE:-}}"
+[ -n "$_lane" ] || _lane="sid$(ps -o sess= -p $$ 2>/dev/null | tr -d ' ')"
+_lockkey=$(printf '%s|%s' "$INBOX" "$_lane" | md5sum | cut -c1-12)
+LOCKFILE="${TMPDIR:-/tmp}/mesh-watch-arm.${_lockkey}.pid"
+if [[ "${MESH_WATCH_FORCE:-0}" != "1" && -f "$LOCKFILE" ]]; then
+    _oldpid=$(cat "$LOCKFILE" 2>/dev/null || true)
+    if [[ -n "$_oldpid" && -d "/proc/$_oldpid" ]] \
+       && grep -qa 'mesh-watch-arm' "/proc/$_oldpid/cmdline" 2>/dev/null; then
+        # ⚠️ THIS IS A POINT-IN-TIME CHECK, AND IT MUST NOT READ AS A STATE.
+        # Measured: an agent got "ALREADY ARMED ... (pid N)", trusted it, and minutes later
+        # /proc/N did not exist. The liveness check HAD passed; the watcher died afterwards and
+        # the lockfile outlived it (an EXIT trap does not fire on SIGKILL). Not a wrong subject,
+        # not a silent zero, but A CORRECT STATEMENT THAT HAS EXPIRED — and a stale reassurance
+        # is worse than no message, because it suppresses the check that would find the truth.
+        # Re-checking harder cannot fix this (the next check has the same race), so the claim
+        # is stamped with the instant it was true and says plainly that it decays.
+        echo "[mesh-watch] ALREADY ARMED for $INBOX lane=$_lane (pid $_oldpid, verified alive at $(date -u +%H:%M:%SZ)) — refusing duplicate watcher in THIS lane. (MESH_WATCH_FORCE=1 to override)"
+        echo "[mesh-watch] ⚠ POINT-IN-TIME: that pid was alive just now, not necessarily still. If you are relying on being watched, re-verify: [ -d /proc/$_oldpid ] || mesh-watch-arm"
+        exit 0
+    fi
+fi
+echo $$ > "$LOCKFILE" 2>/dev/null || true
+trap 'rm -f "$LOCKFILE" 2>/dev/null' EXIT
+
+# DEAD-READER KEEPALIVE. A watcher whose reader is gone never finds out if it never writes.
+# Measured: a remote agent's Monitor expired, its local loop died, and the remote watcher lived
+# 10h+ writing into a dead pipe — every re-arm then hit ALREADY ARMED above and exited, so the
+# lane was deaf for most of a day. We cannot see the reader's end from here, so instead we WRITE
+# periodically and let the write tell us. stderr, not stdout: stdout lines become Monitor events
+# (tokens); stderr does not. On a failed write, take the whole watcher down so the EXIT trap
+# releases the lock and the next arm succeeds.
+_mw_main=$$
+( trap '' PIPE
+  while sleep "${MESH_WATCH_KEEPALIVE_S:-300}"; do
+    printf '[mesh-watch] keepalive %s\n' "$(date -u +%H:%M:%SZ)" >&2 2>/dev/null || { kill -TERM "$_mw_main" 2>/dev/null; exit 0; }
+    kill -0 "$_mw_main" 2>/dev/null || exit 0
+  done ) &
+_mw_ka=$!
+trap 'rm -f "$LOCKFILE" 2>/dev/null; kill "$_mw_ka" 2>/dev/null' EXIT
+
+# Baseline the inbox NOW, before any startup scanning, so a message landing while this
+# process is still booting is still seen as new on the first diff. See LAST_INBOX below.
+# No *.md filter: a peer may write a non-.md artifact (report.html, a worker .flag) —
+# the suffix glob made such files unobservable at the WAKE layer (a truthful zero
+# over a non-empty inbox).
+_EARLY_INBOX=$(find "${INBOX}" -maxdepth 1 -type f 2>/dev/null | sort || true)
+
+# MESH_WATCH_EVENTS — global-EVENTS-bus wake is OPT-IN, default OFF (token-burn fix).
+#
+# Watching /mesh/EVENTS/*/ means EVERY ev-*.md published by ANY mesh agent
+# wakes THIS agent (Monitor fires -> mesh-recv -> LLM calls). With a new
+# global event nearly every 5s poll, a desktop agent was waking ~12x/min to
+# LLM-process the global event bus 24/7 — a flat sustained ~170 Sonnet calls/10min
+# with no discrete work behind it. No agent needs to LLM-process every other
+# agent's published events; the legitimate reactive surface is inbox + queue + jobs.
+#
+# Default: do NOT watch global EVENTS. Set MESH_WATCH_EVENTS=1 per-agent to restore
+# the old firehose behavior for an agent that genuinely needs EVENTS reactions.
+# Inbox / queue / jobs watching is ALWAYS on and unaffected by this flag.
+WATCH_EVENTS="${MESH_WATCH_EVENTS:-0}"
+
+LAST_INBOX=""
+LAST_QUEUE=""
+LAST_JOBS=""
+LAST_EVENTS=""
+
+emit_existing() {
+    local dir="$1" label="$2" pattern="${3:-*.md}"
+    if [[ -d "$dir" ]]; then
+        local files
+        files=$(ls -1 "${dir}"/${pattern} 2>/dev/null | sort)
+        [ -n "$files" ] && echo "$files" | while read -r f; do
+            [ -n "$f" ] && echo "[mesh queued] ${label}: $(basename "$f")"
+        done
+    fi
+}
+
+snapshot_queue() {
+    if [[ -d "$QUEUE_ROOT" ]]; then
+        find "$QUEUE_ROOT" -mindepth 3 -maxdepth 3 -name "*.md" -path "*/pending/*" 2>/dev/null | sort
+    fi
+}
+
+snapshot_jobs() {
+    if [[ -d "$JOBS_ACTIVE" ]]; then
+        ls -1 "${JOBS_ACTIVE}"/*.md 2>/dev/null | sort
+    fi
+}
+
+snapshot_events() {
+    # Global-EVENTS watch is opt-in (see MESH_WATCH_EVENTS above). When off, return
+    # empty so the steady-state diff emits nothing and we never stat the event bus.
+    [[ "$WATCH_EVENTS" == "1" ]] || return 0
+    if [[ -d "$EVENTS_ROOT" ]]; then
+        find "$EVENTS_ROOT" -mindepth 2 -maxdepth 2 -name "ev-*.md" 2>/dev/null | sort
+    fi
+}
+
+# ---- first iteration: drain pre-arm queues (unless --skip-backlog-drain) ----
+if [[ "$SKIP_BACKLOG_DRAIN" -eq 0 ]]; then
+    # inbox: all regular files, not just *.md (non-.md artifacts were invisible)
+    if [[ -d "$INBOX" ]]; then
+        find "$INBOX" -maxdepth 1 -type f 2>/dev/null | sort | while read -r f; do
+            [ -n "$f" ] && echo "[mesh queued] inbox: $(basename "$f")"
+        done
+    fi
+    # (queue backlog is emitted once, by the find below — an emit_existing glob here
+    #  as well listed every pending task twice)
+    if [[ -d "$QUEUE_ROOT" ]]; then
+        find "$QUEUE_ROOT" -mindepth 3 -maxdepth 3 -name "*.md" -path "*/pending/*" 2>/dev/null | while read -r f; do
+            echo "[mesh queued] queue: $(basename "$f")"
+        done
+    fi
+    emit_existing "$JOBS_ACTIVE" "job"
+    # EVENTS drain only when the global-EVENTS watch is opted in (default OFF).
+    if [[ "$WATCH_EVENTS" == "1" && -d "$EVENTS_ROOT" ]]; then
+        find "$EVENTS_ROOT" -mindepth 2 -maxdepth 2 -name "ev-*.md" 2>/dev/null | while read -r f; do
+            topic=$(basename "$(dirname "$f")")
+            echo "[mesh queued] event:${topic}: $(basename "$f")"
+        done
+    fi
+fi
+
+# Always seed LAST_* from current state so steady-state diff only emits truly-new.
+# EXCEPT the inbox, whose baseline is taken at PROCESS START (_EARLY_INBOX, before the
+# startup scans above). Taking it here absorbed anything arriving DURING startup into the
+# baseline, so it could never be emitted as new -- measured with a scratch MESH_INBOX: a file written at t+8s emitted on a warm run and was silently
+# swallowed on a cold one, same command, same file, the only variable being startup
+# duration. A message must not become invisible because the watcher was slow to boot.
+LAST_INBOX="$_EARLY_INBOX"
+LAST_QUEUE=$(snapshot_queue)
+LAST_JOBS=$(snapshot_jobs)
+LAST_EVENTS=$(snapshot_events)
+
+# ---- steady-state poll ----
+while true; do
+    sleep "${MESH_WATCH_POLL_S:-5}"
+
+    # inbox
+    CUR_INBOX=$(find "${INBOX}" -maxdepth 1 -type f 2>/dev/null | sort || true)
+    if [ -n "$LAST_INBOX" ] || [ -n "$CUR_INBOX" ]; then
+        NEW=$(comm -13 <(echo "$LAST_INBOX") <(echo "$CUR_INBOX") 2>/dev/null || true)
+        [ -n "$NEW" ] && echo "$NEW" | while read -r f; do
+            [ -n "$f" ] && echo "[mesh new] inbox: $(basename "$f")"
+        done
+    fi
+    LAST_INBOX="$CUR_INBOX"
+
+    # queue pending
+    CUR_QUEUE=$(snapshot_queue)
+    if [ -n "$LAST_QUEUE" ] || [ -n "$CUR_QUEUE" ]; then
+        NEW=$(comm -13 <(echo "$LAST_QUEUE") <(echo "$CUR_QUEUE") 2>/dev/null || true)
+        [ -n "$NEW" ] && echo "$NEW" | while read -r f; do
+            [ -n "$f" ] && echo "[mesh new] queue: $(basename "$f")"
+        done
+    fi
+    LAST_QUEUE="$CUR_QUEUE"
+
+    # jobs active
+    CUR_JOBS=$(snapshot_jobs)
+    if [ -n "$LAST_JOBS" ] || [ -n "$CUR_JOBS" ]; then
+        NEW=$(comm -13 <(echo "$LAST_JOBS") <(echo "$CUR_JOBS") 2>/dev/null || true)
+        [ -n "$NEW" ] && echo "$NEW" | while read -r f; do
+            [ -n "$f" ] && echo "[mesh new] job: $(basename "$f")"
+        done
+    fi
+    LAST_JOBS="$CUR_JOBS"
+
+    # events
+    CUR_EVENTS=$(snapshot_events)
+    if [ -n "$LAST_EVENTS" ] || [ -n "$CUR_EVENTS" ]; then
+        NEW=$(comm -13 <(echo "$LAST_EVENTS") <(echo "$CUR_EVENTS") 2>/dev/null || true)
+        [ -n "$NEW" ] && echo "$NEW" | while read -r f; do
+            [ -n "$f" ] && topic=$(basename "$(dirname "$f")") && echo "[mesh new] event:${topic}: $(basename "$f")"
+        done
+    fi
+    LAST_EVENTS="$CUR_EVENTS"
+done

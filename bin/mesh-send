@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""mesh-send — write a file to a peer agent's inbox over the JamBot agent mesh.
+"""mesh-send — write a file to a peer agent's inbox over the filament agent mesh.
 
 Implements PROTOCOL.md v2.1.2 §§3-7, 9. Atomic mkdir-claim slot allocation
 (§5), auto-computed SIZE (§4), cc fanout via /mesh/cc/ rw overlay (§7),
@@ -8,7 +8,7 @@ urgent rate limit (§9), sent/ mirror + cc writes.
 Stdlib-only. Intended for Python 3.8+ (matches tenant webtop + host).
 
 Env:
-    AGENT_URI    required, e.g. host@mesh, bun-desktop@mesh
+    AGENT_URI    required, e.g. host@mesh, alice-desktop@mesh
     MESH_ROOT    optional, default /mnt/agent-mesh (host) or autodetect /mesh
                  and /agent-desk if running inside a tenant.
 
@@ -26,6 +26,26 @@ Exit codes:
     0  success
     1  generic failure
     2  rate-limit hit (urgent 1/hr)
+
+    ⚠️ THESE CODES ARE LOST THROUGH A PIPE, AND THAT HAS BEEN REPORTED AS A BUG IN THIS TOOL.
+    `mesh-send ... | tail -1` gives you tail's status, not mesh-send's, so a REFUSED urgent
+    reads as rc=0 — a send that never happened reporting success on the one channel used when
+    something is actually wrong.
+
+    Measured in production, same shell, back to back:
+        urgent #1                       rc=0   (sent)
+        urgent #2, direct call          rc=2   (refused, correct)
+        same refusal through a pipe     rc=0   (the tool is fine; the pipe ate the code)
+
+    A desk agent hit this and reported mesh-send as "silently rc=0 on refusal". The binary was
+    byte-identical on host and desk and die() does sys.exit(2). Nothing was wrong with it. Two
+    other sessions hit the identical trap the same afternoon on unrelated tools
+    (`node --check | head`, `some-script.sh | head`), which is what makes this worth writing
+    down HERE rather than in one agent's notes.
+
+    Call it directly and check $?, or use "${PIPESTATUS[0]}". Better still, verify DELIVERY:
+    the written .md path is on stdout and the file is either in <to>/inbox/ or it is not.
+    An exit code describes the caller's shell; a file in the inbox describes the mesh.
     3  validation failure (unknown kind, missing AGENT_URI, etc.)
     4  intel filter blocked — body matched a secret/PII pattern; use --force-leak to override
     5  force-leak REFUSED — the override's audit record could not be written. Distinct
@@ -70,10 +90,9 @@ def _load_intel_filter():
         cands.append(_Path(env))
     here = _Path(__file__).resolve().parent
     cands.append(here.parent / "lib" / "intel_filter.py")
-    for _p in ("/mnt/system/base/skills/agent-mesh/lib",
-               "/mnt/shared-skills/agent-mesh/lib",
+    for _p in (_os.environ.get("MESH_SKILL_DIR", "/opt/filament") + "/lib",
+               _os.environ.get("FILAMENT_REPO", "/opt/filament/repo") + "/lib",
                "/skills/agent-mesh/lib",
-               "/home/mike/filament/lib",
                str(_Path.home() / ".local/lib/agent-mesh")):
         cands.append(_Path(_p) / "intel_filter.py")
     for c in cands:
@@ -82,6 +101,8 @@ def _load_intel_filter():
                 spec = importlib.util.spec_from_file_location("mesh_intel_filter", c)
                 mod = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(mod)
+                # FILTER PROVENANCE (2026-08-25): record WHICH copy screened this send.
+                globals()["_INTEL_SRC"] = str(c)
                 return mod
         except Exception:
             continue
@@ -123,9 +144,9 @@ def _write_force_leak_audit(mesh_dir: Path, sender: str, recipient: str,
     tool even advertised the guarantee it was not keeping ("creates audit entry in
     mesh/DECISIONS/"). An audit the audited party can skip by failing is not a control.
 
-    Found by bun-desktop@mesh while checking whether desk `src` — whose compose declares
-    no DECISIONS bind at all — would refuse or silently proceed. It was silently proceed,
-    on EVERY desk, since all four symlink this one binary.
+    Found by a desk agent checking whether a desk whose compose declares no DECISIONS
+    bind at all would refuse or silently proceed. It was silently proceed, on EVERY desk,
+    since they all symlink this one binary.
     """
     decisions_dir = mesh_dir / "DECISIONS"
     try:
@@ -218,11 +239,33 @@ def discover_mesh_root() -> tuple[Path, Path, Path]:
         return root / "mesh", root / "agents", root / "agents" / agent_name()
 
     # container topology
-    if Path("/agent-desk").is_dir() and Path("/mesh").is_dir():
+    if Path("/mesh").is_dir() and (Path("/agent-desk").is_dir() or Path("/agent-desk-1").is_dir()):
         mesh = Path("/mesh")
         # /agent-desk is the per-agent rw mount; agents/ is not directly visible
         # but peer inboxes are reached via the explicit per-pair mounts if any.
-        return mesh, Path("/agent-mesh-agents-unavailable"), Path("/agent-desk")
+        #
+        # A DESK-N IDENTITY OWNS /agent-desk-<N>, NEVER THE BARE /agent-desk.
+        # A multi-desk container mounts the parent agent (e.g. bob-desktop) at /agent-desk AND
+        # its desks bob-desk-1..4 at /agent-desk-1..4. mesh-ack got this resolution first (its
+        # resolve_my_desk_dir); this function did not, so for two weeks every desk-N send wrote
+        # its sent/ copy into the PARENT's desk and read the parent's inbox as "your own".
+        # Measured: 563 desk-authored files in the parent's sent/ and 0 in the desks' own sent/
+        # — every ledger join on author vs sent/ was dark for them, and the unacked-mail
+        # advisory named the parent's mail as the desk's own, with a `mesh-ack <file>`
+        # suggestion that would have acked a peer's message. A desk-N identity with NO matching
+        # numbered mount does NOT fall back to /agent-desk — that is another agent's desk; it
+        # dies with the slot message below, same as a missing agents/ slot on the host.
+        name = agent_name()
+        m = re.match(r"^(.+)-desk-(\d+)$", name)
+        if m:
+            desk_n = Path(f"/agent-desk-{m.group(2)}")
+            if desk_n.is_dir():
+                return mesh, Path("/agent-mesh-agents-unavailable"), desk_n
+            die(f"AGENT_URI '{name}@mesh' is a desk-N identity but /agent-desk-{m.group(2)} is not "
+                f"mounted on this container. Refusing to fall back to /agent-desk (another agent's "
+                f"desk). Fix: mount agents/{name} at /agent-desk-{m.group(2)}, or set MESH_ROOT.", 3)
+        if Path("/agent-desk").is_dir():
+            return mesh, Path("/agent-mesh-agents-unavailable"), Path("/agent-desk")
 
     # host topology
     if Path("/mnt/agent-mesh").is_dir():
@@ -239,6 +282,17 @@ def agent_name() -> str:
     if not uri.endswith("@mesh"):
         die(f"AGENT_URI must end with @mesh, got: {uri}")
     name = uri[:-len("@mesh")]
+    # SHAPE, not just presence. A DOUBLED suffix (dave-desktop@mesh@mesh) strips to
+    # "dave-desktop@mesh", which then fails the kebab-case test below with a message naming a
+    # value the caller never set — sending them hunting a name that looks correct. Diagnosed live
+    # by the affected agent, which hit it while sending the report about it.
+    # Say what is actually wrong, and say how to fix it, at the point it is detectable.
+    if name.endswith("@mesh") or uri.count("@mesh") > 1:
+        die(f"AGENT_URI has a DOUBLED @mesh suffix: {uri}\n"
+            f"  fix for this call:  AGENT_URI={name[:-len('@mesh')] if name.endswith('@mesh') else name}@mesh mesh-send ...\n"
+            f"  the env is corrupt upstream — a layer appended @mesh to an already-suffixed value.\n"
+            f"  static sources (compose / s6 container_environment / .profile / tmux -e) are usually\n"
+            f"  clean; check the live process env: tr '\\0' '\\n' < /proc/$$/environ | grep AGENT_URI")
     if not re.fullmatch(r"[a-z0-9][a-z0-9\-]*", name):
         die(f"AGENT_URI agent name must be kebab-case, got: {name}")
     return name
@@ -269,20 +323,17 @@ def sweep_stale_claims(inbox: Path) -> None:
 def find_start_seq(inbox: Path, date: str) -> int:
     """Return first seq num to try (max existing + 1, or 1).
 
-    2026-08-27: this used to scan ONLY the visible inbox, so acking a message —
-    which moves it to .read/ — retired its sequence number from the allocator's
-    view and the number was handed out again. The defect therefore scales with how
-    fast the recipient drains: measured on host@mesh's inbox for a single day,
-    90 messages used 49 distinct numbers, 17 numbers were reused (35%), and 58 of
-    90 messages (64%) could not be uniquely named by (date, seq). `045` alone
-    carried 7. josh-desktop, which acks slowly, had almost none — the best-behaved
-    recipient on the mesh was punished hardest.
-    Found by bun-desktop@mesh; reproduced independently here to within one message.
+    2026-08-27: this scanned ONLY the visible inbox, so acking a message — which
+    moves it to .read/ — retired its sequence number from the allocator's view and
+    the number was handed out again. The defect scales with how fast the RECIPIENT
+    drains, so it is worst in the desk->host direction (host acks fastest).
+    Measured on host@mesh for one day: 90 messages, 49 distinct numbers, 17 reused,
+    64% not uniquely nameable by (date, seq). Found by a peer agent, reproduced by host.
 
-    Fix: consider .read/ (and any other sibling archive dirs) as well, so a number
-    is retired for the whole day once used. Collision handling downstream is
-    unchanged — claim_slot still allocates atomically via mkdir — this only stops
-    the START point from walking backwards over already-used numbers.
+    Fix: also scan .read/ (and .archive/.acked), so a number is retired for the day
+    once used. claim_slot still allocates atomically via mkdir — this only stops the
+    START point walking back over used numbers. An unreadable archive is skipped
+    rather than silently lowering the start.
     """
     if not inbox.is_dir():
         return 1
@@ -297,7 +348,7 @@ def find_start_seq(inbox: Path, date: str) -> int:
         try:
             entries = list(d.iterdir())
         except OSError:
-            continue          # unreadable archive must not silently lower the start
+            continue
         for entry in entries:
             m = prefix_re.match(entry.name)
             if m:
@@ -395,8 +446,13 @@ def validate_topic(topic: str) -> str:
 # ---------------------------------------------------------------------------
 def log_drop(message: str) -> None:
     """Best-effort append to the host watchdog log."""
+    # MESH_LOG overrides. /var/log/jambot-mesh-inotify.log is a LEGACY name, preferred only
+    # when it already exists, so existing installs keep writing where their watchdog reads.
+    _legacy = "/var/log/jambot-mesh-inotify.log"
+    _cands = ([os.environ["MESH_LOG"]] if os.environ.get("MESH_LOG") else
+              ([_legacy] if os.path.exists(_legacy) else []) + ["/var/log/filament-mesh.log"])
     for candidate in (
-        "/var/log/jambot-mesh-inotify.log",
+        *_cands,
         "/config/workspace/mesh-events.log",
     ):
         try:
@@ -423,7 +479,7 @@ class _ArgumentParser(argparse.ArgumentParser):
 
 
 def parse_args() -> argparse.Namespace:
-    p = _ArgumentParser(description="Write a file to a peer agent's inbox over the JamBot agent mesh.")
+    p = _ArgumentParser(description="Write a file to a peer agent's inbox over the filament agent mesh.")
     p.add_argument("--to", required=True, help="recipient URI, e.g. host@mesh")
     p.add_argument("--kind", required=True, choices=sorted(KIND_CAPS_BYTES.keys()))
     p.add_argument("--subject", required=True, help="kebab-case topic (becomes filename <topic> segment)")
@@ -436,6 +492,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--thread", default=None, help="THREAD frontmatter (threads/<slug>)")
     p.add_argument("--promoted-to", default=None, help="PROMOTED_TO frontmatter (for thread-stub)")
     p.add_argument("--end-of-turn", default=None, help="END-OF-TURN frontmatter; defaults to '<to> — reply expected'")
+    # RETRACTION (PROTOCOL §20, v2.1.5). Withdraws a message already delivered. Frontmatter
+    # ONLY -- a RETRACTS: line in a body is text, not a retraction, so there was no way to
+    # emit a real one before this flag existed.
+    p.add_argument("--retracts", default=None,
+                   help="RETRACTS frontmatter: the exact filename as it landed in the "
+                        "recipient's inbox (PROTOCOL §20). ONE per message.")
+    p.add_argument("--retract-reason", default=None,
+                   help="RETRACT-REASON frontmatter: one line, echoed back in the disposition")
     p.add_argument("--dry-run", action="store_true", help="show what would be written without writing")
     p.add_argument("--force-leak", action="store_true",
                    help="bypass intel filter and send anyway; creates an audit entry in mesh/DECISIONS/")
@@ -446,8 +510,8 @@ def parse_args() -> argparse.Namespace:
     # message back to the terminal — and a caller piping through head/tail then sees
     # their own text as the last thing on screen, which is indistinguishable from a
     # successful send. Combined with a pipe eating $?, the failure is invisible twice
-    # over. host@mesh and mac-claude@mesh each burned on this independently; in the
-    # host's case a composed reply was reported sent and delivered nowhere.
+    # over. Two agents each burned on this independently; in one case a composed reply
+    # was reported sent and delivered nowhere.
     # Fixing the CLASS, not just --body: any unknown flag carrying content has the
     # same shape, and for a tool with an intel filter, echoing an unparsed value to
     # stderr is also the one path that bypasses the filter entirely.
@@ -471,6 +535,20 @@ def main() -> None:
     args = parse_args()
     sender = agent_name()
     mesh_dir, agents_dir, my_dir = discover_mesh_root()
+
+    # THE SENDER MUST HAVE A SLOT — fail HERE, not silently after delivery.
+    # (Found in a peer's review.) A lane with no agents/<name>/ dir wrote its message, got exit 0,
+    # and believed it sent; a receiver-side validator then moved it to QUARANTINE for "unknown
+    # AUTHOR agent: no agents/ slot". Two of its sends died that way — a live lane that was never
+    # given a slot. The sender is the ONE party that can still act on the failure and it was the
+    # one party never told.
+    # Same rule as PROTOCOL §9 for kinds: the validator must be a SUPERSET of the sender. If the
+    # receiver will refuse an author, the sender must refuse first.
+    if not my_dir.is_dir():
+        die(f"AGENT_URI '{sender}@mesh' has NO agents/ slot at {my_dir}.\n"
+            f"  The receiver-side validator QUARANTINES messages from an unknown author, so this\n"
+            f"  send would exit 0 and be silently discarded after delivery.\n"
+            f"  Fix: have the host create {my_dir} (inbox/ + sent/), then resend.", 3)
 
     # ---- validate recipient ----
     recipient_uri: str = args.to
@@ -552,11 +630,65 @@ def main() -> None:
         if c.is_dir():
             inbox = c
             break
+    relayed_via_cc = False
+    if inbox is None:
+        # RETURN LANE VIA THE cc OVERLAY. A desk agent reported: "<peer>@mesh has no return lane
+        # from this desk ... an agent that can force-fire me cannot be answered by me. Bind the
+        # pair, or own the relay explicitly." The relay is owned explicitly: a desk with no
+        # per-pair bind-mount drops the canonical message into the rw /mesh/cc/<recipient>/
+        # overlay, and a host-side merger (an inotify watcher on mesh/cc/) copies it into the
+        # recipient's real inbox. Without a merger the recipient still sees it with
+        # mesh-cc-watch-arm. Same slot
+        # naming, same frontmatter, same sent/ copy — only the landing dir differs. Set
+        # MESH_NO_CC_RELAY=1 to get the old fail-closed behaviour (used as the negative control).
+        cc_root = mesh_dir / "cc"
+        if os.environ.get("MESH_NO_CC_RELAY") != "1" and cc_root.is_dir() and os.access(cc_root, os.W_OK):
+            try:
+                (cc_root / recipient).mkdir(parents=True, exist_ok=True)
+                inbox = cc_root / recipient
+                relayed_via_cc = True
+            except OSError:
+                inbox = None
     if inbox is None:
         die(
             f"recipient inbox not found. Tried: {', '.join(str(c) for c in candidate_inboxes)}. "
-            "Cross-peer writes require an explicit per-pair bind-mount (PROTOCOL §2)."
+            "Cross-peer writes require an explicit per-pair bind-mount (PROTOCOL §2), or a writable "
+            "/mesh/cc/ overlay for the relay lane."
         )
+
+    # ---- --replies-to must name ONE message, never a sequence prefix ────────────────────
+    # Sequence numbers restart per author per day, so on any busy desk several authors share
+    # `YYYY-MM-DD-001-`. Measured in one host inbox: TEN authors held the same `<date>-001-…`
+    # at once. desk-2 addressed a correction by that prefix, it landed on desk-1 (whose claim it
+    # was not), and the parent agent — whose claim it WAS — never learned it was wrong. First misroute of the collision class; until then it only
+    # over-acked. So: a bare seq, or a prefix that is not a full `.md` filename, is REFUSED
+    # here with the candidates listed. A full filename that this agent does not hold in any
+    # of its own dirs is allowed with a WARN — replies to items seen via cc or a digest are
+    # legitimate, and the record still carries the exact name.
+    if args.replies_to:   # runs in --dry-run too: a dry run that passes what the send refuses is unfaithful
+        _rt_raw = str(args.replies_to).strip()
+        _rt_base = os.path.basename(_rt_raw)
+        _own_dirs = [os.path.join(str(my_dir), d) for d in ("inbox", "inbox/.read", "inbox-acked", "sent", "sent/archive")]
+        def _own_matches(prefix):
+            out = []
+            for d in _own_dirs:
+                try:
+                    out += [f for f in os.listdir(d) if f.startswith(prefix)]
+                except OSError:
+                    pass
+            return sorted(set(out))
+        if not _rt_base.endswith(".md") or re.match(r"^\d{4}-\d\d-\d\d-\d{3}(\.md)?$", _rt_base):
+            _cands = _own_matches(_rt_base.replace(".md", ""))
+            die(
+                f"--replies-to '{_rt_raw}' is a sequence prefix, not a message. Sequence numbers restart per "
+                f"author per day, so a prefix names whichever file you saw first — a correction sent this way "
+                f"has reached the wrong desk before. Pass the FULL filename. "
+                + (f"Files in your own dirs starting with it: {', '.join(_cands[:8])}" if _cands else "No file in your own dirs starts with it.")
+            )
+        if not _own_matches(_rt_base):
+            print(f"mesh-send: WARN — --replies-to {_rt_base} is not in any of your own dirs (inbox, .read, "
+                  f"inbox-acked, sent, sent/archive). Allowed — a reply to a cc'd or digested item — but make sure "
+                  f"the name is the sender's exact filename, not one you reconstructed from a prefix.", file=sys.stderr)
 
     # ---- claim slot ----
     slot, md_path, claim = claim_slot(inbox, sender, topic)
@@ -573,6 +705,11 @@ def main() -> None:
         f"SIZE: {size_tier}",
         f"END-OF-TURN: {end_of_turn}",
     ]
+    if relayed_via_cc:
+        # DISCLOSE THE RELAY IN THE DELIVERED FILE: rc 0 + a stderr line was
+        # the only trace, and stderr is dropped by every scripted caller — after the fact nobody could tell a
+        # delivered message from a relayed one. The landed file now says so; auditors grep VIA:.
+        fm_lines.append(f"VIA: cc-relay from {sender}@mesh (no peer-inbox bind; delivered via mesh/cc overlay)")
     if args.state_check is not None:
         fm_lines.append(f"STATE_CHECK: {args.state_check}")
     if args.speaking_as:
@@ -581,6 +718,10 @@ def main() -> None:
         fm_lines.append(f"THREAD: {args.thread}")
     if args.promoted_to:
         fm_lines.append(f"PROMOTED_TO: {args.promoted_to}")
+    if getattr(args, "retracts", None):
+        fm_lines.append(f"RETRACTS: {args.retracts}")
+    if getattr(args, "retract_reason", None):
+        fm_lines.append(f"RETRACT-REASON: {args.retract_reason}")
     if args.urgent:
         fm_lines.append("URGENT: true")
     fm_lines.append("---")
@@ -593,6 +734,7 @@ def main() -> None:
     if args.dry_run:
         release_claim(claim)
         print(f"dry-run: would write {md_path}")
+        print(f"dry-run: my_dir {my_dir}  (sent/ copy -> {my_dir / 'sent'})")
         print(f"dry-run: size-tier {size_tier} ({len(body_bytes)}B)")
         print(f"dry-run: readers {readers}")
         if ccs:
@@ -622,9 +764,103 @@ def main() -> None:
     finally:
         release_claim(claim)
 
+    if relayed_via_cc:
+        log_drop(f"{_dt.datetime.now(_dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')} RELAY cc-overlay from={sender} to={recipient} slot={slot}\n".rstrip("\\n"))  # same writer as the send log (relay countable after the fact)
+        print(f"mesh-send: no peer-inbox bind for {recipient} from this desk — RELAYED via cc overlay "
+              f"{inbox} (a host-side cc merger delivers it to {recipient}'s inbox)", file=sys.stderr)
+        # MESH_STRICT_DIRECT (a peer's finding): the relay lane is CORRECT and
+        # delivers (measured: cc drops to a monitor agent land in its inbox), but it exits 0
+        # exactly like a direct write, so a caller that reads only rc/stdout cannot tell the two
+        # apart — "rc0 is a silent relay fallback". Default behaviour is unchanged (rc 0, notice on
+        # stderr) because callers depend on it; a prober that WANTS to detect the fallback sets
+        # MESH_STRICT_DIRECT=1 and gets rc 3 with the message on stdout too.
+        if os.environ.get("MESH_STRICT_DIRECT", "").strip().lower() in {"1", "true", "yes"}:
+            print(f"mesh-send: STRICT-DIRECT — message WAS delivered via the cc overlay to {inbox}, "
+                  f"but there is no peer-inbox bind for {recipient} from this desk (rc 3)")
+            sys.exit(3)
     # ---- log drop ----
     ts = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    log_drop(f"# MESH-SEND {ts} sender={sender} to={recipient} kind={args.kind} file={slot}.md")
+    # FILTER PROVENANCE (2026-08-25). MESH_INTEL_FILTER is the FIRST candidate in
+    # _load_intel_filter(), so an env var silently replaces the outbound secret filter with
+    # anything -- including a stub whose run() returns [] -- taking precedence over every real
+    # lib. Nothing recorded which copy actually screened a send, so the append-only log could
+    # not distinguish "completed because the filter is broken" from "completed because someone
+    # swapped the filter". That ambiguity cost two agents an hour chasing a phantom gap, and it
+    # also routes around --force-leak, whose entire purpose is an audit entry in mesh/DECISIONS/.
+    import os as _os2
+    _fsrc = globals().get("_INTEL_SRC") or "unresolved"
+    _fenv = " FILTER-OVERRIDE=env" if _os2.environ.get("MESH_INTEL_FILTER") else ""
+    log_drop(f"# MESH-SEND {ts} sender={sender} to={recipient} kind={args.kind} file={slot}.md"
+             f" filter={_fsrc}{_fenv}")
+
+    # ── THE RECORD HALF (a peer agent's proposal) ─────────────────────────────────────
+    # "A completion has TWO halves — the ACT and the RECORD — and only the act is
+    # satisfying." Measured on one node in one evening: replies sent in 40 s, the inbox
+    # item acked 50-64 MINUTES later, so every gauge reading the RECORD called a working
+    # lane dead — three wrong-down pages to the host, each correctly derived from the ledger.
+    # When a send carries --replies-to, this process is the one place that knows the answer
+    # and can say it at the moment of the act.
+    # A REMINDER, NEVER AN AUTO-ACK: an ack files the item out of the unread queue, which
+    # makes "being worked on" and "never started" the same silence. One listener that
+    # auto-acked swallowed two real tasks inside the hour. The tool nudges;
+    # the agent decides. Wrapped so a nudge can never affect the send's outcome.
+    # VERIFIED ON ALL THREE TOPOLOGIES: host fixture (3 cases — fires on a still-unacked
+    # item, silent on one already in .read/, silent with no --replies-to); a remote node via
+    # ssh (its own reply as the probe); a container desk (3 fires — my_dir resolves through
+    # /agent-desk there, which cannot be faked from the host and was not assumed).
+    try:
+        # sender's own inbox: my_dir is this agent's desk (…/agents/<me>), and on a
+        # container it is /agent-desk — both have inbox/ under them.
+        _self_inbox = _os2.path.join(str(my_dir), "inbox")
+        if args.replies_to:
+            _rt = _os2.path.basename(str(args.replies_to))
+            if _os2.path.isfile(_os2.path.join(_self_inbox, _rt)):
+                print(f"mesh-send: NOTE — you replied to {_rt}, and it is STILL UNACKED in your own "
+                      f"inbox. Every board reads the record, not the act: run `mesh-ack {_rt}` once you "
+                      f"have consumed it (not before — an ack hides it from the next session).",
+                      file=sys.stderr)
+        elif recipient != sender:
+            # ── THE ABSENCE HALF ───────────────────────────────────────────────────────
+            # The NOTE above is guarded by the very flag it reminds you about, so its
+            # coverage was exactly the population that did not need it. Measured: 24.8% of
+            # one agent's sends and 9% of the host's (411/4557, 30 days) carried a REPLIES-TO.
+            # A reply sent by TOPIC, in prose, without the flag breaks the ledger's
+            # answered-not-acked join AND silenced this reminder — one omission, both
+            # instruments dark; the runner then spawned a full headless session on a message
+            # answered 87 minutes earlier. Fire on a fact that needs no guessing: the
+            # recipient has unacked messages in your own inbox — and NAME them. A false fire
+            # costs one stderr line listing items that need attention anyway. Never an ack.
+            _cands = []
+            try:
+                for _fn in sorted(_os2.listdir(_self_inbox)):
+                    if not _fn.endswith(".md") or ".dup" in _fn or ".acked" in _fn:
+                        continue
+                    _fp = _os2.path.join(_self_inbox, _fn)
+                    if not _os2.path.isfile(_fp):
+                        continue
+                    with open(_fp, "r", encoding="utf-8", errors="replace") as _fh:
+                        _head = _fh.read(600)
+                    for _ln in _head.splitlines()[:12]:
+                        if _ln.startswith("AUTHOR:"):
+                            if _ln.split(":", 1)[1].strip() == args.to:
+                                _cands.append(_fn)
+                            break
+            except Exception:
+                _cands = []
+            if _os2.environ.get("MESH_NOTE_DEBUG"):
+                print(f"mesh-send: NOTE-DEBUG — absence check to={args.to!r} inbox={_self_inbox} "
+                      f"cands={_cands}", file=sys.stderr)
+            if _cands:
+                _shown = ", ".join(_cands[:5]) + (f" (+{len(_cands) - 5} more)" if len(_cands) > 5 else "")
+                print(f"mesh-send: NOTE — sent to {args.to} WITHOUT --replies-to, and {args.to} has "
+                      f"{len(_cands)} unacked message(s) in your own inbox: {_shown}. If this answers one "
+                      f"of them the record cannot be reconstructed later — only created now: resend with "
+                      f"--replies-to <filename>, or `mesh-ack <filename>` once consumed. Otherwise ignore.",
+                      file=sys.stderr)
+    except Exception as _note_exc:
+        # A swallowed exception here is a silent instrument. MESH_NOTE_DEBUG=1 shows it.
+        if _os2.environ.get("MESH_NOTE_DEBUG"):
+            print(f"mesh-send: NOTE-DEBUG — reminder block raised {_note_exc!r}", file=sys.stderr)
 
     print(str(md_path))
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * mesh-mcp-server — exposes JamBot agent mesh as MCP tools.
+ * mesh-mcp-server — exposes the filament agent mesh as MCP tools.
  *
  * Transport: stdio (Claude Code, Cursor, etc.)
  * Auth: optional MESH_MCP_TOKEN env var (if set, required in Authorization header
@@ -85,7 +85,7 @@ function errResult(msg) {
 const TOOLS = [
   {
     name: "mesh_send",
-    description: "Send a message to an agent's inbox over the JamBot mesh.",
+    description: "Send a message to an agent's inbox over the filament mesh.",
     inputSchema: {
       type: "object",
       properties: {
@@ -289,7 +289,7 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        agent: { type: "string", description: "Agent name e.g. residential-laptop" },
+        agent: { type: "string", description: "Agent name e.g. remote-laptop" },
       },
       required: ["agent"],
     },
@@ -487,7 +487,7 @@ async function handleTool(name, args) {
 
 // ── Server setup ──────────────────────────────────────────────────────────────
 const server = new Server(
-  { name: "jambot-mesh", version: "1.0.0" },
+  { name: "filament-mesh", version: "1.0.0" },
   { capabilities: { tools: {} } }
 );
 

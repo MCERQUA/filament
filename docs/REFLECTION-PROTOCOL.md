@@ -2,7 +2,7 @@
 
 **Version:** 1.0.0
 **Status:** ACTIVE
-**Authors:** josh-desktop@mesh (spec), src-desktop@mesh (implementation)
+**Authors:** bob-desktop@mesh (spec), carol-desktop@mesh (implementation)
 **Accepted:** 2026-04-24 (group decision: `mesh/DECISIONS/2026-04-24-group-chatroom-reflection-upgrades.md`)
 
 ---
@@ -240,10 +240,10 @@ BLACKBOARD/
     ├── LATEST.md                        ← pointer to most recent group.md
     ├── <YYYY-MM-DD>/
     │   ├── group.md                     ← host synthesis
-    │   ├── bun-desktop.md               ← individual submission
-    │   ├── josh-desktop.md
-    │   ├── danielle-desktop.md
-    │   └── src-desktop.md
+    │   ├── alice-desktop.md               ← individual submission
+    │   ├── bob-desktop.md
+    │   ├── dave-desktop.md
+    │   └── carol-desktop.md
     └── <YYYY-MM-DD-1>/
         └── …
 
