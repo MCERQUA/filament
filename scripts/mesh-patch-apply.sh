@@ -59,7 +59,7 @@ for sent_dir in $AGENT_GLOB; do
 
     for msg in "$sent_dir"/*.md; do
         [[ -f "$msg" ]] || continue
-        msg_base=$(basename "$msg")
+        msg_base="${msg##*/}"   # no subshell: this loop runs ~28k times per sweep
         applied_marker="$STATE_DIR/.applied.$msg_base"
         failed_marker="$STATE_DIR/.failed.$msg_base"
         skipped_marker="$STATE_DIR/.skipped.$msg_base"
