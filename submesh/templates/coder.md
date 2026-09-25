@@ -8,7 +8,7 @@ You are a CODER agent. You write, edit, and debug code.
 
 ## Asking for research
 ```bash
-mesh-send josh-desk-2@mesh "Need: [what you need researched]"
+mesh-send bob-desk-2@mesh "Need: [what you need researched]"
 ```
 
 ## Reporting done

@@ -1,0 +1,389 @@
+#!/usr/bin/env bash
+# mesh-claim — an exclusive, expiring, owned claim on an arbitrary key.
+#
+# WHY: an ops alert that is deliberately fanned out to TWO lanes (e.g. host@mesh and a
+# second relay lane that shares its inbox) gets actioned by both, independently, with no
+# trace between them — two restarts of the same live service, two edits of the same file.
+# "Grep the ledger for a prior claim" is not a guard when nothing writes a claim, and a
+# queue-oriented tool (mesh-task-claim, which operates on QUEUE directories) cannot lock an
+# arbitrary key such as an inbox filename. This tool exists so there is something to find.
+#
+# A real claim needs all four of these; this implements exactly that:
+#   1. written BEFORE the work starts   -> the caller runs this first, and acts only on exit 0
+#   2. ATOMIC                           -> mkdir(2) is atomic on POSIX; check-then-write races
+#   3. an OWNER                         -> AGENT_URI + host recorded inside
+#   4. an EXPIRY                        -> stale claims are reaped, so a dead holder cannot
+#                                          wedge a key forever (the open-ended-hold trap)
+#
+# Interactive work claims too: a session picking a task up BY HAND takes the same claim, or
+# it stays invisible to every dispatcher and the duplicate-execution collision recurs.
+#
+# Lives on the shared mesh volume so it works across containers, not just one host.
+#
+# Usage:
+#   mesh-claim take    <key> [ttl]          exit 0 = yours · 2 = held by someone else
+#   mesh-claim extend  <key> <ttl> [born]   lengthen a live claim you hold (born unchanged)
+#   mesh-claim release <key>                only the owner may release
+#   mesh-claim done    <key> [note]         mark COMPLETED and release in one step
+#   mesh-claim show    <key>                0 = LIVE · 1 = free · 2 = EXPIRED · 70 = cannot tell
+#   mesh-claim reap    all                  sweep every past-TTL claim
+#   ttl = seconds, or <n>[smhd]  (default $MESH_CLAIM_TTL, else 1800)
+#
+# ── EXIT CODES — ONLY EXIT 2 MEANS HELD ─────────────────────────────────────
+#   0  you hold it — proceed
+#   2  HELD by another lane — stand down (the ONLY code that means stand down)
+#   3  REFUSED: AGENT_URI unset, or you are not the owner on release/extend/done
+#  64  usage / bad TTL
+#  70  FATAL: claims root missing or unwritable — the lock provides NO exclusion
+#  75  CANNOT-TELL: an unreadable born/ttl on an existing claim
+#
+# ⚠ NEVER WRITE `mesh-claim take "$KEY" || exit 0`.
+# That one-liner treats 3, 64, 70 and 75 exactly like 2. A shell with AGENT_URI unset, a
+# typo'd TTL, or an UNREACHABLE CLAIMS ROOT then stands down silently, and logs nothing a
+# reader can tell from a healthy lock doing its job. Measured in production: an operator
+# pasted the claim line from an alert into a shell without AGENT_URI, got exit 3, and the
+# `|| exit 0` wrapper printed "HELD - stand down". Nothing was held. A false positive that
+# renders as success is unauditable — and once enough callers used `|| exit 0`, the broken
+# pattern became the reason nobody would add new exit codes: it was load-bearing for its
+# own defect.
+#
+# THE CORRECT CALLER (quiet on held, loud on broken):
+#   mesh-claim take "$KEY" 1800; rc=$?
+#   case $rc in 0) ;; 2) exit 0 ;; *) echo "mesh-claim rc=$rc is NOT 'held'" >&2; exit $rc ;; esac
+#   ...work...
+#   mesh-claim release "$KEY"        # or: mesh-claim done "$KEY" "what was done"
+#
+# ── DISPATCHING TO A CHILD: the child is NOT a second taker ─────────────────
+# A dispatcher that takes the claim and then spawns a session to do the work will have that
+# child follow the rule above, be told HELD by its OWN PARENT, and abort. Both carry the same
+# AGENT_URI, so the tool cannot tell a child from a rival; only the process tree knows.
+# Pass the key down, scoped to the exact key:
+#   MESH_CLAIM_INHERITED="$KEY" some-agent-cli ...     # child's own `take` returns 0
+#   mesh-claim release "$KEY"                         # the PARENT releases, once
+#
+# ⚠ OVER SSH THE MARKER SILENTLY DOES NOT ARRIVE — ssh forwards no environment:
+#   MESH_CLAIM_INHERITED="$KEY" ssh node '...'        # ✗ var dies locally, never crosses
+#   ssh node "MESH_CLAIM_INHERITED='$KEY' ..."        # ✓ set INSIDE the remote command
+# A test harness that composes its OWN ssh line (with the marker) will stay green while the
+# production caller (without it) gets HELD on every run. Test the join with the production
+# function, unstubbed, against the real peer.
+#
+# ── ENV ─────────────────────────────────────────────────────────────────────
+#   AGENT_URI          required, e.g. alice-desktop@mesh (the recorded OWNER)
+#   MESH_CLAIM_ROOT    explicit claims dir (alias: MESH_CLAIMS_DIR). Must already exist,
+#                      or its parent must — it is never invented with mkdir -p.
+#   MESH_ROOT          filament mesh root; claims live at $MESH_ROOT/mesh/CLAIMS
+#   (autodetect)       /mnt/agent-mesh/mesh/CLAIMS on a host, /mesh/CLAIMS in a container
+#   MESH_CLAIM_TTL     default TTL in seconds (1800)
+#   MESH_CLAIM_INHERITED  exact key a parent passed down (see above)
+set -uo pipefail
+
+case "${1:-}" in
+  -h|--help|help) sed -n '2,/^set -uo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
+esac
+
+# ROOT RESOLUTION. A host sees the mesh at /mnt/agent-mesh/mesh; a desk CONTAINER typically
+# sees the same tree bind-mounted at /mesh, and the host path does not exist there at all.
+# Hardcoding the host path made every containerised agent unable to claim.
+#
+# MUST NOT `mkdir -p` its way to a working directory: a container-local CLAIMS dir would let
+# `take` SUCCEED while being invisible to every other agent — a lock that reports mutual
+# exclusion and provides none. So the PARENT of the claims dir must already exist (proving we
+# are on the shared tree); only the CLAIMS leaf itself may be created.
+ROOT="${MESH_CLAIM_ROOT:-${MESH_CLAIMS_DIR:-}}"
+if [ -z "$ROOT" ]; then
+  if   [ -n "${MESH_ROOT:-}" ] && [ -d "$MESH_ROOT/mesh" ]; then ROOT="$MESH_ROOT/mesh/CLAIMS"
+  elif [ -n "${MESH_ROOT:-}" ]; then
+    echo "mesh-claim: FATAL — MESH_ROOT='$MESH_ROOT' has no mesh/ dir. This is NOT 'held'." >&2
+    exit 70
+  elif [ -d /mnt/agent-mesh/mesh ]; then ROOT=/mnt/agent-mesh/mesh/CLAIMS
+  elif [ -d /mesh ];                then ROOT=/mesh/CLAIMS
+  else
+    echo "mesh-claim: FATAL — no shared mesh dir found (set MESH_ROOT, or MESH_CLAIM_ROOT)." >&2
+    echo "mesh-claim: refusing to claim against a path only this process can see." >&2
+    exit 70
+  fi
+fi
+# Create only the leaf, and only under an existing (proven-shared) parent.
+[ -d "$ROOT" ] || { [ -d "$(dirname "$ROOT")" ] && mkdir "$ROOT" 2>/dev/null; }
+DEFAULT_TTL="${MESH_CLAIM_TTL:-1800}"          # 30 min: long enough for real work, short
+                                               # enough that a dead holder frees the key
+cmd="${1:-}"; key="${2:-}"
+[ -n "$cmd" ] || { echo "usage: mesh-claim {take|release|extend|done|show|reap} <key> [ttl|note]; extend: <key> <ttl> [born]; reap: mesh-claim reap all" >&2; exit 64; }
+# reap is a global sweep — key is ignored; all other verbs require it
+[ "$cmd" = "reap" ] || [ -n "$key" ] || { echo "usage: mesh-claim {take|release|extend|done|show} <key> [ttl|note]; reap: mesh-claim reap all" >&2; exit 64; }
+safe=$(printf '%s' "$key" | tr -c 'A-Za-z0-9._:-' '_')
+dir="$ROOT/$safe.claim"
+done_dir="$ROOT/$safe.done"   # COMPLETION marker: survives release, so a later
+                              # taker can see the work was already finished
+# An owner field that reads "unknown@mesh" satisfies the LETTER of requirement 3 (an OWNER, so
+# a human can find them) and defeats its PURPOSE: nobody can be found. A claim nobody can be
+# traced to is exactly the invisible-holder problem claims exist to end, so this REFUSES
+# rather than defaulting. A guard that fills in a plausible value for missing input is not a
+# guard.
+if [ -z "${AGENT_URI:-}" ]; then
+    echo "mesh-claim: AGENT_URI is not set — refusing to take a claim nobody can be traced to." >&2
+    echo "  export AGENT_URI=<you>@mesh   (it does not survive between shells)" >&2
+    exit 3
+fi
+me="$AGENT_URI"
+
+# Shared by every verb: an unreachable root must never read as "held", "free" or "done".
+require_root() {
+    if [ ! -d "$ROOT" ] || [ ! -w "$ROOT" ]; then
+      echo "mesh-claim: FATAL — claims root '$ROOT' missing or not writable. $1" >&2
+      exit 70
+    fi
+}
+
+reap_if_stale() {
+    [ -d "$dir" ] || return 0
+    local born ttl now
+    born=$(cat "$dir/born" 2>/dev/null || echo 0)
+    ttl=$(cat "$dir/ttl" 2>/dev/null || echo "$DEFAULT_TTL")
+    # The |'' arm matters: an EMPTY born/ttl contains no non-digit character, so
+    # `*[!0-9]*` alone does NOT match it and the empty value fell through to arithmetic
+    # as 0, making `now - 0 >= 0` true and reaping a malformed claim nobody could
+    # evaluate. A claim you cannot read is CANNOT-TELL, not expired.
+    case "$born$ttl" in (*[!0-9]*|'') return 0 ;; esac
+    now=$(date +%s)
+    if [ $(( now - born )) -ge "$ttl" ]; then
+        echo "mesh-claim: reaping EXPIRED claim on '$key' (held by $(cat "$dir/owner" 2>/dev/null), age $(( now - born ))s >= ttl ${ttl}s)" >&2
+        rm -rf "$dir" 2>/dev/null
+    fi
+}
+
+case "$cmd" in
+  take)
+    ttl="${3:-$DEFAULT_TTL}"
+    # TTL NORMALISATION. `take <key> 8h` used to be accepted silently and wrote the literal
+    # string "8h" to the ttl file. reap_if_stale() then finds a non-digit and correctly
+    # returns WITHOUT reaping ("a claim you cannot read is CANNOT-TELL, not expired") — safe
+    # in the right direction, but the consequence is an IMMORTAL claim that only a manual
+    # release frees. That breaks requirement #4: an open-ended claim wedges the task forever
+    # when its holder dies. Measured when found: 7 of 25 live claims were immortal, all held
+    # by one agent.
+    # Fix at WRITE time: accept plain seconds or <n>[smhd]; refuse anything else loudly.
+    case "$ttl" in
+      *[!0-9]*)
+        _n=${ttl%[smhdSMHD]}; _u=${ttl#$_n}
+        case "$_n" in (''|*[!0-9]*) echo "mesh-claim: BAD TTL '$ttl' -- want seconds or <n>[smhd]" >&2; exit 64 ;; esac
+        case "$_u" in
+          s|S) ttl=$_n ;;
+          m|M) ttl=$(( _n * 60 )) ;;
+          h|H) ttl=$(( _n * 3600 )) ;;
+          d|D) ttl=$(( _n * 86400 )) ;;
+          *)   echo "mesh-claim: BAD TTL unit in '$ttl' -- want s, m, h or d" >&2; exit 64 ;;
+        esac ;;
+    esac
+    [ "$ttl" -gt 0 ] 2>/dev/null || { echo "mesh-claim: BAD TTL '$ttl' -- must be > 0" >&2; exit 64; }
+    # PREVIOUSLY-COMPLETED WARNING. A released claim is indistinguishable from one nobody ever
+    # took, so a FINISHED task looks exactly like an untouched one. Measured near-miss: one
+    # lane claimed an inbox item, resolved it, released — and a second lane sharing that
+    # inbox escalated the SAME item as still-open 30 min later. The item never changes to say
+    # "resolved"; the resolution lives in a different message.
+    # Deliberately a WARNING, not a refusal: work can legitimately recur. Exit code unchanged.
+    _prev_done=""
+    if [ -d "$done_dir" ]; then
+      # MACHINE-READABLE COMPLETION SIGNAL. The warning below is stderr PROSE; a caller
+      # following the exit-code contract cannot see completion at all, and grepping prose
+      # makes this tool's wording load-bearing for a peer's correctness. So completion is
+      # also carried as a token (PRIOR_COMPLETION=<owner>) on the TAKEN stdout line.
+      _prev_done="$(cat "$done_dir/owner" 2>/dev/null)"
+      printf 'mesh-claim: ALREADY COMPLETED — %s by %s at %s\n' "$key" \
+        "$(cat "$done_dir/owner" 2>/dev/null)" "$(cat "$done_dir/at" 2>/dev/null)" >&2
+      [ -s "$done_dir/note" ] && printf 'mesh-claim:   note: %s\n' "$(cat "$done_dir/note")" >&2
+      printf 'mesh-claim:   RE-MEASURE THE SUBJECT before acting — the item describes the past.\n' >&2
+    fi
+    reap_if_stale
+    # THREE VERDICTS. A bare `mkdir` failure used to fall through to "held by someone else",
+    # so an UNREACHABLE claims root read as HELD and every agent stood down forever on a
+    # broken tool. Distinguish them before interpreting the failure.
+    require_root "This is NOT 'held'."
+    if mkdir "$dir" 2>/dev/null; then       # ATOMIC: only one caller can win this
+        printf '%s\n' "$me" > "$dir/owner"
+        printf '%s\n' "$(date +%s)" > "$dir/born"
+        printf '%s\n' "$ttl" > "$dir/ttl"
+        # NOT A LIVENESS SIGNAL. $$ is THIS helper's pid and the helper exits on the next
+        # line, so the recorded pid is dead within milliseconds of every claim being taken.
+        # Liveness is the TTL and only the TTL. (Measured: a session read this field as an
+        # orphan signal and RELEASED a live claim with 35 minutes left, putting two sessions
+        # on one task.)
+        printf '%s taken-by-helper-pid=%s (ALWAYS DEAD, NOT the holder — liveness is the TTL)\n' "$(hostname)" "$$" > "$dir/where"
+        if [ -n "${_prev_done:-}" ]; then
+          echo "mesh-claim: TAKEN '$key' by $me (ttl ${ttl}s) PRIOR_COMPLETION=$_prev_done"
+        else
+          echo "mesh-claim: TAKEN '$key' by $me (ttl ${ttl}s)"
+        fi
+        exit 0
+    fi
+    # INHERITED CLAIM — a child of the holder is not a second taker (see header).
+    # THE FAILURE SHAPE IS WHY THIS IS NOT A SMALL BUG: without it the child logs "held by
+    # another lane", which is INDISTINGUISHABLE FROM THE LOCK WORKING, and the dispatched
+    # work silently never happens.
+    # SCOPED DELIBERATELY, because this is a lock bypass: the env var must name the EXACT key
+    # (not a blanket "I am inherited"), and the recorded owner must still match $me. A wrong
+    # key or a different owner falls through to HELD.
+    if [ "${MESH_CLAIM_INHERITED:-}" = "$key" ] \
+       && [ "$(cat "$dir/owner" 2>/dev/null)" = "$me" ]; then
+      echo "mesh-claim: INHERITED '$key' — held by $me (this process tree). Proceeding." >&2
+      echo "mesh-claim: TAKEN '$key' by $me (inherited) INHERITED=1"
+      exit 0
+    fi
+    echo "mesh-claim: HELD '$key' by $(cat "$dir/owner" 2>/dev/null || echo '?') since $(date -u -d "@$(cat "$dir/born" 2>/dev/null || echo 0)" +%H:%M:%SZ 2>/dev/null) — STAND DOWN" >&2
+    exit 2 ;;
+
+  release)
+    # Every verb shares the root guard. A verb that reports success on total failure is the
+    # exact defect this tool exists to prevent.
+    require_root "Nothing was recorded."
+    [ -d "$dir" ] || { echo "mesh-claim: '$key' not held"; exit 0; }
+    owner=$(cat "$dir/owner" 2>/dev/null)
+    if [ "$owner" != "$me" ]; then
+        echo "mesh-claim: REFUSING — '$key' is held by $owner, not $me" >&2; exit 3
+    fi
+    rm -rf "$dir" 2>/dev/null && echo "mesh-claim: released '$key'"; exit 0 ;;
+
+  extend)
+    # extend <key> <ttl> [born]  — lengthen a LIVE claim you already hold.
+    #
+    # WHY: a TTL that lapses UNDER RUNNING WORK turns a working lock into a collision.
+    # Measured: an interactive lane claimed a thread and started a ~70-minute batch; a
+    # dispatcher read HELD on 33 consecutive passes — the tool behaving as designed — and
+    # then the TTL expired while the work was still running. `take` reaped the key as stale
+    # and the dispatcher spawned a second session on a thread the first was mid-way through.
+    # Nothing malfunctioned: the TTL was a guess about duration made before the work
+    # started. Without `extend` the only choices are an over-long TTL (wedge risk) or
+    # expiry-under-work (collision risk); this verb sizes the claim to the WORK.
+    #
+    # `release && take` is not a substitute: it leaves a real free window between the calls
+    # (a same-owner re-take answers HELD by design).
+    #
+    # ⚠ `born` IS DELIBERATELY NOT REWRITTEN. Callers guard against a lapse-and-retake by
+    # recording the born they were granted and passing it here; two lanes under the SAME
+    # AGENT_URI are indistinguishable by owner, so born is the only field that changes on a
+    # retake. If extend reset born, that guard would false-positive on every renewal.
+    require_root "Nothing was recorded."
+    _new_ttl="${3:-}"
+    case "$_new_ttl" in (''|*[!0-9]*) echo "mesh-claim: usage: mesh-claim extend <key> <ttl-seconds> [born]" >&2; exit 64 ;; esac
+    [ -d "$dir" ] || { echo "mesh-claim: REFUSING — '$key' is not held; nothing to extend (re-take it if the work is still yours)" >&2; exit 2; }
+    _owner=$(cat "$dir/owner" 2>/dev/null)
+    if [ "$_owner" != "$me" ]; then
+      echo "mesh-claim: REFUSING — '$key' is held by $_owner, not $me" >&2; exit 3
+    fi
+    _b=$(cat "$dir/born" 2>/dev/null); _t=$(cat "$dir/ttl" 2>/dev/null)
+    # Per-FIELD guard: checking "$_b$_t" as one string would let an empty born hide behind
+    # an all-digit ttl. An unreadable claim is CANNOT-TELL, never "fine to extend".
+    case "$_b" in (''|*[!0-9]*) echo "mesh-claim: CANNOT-TELL — '$key' has an unreadable born; refusing to extend" >&2; exit 75 ;; esac
+    case "$_t" in (''|*[!0-9]*) echo "mesh-claim: CANNOT-TELL — '$key' has an unreadable ttl; refusing to extend" >&2; exit 75 ;; esac
+    _now=$(date +%s); _age=$(( _now - _b ))
+    if [ "$_age" -ge "$_t" ]; then
+      echo "mesh-claim: REFUSING — '$key' ALREADY EXPIRED: age ${_age}s exceeded its ttl ${_t}s $(( _age - _t ))s ago; another lane may hold it now." >&2
+      echo "  Do not resurrect it silently: re-take it and accept the gap, or check who holds it with \`show\`." >&2
+      exit 2
+    fi
+    _want_born="${4:-}"
+    if [ -n "$_want_born" ] && [ "$_want_born" != "$_b" ]; then
+      echo "mesh-claim: REFUSING — born mismatch on '$key': you recorded $_want_born, live claim is $_b." >&2
+      echo "  Your claim lapsed and this is the retake that replaced it. STAND DOWN." >&2
+      exit 2
+    fi
+    printf '%s' "$_new_ttl" > "$dir/ttl" || { echo "mesh-claim: FATAL — could not write ttl" >&2; exit 70; }
+    printf '%s extended ttl %s -> %s by %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$_t" "$_new_ttl" "$me" >> "$dir/renewals" 2>/dev/null || true
+    echo "mesh-claim: EXTENDED '$key' ttl ${_t}s -> ${_new_ttl}s (born $_b unchanged, age ${_age}s, $(( _b + _new_ttl - _now ))s remaining)"
+    exit 0 ;;
+
+  done)
+    require_root "Nothing was recorded."
+    # Mark a key COMPLETED and release it in one step. Refuses to mark someone else's live claim.
+    if [ -d "$dir" ]; then
+      _o=$(cat "$dir/owner" 2>/dev/null)
+      if [ -n "$_o" ] && [ "$_o" != "$me" ]; then
+        echo "mesh-claim: REFUSING — '$key' is held by $_o, not $me" >&2; exit 3
+      fi
+    fi
+    # TWO DEFECTS THIS GUARDS AGAINST (both reproduced by peers before being fixed):
+    # (1) ATTRIBUTION WAS OVERWRITABLE BY ANYONE: alice@mesh completed a key, then
+    #     mallory@mesh ran `done` on it and the record read owner=mallory. The completion
+    #     record is what a later taker trusts ("ALREADY COMPLETED by X at T"), so a forgeable
+    #     one is worse than none. FIRST completion is IMMUTABLE for owner/at/note; every
+    #     completion (including the first) appends to `history`.
+    # (2) IT REPORTED SUCCESS ON TOTAL WRITE FAILURE: the root guard only proves the ROOT is
+    #     writable; if the .done path itself cannot be created (e.g. a FILE sits where the dir
+    #     belongs) every write failed and it still printed success. Writes are VERIFIED now.
+    _ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    if [ -e "$done_dir" ] && [ ! -d "$done_dir" ]; then
+      echo "mesh-claim: FATAL — '$done_dir' exists and is not a directory. Nothing recorded." >&2; exit 70
+    fi
+    if ! mkdir -p "$done_dir" 2>/dev/null; then
+      echo "mesh-claim: FATAL — could not create completion record for '$key'. Nothing recorded." >&2; exit 70
+    fi
+    _prev=$(cat "$done_dir/owner" 2>/dev/null || true)
+    if [ -n "$_prev" ] && [ "$_prev" != "$me" ]; then
+      printf '%s  %s  (repeat; original completion by %s stands)\n' "$_ts" "$me" "$_prev" >> "$done_dir/history"
+      echo "mesh-claim: '$key' was ALREADY COMPLETED by $_prev — recorded your repeat in history, original attribution preserved" >&2
+      rm -rf "$dir" 2>/dev/null
+      exit 0
+    fi
+    printf '%s\n' "$me" > "$done_dir/owner" || { echo "mesh-claim: FATAL — write failed, nothing recorded." >&2; exit 70; }
+    printf '%s\n' "$_ts" > "$done_dir/at"   || { echo "mesh-claim: FATAL — write failed, nothing recorded." >&2; exit 70; }
+    [ -n "${3:-}" ] && { printf '%s\n' "$3" > "$done_dir/note" || { echo "mesh-claim: FATAL — note write failed." >&2; exit 70; }; }
+    printf '%s  %s\n' "$_ts" "$me" >> "$done_dir/history" 2>/dev/null
+    # VERIFY before claiming success — the whole point of (2).
+    if [ ! -s "$done_dir/owner" ] || [ ! -s "$done_dir/at" ]; then
+      echo "mesh-claim: FATAL — completion record did not persist for '$key'. Claim NOT released." >&2; exit 70
+    fi
+    rm -rf "$dir" 2>/dev/null
+    echo "mesh-claim: DONE '$key' by $me (claim released, completion recorded)"; exit 0 ;;
+
+  reap)
+    # GLOBAL SWEEP. reap_if_stale only ever runs inside `take`, on that ONE key — so an
+    # expired claim sits on the board until somebody happens to take the same key again.
+    # Anyone counting directory entries reads stale locks as live work and gates real
+    # decisions on them. Removes ONLY past-TTL claims; live claims are untouched.
+    require_root "Nothing was reaped."
+    _now=$(date +%s); _reaped=0; _kept=0; _cant=0
+    for _d in "$ROOT"/*.claim; do
+      [ -d "$_d" ] || continue
+      _b=$(cat "$_d/born" 2>/dev/null || echo 0); _t=$(cat "$_d/ttl" 2>/dev/null || echo "$DEFAULT_TTL")
+      # CANNOT-TELL claims are not live — count them separately so the summary stays honest
+      case "$_b$_t" in (*[!0-9]*|'') _cant=$((_cant+1)); continue ;; esac
+      if [ $(( _now - _b )) -ge "$_t" ]; then
+        printf "mesh-claim: reaped EXPIRED %s (owner=%s, %ss past ttl)\n" \
+          "$(basename "$_d" .claim)" "$(cat "$_d/owner" 2>/dev/null)" "$(( _now - _b - _t ))"
+        rm -rf "$_d" 2>/dev/null && _reaped=$((_reaped+1))
+      else _kept=$((_kept+1)); fi
+    done
+    echo "mesh-claim: reap complete — $_reaped expired removed, $_kept live kept, $_cant unevaluable"; exit 0 ;;
+
+  show)
+    # THREE VERDICTS, NOT TWO. `show` used to print the same shape and exit 0 for a LIVE
+    # claim and an EXPIRED one, so a reader could not tell "held" from "stale". And on an
+    # unreachable root it reported "free" — a reader would conclude the key is AVAILABLE
+    # when nothing can be known about it. CANNOT-TELL is not free.
+    # Exit: 0 = LIVE (stand down) · 1 = free · 2 = EXPIRED (reapable) · 70 = cannot tell.
+    require_root "Cannot tell whether '$key' is held."
+    # A key that was COMPLETED and released reports "free" — true, but it loses the one fact
+    # a reader most needs: somebody already did this.
+    if [ ! -d "$dir" ] && [ -d "$done_dir" ]; then
+      printf "mesh-claim: '%s' free — but COMPLETED by %s at %s\n" "$key" \
+        "$(cat "$done_dir/owner" 2>/dev/null)" "$(cat "$done_dir/at" 2>/dev/null)"
+      [ -s "$done_dir/note" ] && printf "mesh-claim:   note: %s\n" "$(cat "$done_dir/note")"
+      exit 1
+    fi
+    [ -d "$dir" ] || { echo "mesh-claim: '$key' free"; exit 1; }
+    _b=$(cat "$dir/born" 2>/dev/null || echo 0)
+    _t=$(cat "$dir/ttl" 2>/dev/null || echo "$DEFAULT_TTL")
+    _n=$(date +%s); _verdict="UNKNOWN-ttl"; _rc=0
+    case "$_b$_t" in
+      (*[!0-9]*) : ;;
+      (*) if [ $(( _n - _b )) -ge "$_t" ]; then
+            _verdict="EXPIRED (reapable, age $(( _n - _b ))s >= ttl ${_t}s)"; _rc=2
+          else
+            _verdict="LIVE ($(( _b + _t - _n ))s left)"; _rc=0
+          fi ;;
+    esac
+    echo "mesh-claim: '$key' $_verdict owner=$(cat "$dir/owner" 2>/dev/null) born=$_b ttl=$_t at=$(cat "$dir/where" 2>/dev/null)"
+    exit $_rc ;;
+  *) echo "usage: mesh-claim {take|release|extend|done|show|reap} <key> [ttl|note]" >&2; exit 64 ;;
+esac

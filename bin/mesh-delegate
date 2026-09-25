@@ -11,7 +11,7 @@ heartbeat-check replay path can deliver it verbatim.
 Stdlib-only. Python 3.8+.
 
 Env:
-    AGENT_URI     required, e.g. host@mesh, bun-desktop@mesh
+    AGENT_URI     required, e.g. host@mesh, alice-desktop@mesh
     MESH_ROOT     optional, default /mnt/agent-mesh (host) or /mesh (container)
     PICK_SCRIPT   optional, path to mesh-pick-residential.sh override
 
@@ -36,7 +36,7 @@ Visibility:
 
 Fallback (when no residential node is available):
     dead-letter        save to DEAD_LETTER/residential-pool/, replay on recovery (default)
-    surface-to-user    write STATE_CHECK alert for Mike to see
+    surface-to-user    write STATE_CHECK alert for the operator to see
     drop               silently discard
 
 Exit codes:
@@ -68,7 +68,7 @@ def die(msg: str, code: int = 3) -> None:
 def agent_name() -> str:
     uri = os.environ.get("AGENT_URI", "")
     if not uri.endswith("@mesh"):
-        die("AGENT_URI env var required (e.g. AGENT_URI=bun-desktop@mesh)")
+        die("AGENT_URI env var required (e.g. AGENT_URI=alice-desktop@mesh)")
     name = uri[:-len("@mesh")]
     if not re.fullmatch(r"[a-z0-9][a-z0-9\-]*", name):
         die(f"AGENT_URI agent name must be kebab-case, got: {name}")
@@ -173,7 +173,7 @@ def pick_residential(visibility: str, allow_in_use: bool) -> str | None:
     script_candidates = [
         os.environ.get("PICK_SCRIPT", ""),
         str(Path(__file__).parent / "mesh-pick-residential.sh"),
-        "/home/mike/MIKE-AI/scripts/agent-mesh/mesh-pick-residential.sh",
+        str(Path(__file__).parent / "mesh-pick-residential"),
     ]
     script = next((s for s in script_candidates if s and Path(s).exists()), None)
     if script is None:

@@ -79,7 +79,7 @@ from `mesh/BLACKBOARD/votes/<rfc-id>/`.
 **Quorum rules:**
 | Condition | Verdict | Action |
 |---|---|---|
-| Any `block` vote | `BLOCKED` | Pending Mike review — do not ratify |
+| Any `block` vote | `BLOCKED` | Pending operator review — do not ratify |
 | 3+ `no` (no block) | `CONTESTED` | Host may override, must justify in `DECISIONS/` |
 | Majority `yes` (no block) | `RATIFIED` | Accepted |
 | Majority `no` (no block, <3) | `REJECTED` | Declined |

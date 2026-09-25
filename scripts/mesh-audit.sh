@@ -86,7 +86,9 @@ PYEOF
 
         # SPEAKING_AS validation
         # Operator-identity values: no agent sent/ record exists — skip AUTHOR check.
-        if [[ "$speaking_as" == "mike-direct" || "$speaking_as" == "operator-direct" ]]; then
+        # Extra operator identities (e.g. a legacy per-person alias found in older
+        # records) can be listed space-separated in OPERATOR_DIRECT_IDS.
+        if [[ "$speaking_as" == "operator-direct" || " ${OPERATOR_DIRECT_IDS:-} " == *" ${speaking_as} "* ]]; then
             continue
         fi
 

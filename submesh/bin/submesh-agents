@@ -1,12 +1,25 @@
 #!/bin/bash
 # submesh-agents — list all sub-mesh agents and their status
 
-AGENTS_DIR=/config/submesh/agents
-SLOTS_FILE=/config/submesh/slots
+# In-container home of the submesh (webtop convention: /config). Override for other layouts.
+SUBMESH_HOME="${SUBMESH_HOME:-/config}"
+
+AGENTS_DIR=${SUBMESH_HOME}/submesh/agents
+SLOTS_FILE=${SUBMESH_HOME}/submesh/slots
 SESSION="submesh"
 
-HN=$(hostname 2>/dev/null || cat /etc/hostname 2>/dev/null)
-if echo "$HN" | grep -qi "josh"; then PREFIX="josh-desk"; elif echo "$HN" | grep -qi "ubuntu"; then PREFIX="ubuntu-desk"; else PREFIX="desk"; fi
+# Desk prefix — single source of truth in desk-prefix.sh. See that file for why the
+# old hostname-substring chain put several desktops in one desktop's namespace.
+if [ -r "${0%/*}/desk-prefix.sh" ]; then
+    . "${0%/*}/desk-prefix.sh"
+else
+    # minimal fallback — keep in step with desk-prefix.sh resolution order
+    case "${AGENT_URI:-}" in
+        *-desktop@*) PREFIX="${AGENT_URI%%-desktop@*}-desk" ;;
+        *)           PREFIX="desk" ;;
+    esac
+    [ -n "${SUBMESH_DESK_PREFIX:-}" ] && PREFIX="$SUBMESH_DESK_PREFIX"
+fi
 
 echo "SUB-MESH AGENTS"
 echo "────────────────────────────────────────────────"
@@ -25,11 +38,15 @@ for dir in "$AGENTS_DIR"/*/; do
 
     # detect running: check if any grid pane or window has this agent
     running=false
-    if tmux has-session -t "$SESSION" 2>/dev/null; then
+    # -t= = EXACT session match; bare -t falls back to PREFIX matching, which reports a dead
+    # $SESSION as alive whenever a longer-named session exists (e.g. `submesh` vs
+    # `submesh-watch`). The ":grid" compound targets below stay on bare -t deliberately —
+    # the `=` prefix is for a name, and its behaviour on a session:window spec is not
+    # something to assume in a status reporter.
+    if tmux has-session -t="$SESSION" 2>/dev/null; then
         # check all panes and windows
-        if tmux list-panes -t "$SESSION:grid" -F "#{pane_index}" 2>/dev/null | while read -r p; do
-            tmux capture-pane -t "$SESSION:grid.$p" -p 2>/dev/null | grep -q "$name" && echo yes && break
-        done | grep -q yes; then
+        # grid panes are tagged @submesh_agent=<name> by the launcher/new-agent
+        if tmux list-panes -t "$SESSION:grid" -F '#{@submesh_agent}' 2>/dev/null | grep -qx -- "$name"; then
             running=true
         fi
         tmux list-windows -t "$SESSION" -F "#{window_name}" 2>/dev/null | grep -qx "$name" && running=true

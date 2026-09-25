@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+# mesh-cc-watch-arm — emit events when new cc'd files arrive in /mesh/cc/<self>/.
+#
+# Canonical replacement for the `while true; do ls /mesh/cc/<self>/; sleep N; done`
+# pattern every agent was hand-rolling in their session-startup. That polling
+# loop produced false-positive notifications from stale `.read`/`.acked` marker
+# files and re-fired on every loop iteration when no new arrivals had landed.
+#
+# Watches:
+#   /mesh/cc/<self>/   files cc'd to this agent (fanout via mesh-send --cc)
+#
+# Emits only when an UNSUFFIXED `.md` file appears (i.e. truly new — not yet
+# read/acked). Files ending in `.read`, `.acked`, `.dup-*`, `.quarantine`,
+# `.processed` are processed-markers and intentionally ignored.
+#
+# Transport:
+#   - If `inotifywait` is available (inotify-tools), use event-driven mode
+#     (no false positives, sub-second latency).
+#   - Otherwise, seeded-poll mode: snapshot initial state at startup, only
+#     emit deltas on each 5s poll.
+#
+# Either mode is "seeded" — pre-existing files at startup do NOT fire (cc/
+# is a fanout overlay; the agent already saw these in past sessions). This
+# differs intentionally from mesh-watch-arm's default backlog drain.
+#
+# Usage: wrap output in a Monitor(persistent=true) tool call, or run standalone.
+#
+# Flags:
+#   --emit-backlog          Force-emit pre-existing unsuffixed files at startup
+#                           as `[mesh queued] cc: <filename>`. Default is to
+#                           seed silently. Mirror of mesh-watch-arm semantics
+#                           when you actually want the historical view.
+#   --interval <seconds>    Poll interval for fallback mode (default: 5).
+#                           Ignored in inotify mode.
+#   --self <agent>          Override agent shortname (default: derived from
+#                           $AGENT_URI or hostname).
+#   --help, -h              Show this help.
+#
+# Env:
+#   AGENT_URI   <agent>@mesh — used to derive /mesh/cc/<agent>/ path
+#   MESH_DIR    override mesh shared dir (default: $MESH_ROOT/mesh, else /mesh,
+#               else /mnt/agent-mesh/mesh)
+#   MESH_ROOT   filament mesh root (parent of mesh/)
+
+set -u
+
+EMIT_BACKLOG=0
+INTERVAL=5
+SELF_OVERRIDE=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --emit-backlog)
+            EMIT_BACKLOG=1
+            shift
+            ;;
+        --interval)
+            INTERVAL="$2"
+            shift 2
+            ;;
+        --self)
+            SELF_OVERRIDE="$2"
+            shift 2
+            ;;
+        --help|-h)
+            sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'
+            exit 0
+            ;;
+        *)
+            echo "mesh-cc-watch-arm: unknown arg: $1 (try --help)" >&2
+            exit 2
+            ;;
+    esac
+done
+
+# Resolve mesh dir
+if [[ -n "${MESH_DIR:-}" ]]; then
+    MESH_DIR="$MESH_DIR"
+elif [[ -n "${MESH_ROOT:-}" && -d "${MESH_ROOT}/mesh" ]]; then
+    MESH_DIR="${MESH_ROOT}/mesh"          # explicit root beats autodetect
+elif [[ -d /mesh ]]; then
+    MESH_DIR=/mesh
+elif [[ -d /mnt/agent-mesh/mesh ]]; then
+    MESH_DIR=/mnt/agent-mesh/mesh
+else
+    echo "mesh-cc-watch-arm: cannot resolve mesh dir (set MESH_DIR or MESH_ROOT)" >&2
+    exit 2
+fi
+
+# Resolve self
+if [[ -n "$SELF_OVERRIDE" ]]; then
+    SELF="$SELF_OVERRIDE"
+elif [[ -n "${AGENT_URI:-}" ]]; then
+    SELF="${AGENT_URI%@mesh}"
+else
+    SELF=$(hostname -s 2>/dev/null || hostname)
+fi
+
+CC_DIR="${MESH_DIR}/cc/${SELF}"
+
+if [[ ! -d "$CC_DIR" ]]; then
+    echo "mesh-cc-watch-arm: cc dir does not exist: $CC_DIR" >&2
+    echo "mesh-cc-watch-arm: (will keep retrying — peer agents may seed it later)" >&2
+fi
+
+# True-new = .md file whose name does NOT end in a processed-marker suffix.
+# Anything matching .read / .acked / .dup-* / .quarantine / .processed is skipped.
+is_truly_new() {
+    local name="$1"
+    case "$name" in
+        *.read|*.acked|*.quarantine|*.processed) return 1 ;;
+        *.dup-*) return 1 ;;
+        *.md) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+snapshot_cc() {
+    # All entries in the cc dir, sorted. Filtering happens at emit time so the
+    # snapshot itself is stable across runs even if marker suffixes get added.
+    if [[ -d "$CC_DIR" ]]; then
+        ls -1 "$CC_DIR" 2>/dev/null | sort
+    fi
+}
+
+emit_if_new() {
+    local name="$1"
+    if is_truly_new "$name"; then
+        echo "[mesh new] cc: ${name}"
+    fi
+}
+
+emit_if_queued() {
+    local name="$1"
+    if is_truly_new "$name"; then
+        echo "[mesh queued] cc: ${name}"
+    fi
+}
+
+# ---- startup: seed (and optionally emit backlog) ----
+LAST_CC=$(snapshot_cc)
+if [[ "$EMIT_BACKLOG" -eq 1 && -n "$LAST_CC" ]]; then
+    echo "$LAST_CC" | while read -r name; do
+        [ -n "$name" ] && emit_if_queued "$name"
+    done
+fi
+
+# ---- steady-state: prefer inotify, fall back to poll ----
+if command -v inotifywait >/dev/null 2>&1 && [[ -d "$CC_DIR" ]]; then
+    # Inotify mode — event-driven, no false positives. We still hold LAST_CC
+    # to dedupe `moved_to + close_write` pairs from atomic-rename writers.
+    inotifywait -m -q \
+        -e create -e moved_to -e close_write \
+        --format '%f' \
+        "$CC_DIR" 2>/dev/null | while read -r name; do
+        [ -z "$name" ] && continue
+        # de-dup: only emit if we haven't already seen this exact name in
+        # this run (a single mesh-send create+close_write fires twice).
+        if ! grep -qxF "$name" <<<"$LAST_CC"; then
+            emit_if_new "$name"
+            LAST_CC="$LAST_CC
+$name"
+        fi
+    done
+else
+    # Seeded-poll fallback — only emit deltas vs initial snapshot.
+    while true; do
+        sleep "$INTERVAL"
+        CUR_CC=$(snapshot_cc)
+        if [ -n "$LAST_CC" ] || [ -n "$CUR_CC" ]; then
+            NEW=$(comm -13 <(echo "$LAST_CC") <(echo "$CUR_CC") 2>/dev/null || true)
+            [ -n "$NEW" ] && echo "$NEW" | while read -r name; do
+                [ -n "$name" ] && emit_if_new "$name"
+            done
+        fi
+        LAST_CC="$CUR_CC"
+    done
+fi

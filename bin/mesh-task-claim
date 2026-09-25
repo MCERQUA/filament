@@ -7,7 +7,7 @@ Atomic claim uses mkdir sentinel (same pattern as inbox seq-slot allocation).
 Stdlib-only. Python 3.8+.
 
 Env:
-    AGENT_URI    required, e.g. bun-desktop@mesh
+    AGENT_URI    required, e.g. alice-desktop@mesh
     MESH_ROOT    optional, default /mnt/agent-mesh (host) or /mesh (container)
 
 Subcommands:
@@ -47,7 +47,7 @@ def die(msg: str, code: int = 3) -> None:
 def agent_name() -> str:
     uri = os.environ.get("AGENT_URI", "")
     if not uri.endswith("@mesh"):
-        die("AGENT_URI env var required (e.g. AGENT_URI=bun-desktop@mesh)")
+        die("AGENT_URI env var required (e.g. AGENT_URI=alice-desktop@mesh)")
     name = uri[:-len("@mesh")]
     if not re.fullmatch(r"[a-z0-9][a-z0-9\-]*", name):
         die(f"AGENT_URI agent name must be kebab-case, got: {name}")

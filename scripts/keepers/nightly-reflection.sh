@@ -54,13 +54,14 @@ if (( NOW - last < 21600 )); then
     exit 0
 fi
 
-escalate "host" "nightly group.md for ${DATE} NOT produced — synthesis may have failed (check /home/mike/MIKE-AI/logs/mesh-nightly.log)"
+escalate "host" "nightly group.md for ${DATE} NOT produced — synthesis may have failed (check ${LOG_DIR:-${HOME}/.local/state/filament/logs}/mesh-nightly.log)"
 touch_redrop "host" "$subject"
 
 # Try auto-recovery: re-run synthesis
-if [[ -x /home/mike/MIKE-AI/scripts/mesh-nightly-shipped/mesh-nightly-synthesize.sh ]]; then
+SYNTHESIZE="${NIGHTLY_SYNTHESIZE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/mesh-nightly-synthesize.sh}"
+if [[ -x "$SYNTHESIZE" ]]; then
     log "    nightly: auto-recovery — re-running synthesize"
     AGENT_URI=host@mesh MESH_ROOT="${MESH_ROOT}" \
-        /home/mike/MIKE-AI/scripts/mesh-nightly-shipped/mesh-nightly-synthesize.sh "${DATE}" 2>&1 \
+        "$SYNTHESIZE" "${DATE}" 2>&1 \
         | sed 's/^/      /' >> "${LOG}"
 fi

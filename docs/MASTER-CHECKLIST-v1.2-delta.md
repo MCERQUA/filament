@@ -9,12 +9,12 @@ last_updated: 2026-04-25
 applies_to:
   protocol: 2.1.2
   filament: v1.x (commit 453d004 or later)
-reviewers: [bun-desktop@mesh, josh-desktop@mesh, danielle-desktop@mesh, src-desktop@mesh, residential-laptop@mesh]
+reviewers: [alice-desktop@mesh, bob-desktop@mesh, dave-desktop@mesh, carol-desktop@mesh, remote-laptop@mesh]
 ---
 
 # Filament Mesh — Master Checklist v1.2
 
-v1.2 folds residential-laptop's review + drift findings from the cross-mesh
+v1.2 folds remote-laptop's review + drift findings from the cross-mesh
 self-validate matrix. v1.1 sections all carried forward; v1.2 changes
 documented below per section. See v1.1.md for the full prior baseline.
 
@@ -27,8 +27,8 @@ documented below per section. See v1.1.md for the full prior baseline.
   Host watchdog independently writes `mesh/HEARTBEAT/<agent>.last` for liveness
   inference. **Two-writer collision risk** if both become active simultaneously.
   Single source of truth needs an RFC.
-  - [VERIFY] `ssh <vps> stat -c '%y' /mnt/agent-mesh/mesh/HEARTBEAT/residential-laptop.last`
-  - [VERIFY local writer] `test -r /mnt/agent-mesh/agents/residential-laptop/status/heartbeat.txt && stat -c '%Y' $_`
+  - [VERIFY] `ssh <vps> stat -c '%y' /mnt/agent-mesh/mesh/HEARTBEAT/remote-laptop.last`
+  - [VERIFY local writer] `test -r /mnt/agent-mesh/agents/remote-laptop/status/heartbeat.txt && stat -c '%Y' $_`
 - **G4 (rewritten)** — `xprintidle` is NOT in default LSIO `webtop:ubuntu-kde`.
   Per W15 (apt non-persistence), permanent install requires host-side
   Dockerfile + rebuild. Without it, `node_status` stuck at `available`,
@@ -57,7 +57,7 @@ documented below per section. See v1.1.md for the full prior baseline.
   |---|---|---|---|
   | image-baked v0.1.0 (aiohttp) | `/opt/ovui/ovui_bridge.py` | `/healthz` (no auth) | NO `/tools` catalogue |
   | package v1.0.0 (FastAPI) | `/config/ovui-bridge/` | `/health` (auth required) | `/tools` returns 66+ |
-  - bun-desktop currently runs **v0.1.0** (image-baked). Phase-3-minimal
+  - alice-desktop currently runs **v0.1.0** (image-baked). Phase-3-minimal
     documentation expected v1.0.0. Drift item.
   - [VERIFY which one is active] `curl -sf http://127.0.0.1:8090/healthz | grep -q ok`
     (succeeds on v0.1.0); `curl -sf -H "X-Auth: Bearer $OVUI_BRIDGE_AUTH_TOKEN" http://127.0.0.1:8090/health` (succeeds on v1.0.0)
@@ -91,7 +91,7 @@ documented below per section. See v1.1.md for the full prior baseline.
 
 - **S9 (new)** — Agent provisioner MUST seed `~/private_context.md` (or
   `/agent-desk/private_context.md` for containers) on first provision.
-  Currently NOT seeded for residential or src-desktop. L5 mandate has no
+  Currently NOT seeded for residential or carol-desktop. L5 mandate has no
   enforcement gate today — provisioner gap.
 
 ### Section W — General invariants
@@ -125,17 +125,17 @@ documented below per section. See v1.1.md for the full prior baseline.
   refresh script ran (commit 453d004 fixes mesh-blocker exec bit; sudo refresh
   symlinked CLIs into /usr/local/bin/)
 - ✅ **PROTOCOL.md sync to 2.1.2** — synced from filament source + announced
-- ✅ **bun-desktop REGISTRY placeholder** — overwritten with canonical row
+- ✅ **alice-desktop REGISTRY placeholder** — overwritten with canonical row
 - ✅ **datetime.utcnow DeprecationWarning** — replaced across mesh-{ack,on,recv,send}
 - ✅ **host inbox mode** — fixed 1777 → 1733
 - ✅ **F28 OPEN SPEC** — closed via residential's recommendation (above)
 
 ## v1.2 PENDING items (carried to v1.3)
 
-- src-desktop install drift (B14/B15 + private_context.md missing)
+- carol-desktop install drift (B14/B15 + private_context.md missing)
 - xprintidle install on residential (Dockerfile rebuild required)
 - mesh-heartbeat s6 service status on residential (drift)
-- bridge version unification (image-baked v0.1.0 → package v1.0.0 on bun)
+- bridge version unification (image-baked v0.1.0 → package v1.0.0 on alice)
 - B18 schedule.md schema spec
 - G2 heartbeat-path single-source-of-truth RFC
 

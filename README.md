@@ -62,6 +62,7 @@ The full wire format -- message headers, kinds, lifecycle, security model -- is 
 |---|---|
 | [`bin/`](bin/) | The CLIs (`mesh-send`, `mesh-recv`, `mesh-ack`, `mesh-event`, `mesh-chat`, `mesh-jobs`, `mesh-semaphore`, `mesh-pipeline`, `mesh-blocker`, ...) |
 | [`scripts/`](scripts/) | Operator scripts (init, agent-add, rollover, rollup, blocker check, patch apply, nightly reflection, canvas dashboard) |
+| [`scripts/wake/`](scripts/wake/) | Dropping prompts into live agent sessions: tagged + ledgered wakes with submit verification, session shell, inbox wake filter |
 | [`systemd/`](systemd/) | Service + timer units for every periodic operator script |
 | [`mcp-server/`](mcp-server/) | MCP server -- exposes every CLI as a tool to AI agents |
 | [`skill/`](skill/) | Reusable agent skills (nightly reflection, more to come) |
@@ -78,8 +79,38 @@ The full wire format -- message headers, kinds, lifecycle, security model -- is 
 - **[CANVAS-DASHBOARD](docs/CANVAS-DASHBOARD.md)** -- self-updating status page
 - **[REFLECTION-PROTOCOL](docs/REFLECTION-PROTOCOL.md)** -- nightly multi-agent reflection cadence
 - **[CAPABILITIES-SCHEMA](docs/CAPABILITIES-SCHEMA.md)** -- how agents publish their installed tools
+- **[WAKE](docs/WAKE.md)** -- dropping prompts into agent sessions (tmux wakes, tags, ledger, verification)
 - **[contrib/docker/README](contrib/docker/README.md)** -- Docker deployment patterns
 - **[systemd/README](systemd/README.md)** -- timer unit installation + cron alternative
+
+## Dropping prompts into agent sessions
+
+Agents that run an interactive CLI (Claude Code and similar) inside tmux do not poll: once a
+turn ends they idle at the prompt until something types into the pane. A raw
+`tmux send-keys` is indistinguishable from the operator typing, and "I typed it" is not "it
+was submitted". [`scripts/wake/`](scripts/wake/) makes that seam safe:
+
+- **Tagged + ledgered.** Every machine-typed line carries `[wake:<producer>#<nonce>]`, and the
+  nonce is written to an append-only ledger (`$MESH_ROOT/mesh/LEDGER/wakes/<date>.jsonl`)
+  *before* the keys are sent. `wake-verify` flags forged, malformed, origin-spoofed and
+  untagged lines.
+- **Submit-verified.** `mesh-wake` refuses panes that are not running the agent, not at a
+  prompt, showing a modal, or holding a human's half-typed text; detects frozen panes
+  (no redraw); submits with `Enter` + `C-m`; and verifies on the CLI's **transcript**, not
+  the pane. Typed exits: 0 verified · 1 stuck · 2 refused · 3 wedged · 4 cannot-tell.
+- **Session shell.** `agent-session.sh` keeps one shared tmux session with a guarded-resume
+  respawn loop and an idempotent `/mesh-start` boot prompt.
+- **Wake only when owed.** `inbox-wake-filter.sh` separates WAKE-class arrivals (tasks,
+  questions, blockers, anything addressed to you) from FYIs that can wait, and
+  `inbox-watch.sh` turns the former into serialized, coalesced, verified wakes.
+
+```bash
+scripts/wake/mesh-wake --target agent-mesh --origin my-cron \
+    --text "new inbox file — run mesh-recv" \
+    --transcript-dir "$HOME/.claude/projects/-workspace"
+```
+
+Full guide: **[docs/WAKE.md](docs/WAKE.md)**.
 
 ## Use cases
 
@@ -93,9 +124,9 @@ Filament is designed for any deployment with multiple AI agents that need to coo
 
 ## Master Checklist (post-install verification)
 
-Single source of truth: `/mnt/agent-mesh/mesh/BLACKBOARD/master-checklist/LATEST.md`
-Mirror: `/home/mike/filament/docs/MASTER-CHECKLIST.md`
-JamBot copy: `/home/mike/MIKE-AI/docs/jambot/mesh-master-checklist.md`
+Single source of truth: `$MESH_ROOT/mesh/BLACKBOARD/master-checklist/LATEST.md`
+(e.g. `/mnt/agent-mesh/mesh/BLACKBOARD/master-checklist/LATEST.md`)
+Mirror in this repo: [`docs/MASTER-CHECKLIST.md`](docs/MASTER-CHECKLIST.md)
 
 23-section checklist (A-W) covering directory tree, CLIs, protocol compliance,
 watchdog/heartbeat, cron+timer, Layer 3, residential pool, HITL, patch/blocker

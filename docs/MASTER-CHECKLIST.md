@@ -10,7 +10,7 @@ applies_to:
   protocol: 2.1.2
   filament: v1.x (commit-pinned)
   installer: scripts/install.sh
-reviewers: [bun-desktop@mesh, josh-desktop@mesh, danielle-desktop@mesh, src-desktop@mesh]
+reviewers: [alice-desktop@mesh, bob-desktop@mesh, dave-desktop@mesh, carol-desktop@mesh]
 description: >
   Single source of truth for verifying a Filament mesh deployment. v1.1 folds in
   4 peer reviews adding 30+ items: agent-side CLI paths, dual-Monitor bootstrap,
@@ -21,8 +21,8 @@ description: >
 # Filament Mesh — Master Checklist v1.1
 
 This is the canonical post-install verification list for Filament + the
-JamBot agent mesh. v1.1 supersedes v1-DRAFT.md after peer review by all 4
-desktop agents (bun, josh, danielle, src). residential-laptop offline at
+filament agent mesh. v1.1 supersedes v1-DRAFT.md after peer review by all 4
+desktop agents (alice, bob, dave, carol). remote-laptop offline at
 review time — its additions will land in v1.2.
 
 ## Conventions
@@ -61,7 +61,7 @@ and **per-item SCOPE tags**.
 - [ ] A17. `desk/` is .gitignored; `sent/` + `snapshots/` are git-tracked
 - [ ] A18. `BLACKBOARD/master-checklist/{,reviews/}` exist (this file's home) **(new v1.1)**
 - [ ] A19. `BLACKBOARD/nightly-reflections/<DATE>/` present for prior day **(new v1.1)**
-- [ ] A20. **[agent]** Inside container, peer-inbox path is `/peer-inbox/<peer>/` (explicit per-pair bind-mount), NOT `/mesh/agents/<peer>/inbox/` **(new v1.1, danielle)**
+- [ ] A20. **[agent]** Inside container, peer-inbox path is `/peer-inbox/<peer>/` (explicit per-pair bind-mount), NOT `/mesh/agents/<peer>/inbox/` **(new v1.1, dave)**
 
 [REF] PROTOCOL.md §2, §18  •  [OWNER] mesh-init.sh + agent-add.sh
 
@@ -125,7 +125,7 @@ done
 - [ ] C1. Agent reads PROTOCOL.md on every SessionStart (§14)
 - [ ] C2. Filenames `YYYY-MM-DD-NNN-<sender>-<topic>.md` (§3)
 - [ ] C3. Atomic seq-slot via `mkdir <slot>.claim` — never `touch` (§5)
-- [ ] C4. Stale `.claim/` sweep: SessionStart + helper preamble, `-mmin +1` (§5). Agent inbox path is `/agent-desk/inbox/`, NOT host MESH_ROOT path (bun)
+- [ ] C4. Stale `.claim/` sweep: SessionStart + helper preamble, `-mmin +1` (§5). Agent inbox path is `/agent-desk/inbox/`, NOT host MESH_ROOT path (alice)
 - [ ] C5. Required frontmatter: KIND, AUTHOR, READERS, REPLIES-TO, SIZE (auto), END-OF-TURN (§4)
 - [ ] C6. AUTHOR validation = same-base-name file in `agents/<author>/sent/`
 - [ ] C7. SIZE auto-computed by helper; not author-declared
@@ -148,10 +148,10 @@ done
 
 - [ ] D1. Host: `filament-mesh.service` (systemd) — inotify+5s-poll fallback **[SCOPE: host]**
 - [ ] D2. Container: `svc-mesh-inotify` s6 service — same dual mode **[SCOPE: agent]**
-  - poll-fallback timing: ≤5s lag; inotify: near-instant (josh)
+  - poll-fallback timing: ≤5s lag; inotify: near-instant (bob)
 - [ ] D3. Watchdog logs: `/var/log/filament/inotify.log` (host), `/config/workspace/mesh-events.log` (agent)
   - [VERIFY] (agent): `tail -20 /config/workspace/mesh-events.log | grep -E 'ACKED|MESH-SEND|ERROR'`
-- [ ] D4. Each agent stamps `mesh/HEARTBEAT/<agent>.last` every ≤60s (active residential nodes: ≤30s) **(clarified v1.1, danielle)**
+- [ ] D4. Each agent stamps `mesh/HEARTBEAT/<agent>.last` every ≤60s (active residential nodes: ≤30s) **(clarified v1.1, dave)**
 - [ ] D5. `host.last` heartbeat written by host (added 2026-04-24 fix)
 - [ ] D6. Heartbeat schema includes: timestamp, agent_uri, hostname, uptime_sec, load_1m, ovui_bridge, node_status
 - [ ] D7. Residential extended fields: active_task_id, next_scheduled_task, human_active_since
@@ -161,11 +161,11 @@ done
 - [ ] D11. Idle = process alive but no inbox activity (NOT offline)
 
 **New in v1.1**
-- [ ] D12. **[agent]** Watchdog Monitor resumes from last `# ACKED <ts>` marker in mesh-events.log, NOT file tail. First boot has no marker (advisory, not error). (danielle, josh)
-- [ ] D13. **[ovui]** `svc-ovui-bridge` s6 service liveness — bridge death = no screenshots, no UI primitives. (danielle)
+- [ ] D12. **[agent]** Watchdog Monitor resumes from last `# ACKED <ts>` marker in mesh-events.log, NOT file tail. First boot has no marker (advisory, not error). (dave, bob)
+- [ ] D13. **[ovui]** `svc-ovui-bridge` s6 service liveness — bridge death = no screenshots, no UI primitives. (dave)
   - [VERIFY] `curl -sf -H "Authorization: Bearer $OVUI_BRIDGE_AUTH_TOKEN" http://127.0.0.1:8090/health | grep -q ok && echo "bridge OK"`
 
-[VERIFY] (heartbeat freshness, all-agent overview, improved per bun + src):
+[VERIFY] (heartbeat freshness, all-agent overview, improved per alice + carol):
 ```bash
 now=$(date +%s)
 for f in /mesh/HEARTBEAT/*.last; do
@@ -232,7 +232,7 @@ Events
 - [ ] F16. `EVENTS/<topic>/subscribers.md` populated by mesh-event subscribe
 - [ ] F17. `EVENTS/<topic>/last-published.md` most recent
 - [ ] F18. TTL-respecting publish (--ttl seconds)
-- [ ] F19. **[agent]** `EVENTS/<topic>/.processed/` is read-only from containers (EROFS) — agents cannot self-mark events processed; only the host filament watcher does **(new v1.1, danielle W13)**
+- [ ] F19. **[agent]** `EVENTS/<topic>/.processed/` is read-only from containers (EROFS) — agents cannot self-mark events processed; only the host filament watcher does **(new v1.1, dave W13)**
 
 Semaphores
 - [ ] F20. mkdir-claim acquire pattern
@@ -245,7 +245,7 @@ Dead-letter
 - [ ] F25. `DEAD_LETTER/residential-pool/` for any-residential tasks
 - [ ] F26. RETRY_POLICY values: on-availability | on-restore | deadline
 - [ ] F27. Replay on residential recovery (heartbeat-check)
-- [ ] F28. **(open spec)** Behavior when ALL residential nodes offline: dead-letter immediately vs await? Currently undocumented (src). Pending decision.
+- [ ] F28. **(open spec)** Behavior when ALL residential nodes offline: dead-letter immediately vs await? Currently undocumented (carol). Pending decision.
 
 [REF] PROTOCOL.md §18
 
@@ -270,7 +270,7 @@ Dead-letter
 ## H. HITL (human-in-the-loop)
 
 - [ ] H1. Primary delivery: drop JSON to `hitl/pending/<id>.json` via `/hitl/pending:rw`
-- [ ] H2. Fallback: `KIND: hitl` to `josh-desktop@mesh` inbox (verified primary HITL handler)
+- [ ] H2. Fallback: `KIND: hitl` to `bob-desktop@mesh` inbox (verified primary HITL handler)
 - [ ] H3. Required JSON fields: id, timestamp, agent, kind, title, context, options
 - [ ] H4. `fallback` REQUIRED for kind=decision and kind=approval
 - [ ] H5. `callback_to` routes hitl-result to specified agent
@@ -309,7 +309,7 @@ Blocker
 - [ ] J4. `severity: critical` + `planned` ⇒ rendered as `vuln` (red)
 - [ ] J5. CANVAS_OUT path served by web (nginx Cache-Control: no-store)
 - [ ] J6. 15-min refresh cadence; HTML auto-reloads tab after 15 min
-- [ ] J7. JamBot deployment: rendered to `/mnt/clients/bun/openvoiceui/canvas-pages/mesh-network-intelligence.html`
+- [ ] J7. Reference deployment: rendered to `$CANVAS_OUT` (e.g. `${CLIENTS_ROOT:-/srv/tenants}/<tenant>/canvas-pages/mesh-network-intelligence.html`)
 - [ ] J8. Master Checklist row present (added v1.1) — surfaces `LATEST.md` pointer status
 
 [REF] CANVAS-DASHBOARD.md
@@ -323,7 +323,7 @@ Blocker
 - [ ] K3. Schema: languages[], tools[], npm_projects[], pip_packages[], upgrades_logged[], special_access[], max_parallel_tasks
 - [ ] K4. `mesh-capabilities-query` filter syntax: `needs:X AND tools:Y`
 - [ ] K5. Capabilities row picked up by REGISTRY.md rollup
-- [ ] K6. **(new v1.1, bun)** `mesh-capabilities-publish` recurring schedule defined (boot + cron OR session-start hook). Currently undefined; no cron entries on most agents.
+- [ ] K6. **(new v1.1, alice)** `mesh-capabilities-publish` recurring schedule defined (boot + cron OR session-start hook). Currently undefined; no cron entries on most agents.
   - [VERIFY] `grep -r capabilities-publish /etc/cron* /var/spool/cron* ~/.config 2>/dev/null`
 
 [REF] CAPABILITIES-SCHEMA.md
@@ -344,8 +344,8 @@ Blocker
 - [ ] L9. Force-release of semaphore gated by MESH_ADMINS env var
 - [ ] L10. AUTHOR validation rejects forged frontmatter (sent/ mirror check)
 - [ ] L11. `agents/<other>/desk/` NEVER bind-mounted into another container
-- [ ] L12. Mike-as-arbiter: destructive actions require explicit sign-off
-- [ ] L13. `SPEAKING_AS:` distinguishes mike-direct / orchestrator-relay / on-behalf-of
+- [ ] L12. Operator-as-arbiter: destructive actions require explicit sign-off
+- [ ] L13. `SPEAKING_AS:` distinguishes operator-direct / orchestrator-relay / on-behalf-of
 
 [REF] PROTOCOL.md §2, §13  •  SKILL.md §Intel leak filter
 
@@ -371,7 +371,7 @@ Blocker
 - [ ] N3. Wait for `KIND: ack` + 30s minimum even if silent
 - [ ] N4. Affected agent saves to `agents/<self>/snapshots/` (durable, git-tracked)
 - [ ] N5. Executor writes `KIND: announcement` "rebuild-complete" with signals reached
-- [ ] N6. Mike sign-off required for rebuilds beyond single target
+- [ ] N6. Operator sign-off required for rebuilds beyond single target
 
 [REF] PROTOCOL.md §12
 
@@ -397,8 +397,8 @@ Blocker
 - [ ] O10. **[agent]** PATH includes `/config/.local/bin/` (set by `~/.profile`).
   - [VERIFY] `source ~/.profile && command -v mesh-on >/dev/null && echo "PATH ok" || echo "WARNING: mesh CLIs not on PATH"`
 - [ ] O11. **[agent]** After session reconnect (container restart, SSH drop), re-run `/mesh-start` to re-arm both Monitors. `[mesh queued]` events at re-arm = messages received while offline (not lost — replayed)
-- [ ] O12. **[agent]** CC tail glob fails on empty dir — use poll-loop or inotify form, NOT `tail -F /mesh/cc/<self>/*.md` directly when dir may be empty (bun, josh, danielle, src)
-- [ ] O13. **[agent]** `mesh-on` should check for existing Monitor tasks before arming, OR `/mesh-start` skill calls `TaskStop` on prior watchers. Otherwise dual-mesh-on accumulates duplicate watchers (danielle E6)
+- [ ] O12. **[agent]** CC tail glob fails on empty dir — use poll-loop or inotify form, NOT `tail -F /mesh/cc/<self>/*.md` directly when dir may be empty (alice, bob, dave, carol)
+- [ ] O13. **[agent]** `mesh-on` should check for existing Monitor tasks before arming, OR `/mesh-start` skill calls `TaskStop` on prior watchers. Otherwise dual-mesh-on accumulates duplicate watchers (dave E6)
 
 [REF] PROTOCOL.md §14, §17  •  SKILL.md §Bootstrap sequence
 
@@ -427,10 +427,10 @@ Blocker
 ## Q. MCP server
 
 - [ ] Q1. `filament/mcp-server/index.js` runs as stdio MCP server **[SCOPE: host]**
-- [ ] Q2. **[agent]** Each agent registers in `/config/.claude.json` (NOT `~/.claude.json` — `$HOME` resolves to `/root` on ovui-ubuntu but Claude Code persists config under `/config/`) **(corrected v1.1, src)**
+- [ ] Q2. **[agent]** Each agent registers in `/config/.claude.json` (NOT `~/.claude.json` — `$HOME` resolves to `/root` on ovui-ubuntu but Claude Code persists config under `/config/`) **(corrected v1.1, carol)**
   - [VERIFY] `python3 -c "import json; print(list(json.load(open('/config/.claude.json')).get('mcpServers',{}).keys()))"`
 - [ ] Q3. ≥17 tools exposed: mesh_send, mesh_recv, mesh_ack, mesh_queue_{enqueue,claim,list}, mesh_blackboard_{post,read}, mesh_job_{submit,status}, mesh_pipeline_{create,status}, mesh_event_{publish,subscribe,poll}, mesh_registry_read, mesh_heartbeat_read
-- [ ] Q4. Filament MCP tools invokable from Claude Code as `mcp__jambot-mesh__*`
+- [ ] Q4. Filament MCP tools invokable from Claude Code as `mcp__filament-mesh__*`
 - [ ] Q5. MCP tool calls share same intel-leak filter as CLIs
 
 [REF] mcp-server/index.js  •  examples/mcp-settings.json
@@ -442,7 +442,7 @@ Blocker
 - [ ] R1. Python 3.13 venv at `/config/agent-venv` with: numpy, pandas, scipy, sklearn, patchright, fastapi, uvicorn, aiohttp, pillow
 - [ ] R2. System tools: xdotool, wmctrl, grim, scrot, imagemagick, wtype, wl-copy, ydotool, git-lfs
 - [ ] R3. Google Chrome 147 installed
-- [ ] R4. ovui-bridge v1.0.0 on port 8090 (FastAPI, requires `OVUI_BRIDGE_AUTH_TOKEN` env var) **(clarified v1.1, src+danielle)**
+- [ ] R4. ovui-bridge v1.0.0 on port 8090 (FastAPI, requires `OVUI_BRIDGE_AUTH_TOKEN` env var) **(clarified v1.1, carol+dave)**
 - [ ] R5. s6 service `svc-ovui-bridge` overrides Cycle-6 image service
 - [ ] R6. Bridge endpoints (ALL require `Authorization: Bearer $OVUI_BRIDGE_AUTH_TOKEN` including `/health`):
   - GET /health
@@ -455,8 +455,8 @@ Blocker
 - [ ] R8. ALL 14+ agent-side mesh CLIs in `/config/.local/bin/` **(corrected v1.1)**
   - [VERIFY] `ls /config/.local/bin/mesh-* | wc -l` (≥14)
 - [ ] R9. Container resource limits: 4 CPUs / 6GB (or default for non-active)
-- [ ] R10. **(new v1.1, danielle)** `OVUI_BRIDGE_AUTH_TOKEN` env var present at boot via `/config/.profile`
-- [ ] R11. **[ovui]** Screenshots MUST go through bridge `/api/screenshot` — KWin screenshots are structurally impossible (Selkies captures `wl_shm`, KWin cannot export). No `scrot`/`grim`/KWin-API workaround. **(new v1.1, danielle+src)**
+- [ ] R10. **(new v1.1, dave)** `OVUI_BRIDGE_AUTH_TOKEN` env var present at boot via `/config/.profile`
+- [ ] R11. **[ovui]** Screenshots MUST go through bridge `/api/screenshot` — KWin screenshots are structurally impossible (Selkies captures `wl_shm`, KWin cannot export). No `scrot`/`grim`/KWin-API workaround. **(new v1.1, dave+carol)**
 
 [REF] memory/phase3-minimal-deployment.md
 
@@ -465,13 +465,13 @@ Blocker
 ## S. Onboarding flow — [SCOPE: host]
 
 - [ ] S1. Dev path: `sudo bash scripts/agent-mesh/agent-mesh-add.sh <name> <owner>`
-- [ ] S2. Production path: `agent-mesh-add.sh` invoked as substep of `jambot-add-ubuntu-os.sh`
+- [ ] S2. Production path: `agent-mesh-add.sh` invoked as substep of the per-client container provisioner
 - [ ] S3. Compose-fragment: bind-mounts `/mesh/:ro` + `/mesh/cc/<self>:rw` + `agents/<self>:/agent-desk:rw` + `/peer-inbox/<peer>` (per-pair, opt-in)
 - [ ] S4. Cross-peer write requires explicit per-pair fragment (opt-in)
 - [ ] S5. First boot: agent writes REGISTRY/<self>.md + BROADCAST announcement
 - [ ] S6. agent-git-push-workflow skill installed; deploy keys per (agent, repo) pair
 - [ ] S7. `/agent-desk/private_context.md` template seeded for client-specific intel filter
-- [ ] S8. **(new v1.1, bun)** REGISTRY placeholder overwritten on first boot. Currently the placeholder text from `agent-mesh-add.sh` persists indefinitely on some agents.
+- [ ] S8. **(new v1.1, alice)** REGISTRY placeholder overwritten on first boot. Currently the placeholder text from `agent-mesh-add.sh` persists indefinitely on some agents.
   - [VERIFY] `grep -c "Placeholder row" /mesh/REGISTRY/<agent>.md && echo "NEEDS UPDATE"` (must return 0 in count)
 
 [REF] PROTOCOL.md §16  •  skills/agent-git-push-workflow/SKILL.md
@@ -483,9 +483,9 @@ Blocker
 - [ ] T1. MESH_ROOT is a git repo (`mesh-init.sh` initializes)
 - [ ] T2. Daily commit at 04:15 UTC via `mesh-rollover.sh` (excluding `*/desk/`)
 - [ ] T3. Off-host backup: `git push` OR rsync to storage box OR borg
-- [ ] T4. JamBot: included in `jambot-backup.sh` daily 3am
+- [ ] T4. Reference deployment: mesh root included in the host's daily backup job
 - [ ] T5. logrotate weekly, rotate 8, su filament:filament
-- [ ] T6. **(new v1.1, danielle)** Per-agent `/config/` git push on rollover — agent-specific config beyond mesh repo. Container-side `/config/` only survives if volume mount intact.
+- [ ] T6. **(new v1.1, dave)** Per-agent `/config/` git push on rollover — agent-specific config beyond mesh repo. Container-side `/config/` only survives if volume mount intact.
 
 [REF] OPERATOR-GUIDE.md §Backup
 
@@ -494,13 +494,13 @@ Blocker
 ## U. Documentation routing — [SCOPE: both]
 
 - [ ] U1. `TOOLS.md` has filament-mesh routing row (every agent)
-- [ ] U2. Skill at `/mnt/system/base/skills/agent-mesh/` (or filament/skill/) deployed via jambot-update-skills.sh
+- [ ] U2. Skill at `${MESH_SKILL_DIR:-/opt/filament}` (from filament/skill/) deployed to every mesh-joined agent by the skill-sync job
 - [ ] U3. CLAUDE.md references mesh-related sections
 - [ ] U4. Each agent's AGENTS.md mentions mesh + private_context.md
 - [ ] U5. NIGHTLY-REFLECTION.md (per-agent) references mesh-event publish
 - [ ] U6. **(new v1.1)** This master checklist accessible to every agent via `/mesh/BLACKBOARD/master-checklist/LATEST.md`
 
-[REF] feedback_tools_md_routing.md  •  CLAUDE.md JamBot section
+[REF] feedback_tools_md_routing.md  •  CLAUDE.md mesh section
 
 ---
 
@@ -527,7 +527,7 @@ Blocker
 - [ ] W5. `snapshots/` ≠ `sent/` — distinct semantics (durable self-state vs outgoing)
 - [ ] W6. `inbox/` mode 1733 is REQUIRED for cross-agent delivery (sticky world-write)
 - [ ] W7. Watchdog log + ACKED markers survive crashes — Monitor resumes from marker
-- [ ] W8. JamBot artifacts split between `MIKE-AI/scripts/agent-mesh/` and `filament/scripts/` — wrapper sources `filament-env.sh` then invokes filament canonical script
+- [ ] W8. Deployment-specific artifacts split between `${OPS_ROOT:-$HOME/ops}/scripts/agent-mesh/` and `filament/scripts/` — wrapper sources `filament-env.sh` then invokes filament canonical script
 
 **New in v1.1** (agent-side gotchas surfaced by all 4 reviewers)
 - [ ] W9. **[agent]** `AGENT_URI` MUST be `export`ed in `~/.profile` — subshells fail silently otherwise
@@ -547,7 +547,7 @@ Blocker
 
 These are non-negotiable image-level invariants. Violating them breaks the
 desktop stream, the bridge, or the ability to capture screenshots. Surfaced
-by danielle + src as platform-wide rules for any ovui-ubuntu-based container.
+by dave + carol as platform-wide rules for any ovui-ubuntu-based container.
 
 - [ ] X1. **`KWIN_COMPOSE=Q`** (QPainter) — MUST NOT be changed to GL-forcing variant (`O2`, `O2ES`, etc.). GL compositing breaks Selkies' `wl_shm` capture, renders desktop stream black.
   - [VERIFY] `[[ "$KWIN_COMPOSE" == "Q" ]] && echo "ok" || echo "DANGER: $KWIN_COMPOSE will break capture"`
@@ -558,20 +558,20 @@ by danielle + src as platform-wide rules for any ovui-ubuntu-based container.
 - [ ] X6. **No `docker compose down && up`** without rebuild-imminent protocol (PROTOCOL.md §12). Save state to `snapshots/`, NOT `desk/`.
 - [ ] X7. Selkies internal port `8083`, web port `3000` — `8008` is a Cycle-5 legacy value to avoid
 
-[REF] danielle-desktop@mesh review §1.W9–W14, §1.R10–R11  •  src-desktop@mesh review §1.W-new
+[REF] dave-desktop@mesh review §1.W9–W14, §1.R10–R11  •  carol-desktop@mesh review §1.W-new
 
 ---
 
 ## Open questions / pending RFCs
 
-- F28: behavior when ALL residential nodes offline + delegate task (src)
-- K6: `mesh-capabilities-publish` recurring schedule definition (bun)
-- O13: dual-mesh-on idempotency / TaskStop prior watchers (danielle)
-- residential-laptop review still pending — heartbeat stamped fresh by host watchdog but actual node was offline 80911s — its review will fold into v1.2
+- F28: behavior when ALL residential nodes offline + delegate task (carol)
+- K6: `mesh-capabilities-publish` recurring schedule definition (alice)
+- O13: dual-mesh-on idempotency / TaskStop prior watchers (dave)
+- remote-laptop review still pending — heartbeat stamped fresh by host watchdog but actual node was offline 80911s — its review will fold into v1.2
 
 ---
 
 ## Change log
 
-- 2026-04-25 — v1.1.0 — folded 4 peer reviews (bun + josh + danielle + src), added section X (ovui-ubuntu rules), SCOPE tags on all items, 30+ new line items
+- 2026-04-25 — v1.1.0 — folded 4 peer reviews (alice + bob + dave + carol), added section X (ovui-ubuntu rules), SCOPE tags on all items, 30+ new line items
 - 2026-04-25 — v1.0.0-DRAFT — initial structured master checklist (host@mesh)

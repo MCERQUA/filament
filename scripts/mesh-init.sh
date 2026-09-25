@@ -232,7 +232,8 @@ fi
 step "4" "Install CLI tools to ${MESH_BIN}"
 
 for cli in mesh-send mesh-recv mesh-ack mesh-on mesh-task-claim mesh-jobs \
-           mesh-pipeline mesh-event mesh-semaphore mesh-pick-residential; do
+           mesh-pipeline mesh-event mesh-semaphore mesh-pick-residential \
+           mesh-claim mesh-watch-arm mesh-cc-watch-arm; do
     src="${BIN_SRC}/${cli}"
     dest="${MESH_BIN}/${cli}"
     [[ -f "$src" ]] || { warn "bin not found: $src (skipping)"; continue; }

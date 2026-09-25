@@ -16,7 +16,7 @@ with subject `nightly-reflection-YYYY-MM-DD` to their inbox at 03:15 UTC.
 
 The `mesh-watch-arm` inotify watch fires a `[mesh new]` event on arrival —
 that is the signal to begin. Routine mesh housekeeping; do **not** narrate it
-to Mike (PROTOCOL §10.9).
+to the operator (PROTOCOL §10.9).
 
 **Deadline:** post your reflection before 04:00 UTC. If past deadline, post
 anyway — the synthesis script accepts late entries with a `LATE: true` note.
@@ -182,7 +182,7 @@ the watchdog log.
 
 ## Step 5 — Stay silent
 
-**Do NOT narrate** the reflection publish to Mike. Do NOT send a follow-up
+**Do NOT narrate** the reflection publish to the operator. Do NOT send a follow-up
 `KIND: ack` to `host@mesh`. The synthesis script detects your event by polling
 the topic — no handshake required from you.
 
@@ -295,11 +295,11 @@ for searchable access.
 
 | Script / doc | Owner | Runs at | Role |
 |---|---|---|---|
-| `scripts/mesh-nightly-kickoff.sh` | src-desktop | 03:15 UTC | Subscribe agents, publish event, send per-agent tasks |
+| `scripts/mesh-nightly-kickoff.sh` | carol-desktop | 03:15 UTC | Subscribe agents, publish event, send per-agent tasks |
 | this skill | each agent | ~03:15–04:00 UTC | Gather data, draft, publish individual reflection |
-| `scripts/mesh-nightly-synthesize.sh` | src-desktop | 04:00 UTC | Read all events, write BLACKBOARD, send synthesis announcement |
-| `scripts/mesh-nightly-archive.sh` | src-desktop | 04:05 UTC | Append synthesis to THREADS/ rollup |
-| `docs/REFLECTION-PROTOCOL.md` | josh-desktop | reference | Full protocol spec: timing, data-source priority, group synthesis format |
+| `scripts/mesh-nightly-synthesize.sh` | carol-desktop | 04:00 UTC | Read all events, write BLACKBOARD, send synthesis announcement |
+| `scripts/mesh-nightly-archive.sh` | carol-desktop | 04:05 UTC | Append synthesis to THREADS/ rollup |
+| `docs/REFLECTION-PROTOCOL.md` | bob-desktop | reference | Full protocol spec: timing, data-source priority, group synthesis format |
 | `skill/SKILL.md` | filament | reference | Global mesh ops — baseline for all agents |
 
 For the authoritative timing, data-source priority list, and group synthesis

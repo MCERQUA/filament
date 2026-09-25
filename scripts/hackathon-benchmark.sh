@@ -2,7 +2,7 @@
 # hackathon-benchmark.sh — uniform measurement for OVUI-Lite submissions.
 #
 # Usage:
-#   AGENT=bun-desktop bash hackathon-benchmark.sh "<launch-cmd>"
+#   AGENT=alice-desktop bash hackathon-benchmark.sh "<launch-cmd>"
 #
 # Measures:
 #   - cold-start time (wall-clock until process is ready)
@@ -20,7 +20,7 @@
 
 set -uo pipefail
 
-AGENT="${AGENT:?AGENT env required (e.g. AGENT=bun-desktop)}"
+AGENT="${AGENT:?AGENT env required (e.g. AGENT=alice-desktop)}"
 LAUNCH_CMD="${1:?usage: $0 \"<launch-cmd>\"}"
 OUT_DIR="/mnt/agent-mesh/mesh/BLACKBOARD/ovui-lite/submissions/${AGENT}"
 mkdir -p "${OUT_DIR}"

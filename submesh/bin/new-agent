@@ -1,8 +1,11 @@
 #!/bin/bash
 # new-agent <name> [type] [context]
-# Assigns a real desk slot (josh-desk-N or ubuntu-desk-N), generates
+# Assigns a real desk slot (<PREFIX>-N@mesh, see desk-prefix.sh), generates
 # a concrete CLAUDE.md with slot-specific inbox paths, and starts
 # Claude Code with full mesh env set. Agents are autonomous from first keystroke.
+
+# In-container home of the submesh (webtop convention: /config). Override for other layouts.
+SUBMESH_HOME="${SUBMESH_HOME:-/config}"
 
 NAME="$1"
 TYPE="${2:-general}"
@@ -15,22 +18,42 @@ if [ -z "$NAME" ]; then
 fi
 
 SESSION="submesh"
-CLAUDE=/config/.local/bin/claude
-TEMPLATES=/config/submesh-templates
-AGENT_DIR=/config/submesh/agents/$NAME
-SLOTS_FILE=/config/submesh/slots
+CLAUDE=${SUBMESH_HOME}/.local/bin/claude
+TEMPLATES=${SUBMESH_HOME}/submesh-templates
+AGENT_DIR=${SUBMESH_HOME}/submesh/agents/$NAME
+SLOTS_FILE=${SUBMESH_HOME}/submesh/slots
 
-# -- detect desk prefix from hostname --
-HN=$(hostname 2>/dev/null || cat /etc/hostname 2>/dev/null)
-if echo "$HN" | grep -qi "josh"; then
-    PREFIX="josh-desk"
-elif echo "$HN" | grep -qi "ubuntu"; then
-    PREFIX="ubuntu-desk"
+# -- detect desk prefix --
+#
+# CROSS-DESK IDENTITY COLLISION (fixed upstream 2026-08). The old chain matched hostname
+# SUBSTRINGS generic-last, and every desktop container's hostname shared a common base, so
+# two desktops minted workers into ANOTHER desktop's slot namespace while writing into
+# their own mounts — measured, not hypothetical: two desks both held
+# `2:worker-1 3:worker-2 4:worker-3`, i.e. both claimed the same <prefix>-2/3/4@mesh.
+# AGENT_URI is the authoritative identity and is set per desk, so it is preferred; the
+# hostname is only a fallback, and is matched MOST-SPECIFIC-FIRST (see desk-prefix.sh).
+# Sourced from desk-prefix.sh so all five tools share ONE definition. Keeping a
+# corrected inline copy here would rebuild the exact condition that caused the bug:
+# four divergent copies of one rule, of which fixing one looks like fixing the rule.
+if [ -r "${0%/*}/desk-prefix.sh" ]; then
+    . "${0%/*}/desk-prefix.sh"
 else
-    PREFIX="desk"
+    # minimal fallback — keep in step with desk-prefix.sh resolution order
+    case "${AGENT_URI:-}" in
+        *-desktop@*) PREFIX="${AGENT_URI%%-desktop@*}-desk" ;;
+        *)           PREFIX="desk" ;;
+    esac
+    [ -n "${SUBMESH_DESK_PREFIX:-}" ] && PREFIX="$SUBMESH_DESK_PREFIX"
 fi
 
-mkdir -p "$AGENT_DIR/workspace" "$AGENT_DIR/memory" /config/submesh
+# Refuse BEFORE touching the slots file or agent dir: checking after the slot was recorded left a
+# phantom "N:name" entry behind on every failed start, and that slot then read as taken.
+if ! tmux has-session -t="$SESSION" 2>/dev/null; then
+    echo "Sub-mesh not running. Use start-submesh first."
+    exit 1
+fi
+
+mkdir -p "$AGENT_DIR/workspace" "$AGENT_DIR/memory" ${SUBMESH_HOME}/submesh
 
 # -- assign a numbered slot (1=manager, 2-4=workers) --
 # slot file: each line is "N:agentname"
@@ -119,6 +142,17 @@ mkdir -p "$AGENT_DIR/workspace/.claude"
 cat > "$AGENT_DIR/workspace/.claude/settings.json" << SETTINGS
 {
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${SUBMESH_HOME}/mesh-tools/bin/render-guard.py"
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": ".*",
@@ -146,20 +180,29 @@ SETTINGS
 
 CMD="export AGENT_URI=${AGENT_URI}; export MESH_INBOX=${MESH_INBOX}; export DESK_SLOT=${SLOT}; cd $AGENT_DIR/workspace; $CLAUDE --dangerously-skip-permissions"
 
-if ! tmux has-session -t "$SESSION" 2>/dev/null; then
-    echo "Sub-mesh not running. Use start-submesh first."
-    exit 1
-fi
 
 # -- place in empty grid slot or overflow window --
 FILLED=false
+# A pane is FREE only if BOTH hold: it shows the "Slot N ready" marker AND its foreground
+# process is a plain shell. The marker alone is not enough — it stays on screen after an
+# agent starts in that pane, and typing a second launch command into a running agent's
+# prompt is far worse than opening an overflow window. `clear` wipes the marker as the
+# agent launches so the next new-agent cannot mistake this pane for a free one.
+# A pane already tagged @submesh_agent (see stop-submesh) is never free.
 for PANE in 1 2 3; do
+    TAG=$(tmux display-message -p -t "$SESSION:grid.$PANE" '#{@submesh_agent}' 2>/dev/null)
+    [ -n "$TAG" ] && continue
+    FG=$(tmux display-message -p -t "$SESSION:grid.$PANE" '#{pane_current_command}' 2>/dev/null)
+    case "$FG" in bash|sh|zsh|dash|fish) ;; *) continue ;; esac
     CONTENT=$(tmux capture-pane -t "$SESSION:grid.$PANE" -p 2>/dev/null | grep -c "Slot.*ready" || true)
     if [ "$CONTENT" -gt 0 ]; then
-        tmux send-keys -t "$SESSION:grid.$PANE" "q" ""
-        tmux send-keys -t "$SESSION:grid.$PANE" "" ""
-        tmux send-keys -t "$SESSION:grid.$PANE" "$CMD" Enter
-        echo "Agent '${NAME}' (${AGENT_URI}) started in grid slot $((PANE+1))."
+        # C-u clears any half-typed input. (This used to send a literal "q", which the shell
+        # glued onto the launch line — "qexport AGENT_URI=..." — so the FIRST export failed
+        # and the worker silently inherited the session-level AGENT_URI: the manager's.)
+        tmux send-keys -t "$SESSION:grid.$PANE" C-u
+        tmux set-option -p -t "$SESSION:grid.$PANE" @submesh_agent "$NAME"
+        tmux send-keys -t "$SESSION:grid.$PANE" "clear; $CMD" Enter
+        echo "Agent '${NAME}' (${AGENT_URI}) started in grid pane ${PANE} (slot ${SLOT})."
         FILLED=true
         break
     fi
@@ -170,7 +213,7 @@ if [ "$FILLED" = false ]; then
         -e "AGENT_URI=${AGENT_URI}" \
         -e "MESH_INBOX=${MESH_INBOX}" \
         -e "DESK_SLOT=${SLOT}" \
-        -e "PATH=/config/.local/bin:/usr/local/bin:/usr/bin:/bin"
+        -e "PATH=${SUBMESH_HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin"
     tmux send-keys -t "$SESSION:$NAME" "$CMD" Enter
     echo "Agent '${NAME}' (${AGENT_URI}) started in overflow window."
     echo "Use: join-submesh $NAME"

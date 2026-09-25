@@ -14,6 +14,9 @@ Stdlib-only.
 Env:
     AGENT_URI    required
     MESH_ROOT    optional
+    MESH_INBOX   optional — this agent's inbox dir, wins over every guess
+    MESH_LOG     optional — watchdog log path
+    MESH_SESSION_START_READ_CAP  optional — per-file char cap for SESSION-START-READS.txt (12000)
 
 Usage:
     mesh-on                 # full bootstrap
@@ -45,25 +48,79 @@ def agent_name() -> str:
         die("AGENT_URI env var required (e.g. AGENT_URI=host@mesh)")
     if not uri.endswith("@mesh"):
         die(f"AGENT_URI must end with @mesh, got: {uri}")
-    return uri[: -len("@mesh")]
+    # Strip EVERY @mesh, not just the last one. A single-suffix strip here, while another
+    # normaliser in the same run used a global replace, made the two disagree on a doubled
+    # URI ("x@mesh@mesh") — and anything written through verbatim (a filename AND the agent
+    # field inside it) came out consistently wrong. Why it stayed invisible: a
+    # filename-vs-field consistency check PASSES on that file. Consistency between two
+    # derived values is satisfied by both failure modes, so it can never be the check that
+    # catches either.
+    name = uri.replace("@mesh", "")
+    if not name:
+        die(f"AGENT_URI has no agent name: {uri}")
+    if uri.count("@mesh") > 1:
+        print(f"mesh-on: WARNING - AGENT_URI has a doubled @mesh suffix ({uri}); "
+              f"normalised to {name}@mesh for this run. The env is corrupt upstream and "
+              f"mesh-send will FAIL CLOSED on it, so this lane's alarms cannot be heard. "
+              f"Fix the invoker.",
+              file=sys.stderr)
+    return name
+
+
+def resolve_my_desk_dir() -> Path:
+    """Return this agent's own desk-root directory. See mesh-recv's identical
+    helper for the full rationale; kept in sync by hand (stdlib-only tools,
+    no shared import). Order: MESH_ROOT override -> desk-N mount matching
+    AGENT_URI's own "-desk-<N>" suffix -> bare /agent-desk (only with no
+    desk-N suffix) -> host path.
+    """
+    override = os.environ.get("MESH_ROOT")
+    if override:
+        return Path(override) / "agents" / agent_name()
+
+    name = agent_name()
+    m = re.match(r"^(.+)-desk-(\d+)$", name)
+    if m:
+        desk_n_dir = Path(f"/agent-desk-{m.group(2)}")
+        if desk_n_dir.is_dir():
+            return desk_n_dir
+    elif Path("/agent-desk").is_dir():
+        return Path("/agent-desk")
+
+    if Path("/mnt/agent-mesh").is_dir():
+        return Path("/mnt/agent-mesh/agents") / name
+
+    die("cannot discover mesh root — set MESH_ROOT")
+
+
+def _host_log_path() -> Path:
+    """Watchdog log on a host. MESH_LOG wins; /var/log/jambot-mesh-inotify.log is a LEGACY
+    name, used only when it already exists and the new name does not."""
+    if os.environ.get("MESH_LOG"):
+        return Path(os.environ["MESH_LOG"])
+    new, legacy = Path("/var/log/filament-mesh.log"), Path("/var/log/jambot-mesh-inotify.log")
+    return legacy if (legacy.exists() and not new.exists()) else new
 
 
 def discover_roots() -> tuple[Path, Path, Path]:
-    """Return (mesh_dir, my_dir, watchdog_log_path)."""
+    """Return (mesh_dir, my_dir, watchdog_log_path).
+
+    On a container that bind-mounts BOTH /agent-desk (the parent agent's desk) and
+    /agent-desk-<N> (this desk's own), the old check `Path("/agent-desk").is_dir()`
+    matched FIRST unconditionally, so every "-desk-N" identity silently swept and read
+    another agent's claims/inbox. my_dir now goes through resolve_my_desk_dir().
+    """
     override = os.environ.get("MESH_ROOT")
     if override:
         root = Path(override)
-        return root / "mesh", root / "agents" / agent_name(), Path("/var/log/jambot-mesh-inotify.log")
+        return root / "mesh", root / "agents" / agent_name(), _host_log_path()
 
-    if Path("/agent-desk").is_dir() and Path("/mesh").is_dir():
-        return Path("/mesh"), Path("/agent-desk"), Path("/config/workspace/mesh-events.log")
+    my_dir = resolve_my_desk_dir()
+    if my_dir != Path("/mnt/agent-mesh/agents") / agent_name() and Path("/mesh").is_dir():
+        return Path("/mesh"), my_dir, Path(os.environ.get("MESH_LOG") or "/config/workspace/mesh-events.log")
 
     if Path("/mnt/agent-mesh").is_dir():
-        return (
-            Path("/mnt/agent-mesh/mesh"),
-            Path("/mnt/agent-mesh/agents") / agent_name(),
-            Path("/var/log/jambot-mesh-inotify.log"),
-        )
+        return Path("/mnt/agent-mesh/mesh"), my_dir, _host_log_path()
 
     die("cannot discover mesh root — set MESH_ROOT")
 
@@ -298,7 +355,7 @@ def main() -> None:
     print(f"mesh-on: PROTOCOL.md version {version} (mtime {mt_iso})")
 
     # ---- 3. Inbox summary ----
-    inbox = my_dir / "inbox"
+    inbox = Path(os.environ["MESH_INBOX"]) if os.environ.get("MESH_INBOX") else my_dir / "inbox"
     stats = list_inbox_summary(inbox, args.quiet)
     print(f"mesh-on: {stats['unread']} unread / {stats['read']} acked in {inbox}")
     if not args.quiet and stats["files"]:
@@ -309,10 +366,17 @@ def main() -> None:
 
     # ---- 4. cc/<self>/ summary ----
     cc_dir = mesh_dir / "cc" / agent_name()
-    cc_count = 0
-    if cc_dir.is_dir():
+    # THREE VERDICTS, NOT TWO. `if cc_dir.is_dir(): count(...)` left cc_count at its init 0
+    # when the directory did not exist, so A MISSING cc DIRECTORY AND AN EMPTY ONE PRINTED THE
+    # SAME CONFIDENT ZERO. Measured: a banner read "0 cc'd in /mesh/cc/x@mesh" — a path that has
+    # never existed (the URI was doubled) — while the real dir held unread cc traffic. A
+    # detector whose "nothing here" is indistinguishable from "I could not look" is a defect.
+    if not cc_dir.is_dir():
+        print(f"mesh-on: cc dir MISSING — {cc_dir} does not exist (NOT the same as 0 cc'd; "
+              f"check AGENT_URI is not doubled)")
+    else:
         cc_count = sum(1 for e in cc_dir.iterdir() if e.is_file() and e.suffix == ".md")
-    print(f"mesh-on: {cc_count} cc'd in {cc_dir}")
+        print(f"mesh-on: {cc_count} cc'd in {cc_dir}")
 
     # ---- 5. Registry peers ----
     registry_file = mesh_dir / "REGISTRY.md"
@@ -355,6 +419,37 @@ def main() -> None:
         print(f"mesh-on: last ack-marker: {last_ack}")
     else:
         print("mesh-on: no prior ack-marker found for this agent — full replay recommended")
+
+    # ---- 7b. SESSION-START READS ----
+    # A file that says "read at session start, every session" is a convention until something
+    # opens it. Measured: a manager's OPEN-HOLDS.md said exactly that; nothing carried the
+    # instruction; 4 of 18 holds went materially stale. This is the construction: a lane lists
+    # the files its session must open in <its desk>/SESSION-START-READS.txt (one path per line,
+    # as the lane sees it, # comments allowed) and mesh-on prints each one here — the agent
+    # cannot skip a file that is already in front of it. Capped per file so a runaway register
+    # cannot flood the boot; a MISSING file is said out loud, never silently skipped.
+    _ssr = my_dir / "SESSION-START-READS.txt"
+    if _ssr.is_file():
+        _cap = int(os.environ.get("MESH_SESSION_START_READ_CAP", "12000"))
+        _lines = [l.strip() for l in _ssr.read_text(encoding="utf-8", errors="replace").splitlines()]
+        _paths = [l for l in _lines if l and not l.startswith("#")]
+        print(f"mesh-on: SESSION-START READS — {len(_paths)} file(s) declared in {_ssr}")
+        for _p in _paths:
+            _fp = Path(os.path.expandvars(os.path.expanduser(_p)))
+            if not _fp.is_file():
+                print(f"mesh-on: === SESSION-START READ MISSING: {_p} (declared, not found from this lane) ===")
+                continue
+            try:
+                _txt = _fp.read_text(encoding="utf-8", errors="replace")
+            except Exception as _e:  # noqa: BLE001
+                print(f"mesh-on: === SESSION-START READ UNREADABLE: {_p} ({_e}) ===")
+                continue
+            _mt = _dt.datetime.fromtimestamp(_fp.stat().st_mtime, tz=_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            print(f"mesh-on: === SESSION-START READ: {_p} ({len(_txt)} chars, mtime {_mt}) ===")
+            print(_txt[:_cap].rstrip())
+            if len(_txt) > _cap:
+                print(f"mesh-on: === (truncated at {_cap} chars — open {_p} for the rest) ===")
+            print(f"mesh-on: === END {_p} ===")
 
     # ---- 8. Open blockers ----
     blockers_dir = my_dir / "blockers"

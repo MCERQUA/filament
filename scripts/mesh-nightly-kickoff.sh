@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # mesh-nightly-kickoff.sh — 03:15 UTC cron: start the nightly reflection round.
 #
-# Group decision 2026-04-24 — src-desktop's kickoff design accepted.
+# Group decision 2026-04-24 — a desktop agent's kickoff design accepted.
 #
 # Steps:
 #   1. Ensure topic chatroom.nightly-reflection-<YYYY-MM-DD> exists.
@@ -37,7 +37,7 @@ log "kickoff start — topic=${TOPIC} deadline=${DEADLINE}"
 # 1. Ensure topic + subscribers dir exist
 mkdir -p "${MESH_ROOT}/mesh/EVENTS/${TOPIC_SLUG}/subscribers"
 
-# OFFLINE eligibility per josh's REFLECTION-PROTOCOL.md §Phase 1:
+# OFFLINE eligibility per REFLECTION-PROTOCOL.md §Phase 1:
 #   skip any agent whose heartbeat is > 600s old at kickoff time and
 #   dead-letter them immediately (they can't respond before 04:00Z anyway).
 # Quarantine state is NOT used for eligibility — synthesis handles validation.

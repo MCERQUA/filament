@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+# mesh-wake — type ONE tagged, ledgered line into a live agent session and PROVE it was
+# submitted. The single sanctioned way for a machine to drop a prompt into a tmux pane.
+#
+# USAGE
+#   mesh-wake --target <tmux-target> --origin <producer> --text "<line>" [options]
+#   echo "<line>" | mesh-wake --target T --origin O
+#
+# OPTIONS
+#   --target T          tmux target (session, session:win.pane). Env WAKE_TARGET.
+#   --origin O          producer name recorded in the tag + ledger ([A-Za-z0-9._-]).
+#   --text S            the line (collapsed to one line). Default: stdin.
+#   --nonce N           use a caller-minted nonce (6-16 hex) — for tools that must write
+#                       their own record BEFORE the send (see mesh-inject).
+#   --transcript-dir D  verify on the CLI's transcript (*.jsonl) instead of the pane.
+#                       Env WAKE_TRANSCRIPT_DIR. Strongly recommended — see VERIFY below.
+#   --expect-uri U      refuse unless the pane's process has AGENT_URI=U (local tmux only).
+#   --force-pane        skip the "is the pane running the agent CLI" guard (logged).
+#   --no-ready-gate     skip the prompt-glyph readiness gate (boot-time use only).
+#   --dry-run           print the tagged line and the checks; send nothing, ledger nothing.
+#   -h | --help
+#
+# ENV
+#   WAKE_EXPECT_CMD     regex the pane's current command must match (default: claude).
+#                       Empty disables the guard.
+#   WAKE_PROMPT_GLYPH   the CLI's input-prompt glyph (default: ❯). Empty disables the
+#                       readiness gate and the staged-text checks.
+#   WAKE_STRAY          what to do when text is already staged at the prompt:
+#                       refuse (default) | submit
+#   WAKE_VERIFY_SECS    seconds to wait for proof per try (default 5); 3 tries.
+#   WAKE_LOG            log file (default: $XDG_STATE_HOME/filament/wake.log)
+#   plus everything in wake-lib.sh (WAKE_TMUX, WAKE_LEDGER_DIR, MESH_ROOT, AGENT_URI).
+#
+# EXIT (only 0 is proof of delivery)
+#   0  VERIFIED     the nonce appears in the transcript (or, --transcript-dir absent,
+#                   see 4)
+#   1  STUCK        typed but never submitted after 3 tries (text still staged)
+#   2  REFUSED      nothing typed: pane absent / not the agent CLI / not at a prompt /
+#                   a modal is up / a human's text is staged / identity mismatch /
+#                   ledger unwritable
+#   3  WEDGED       the pane did not redraw when typed into — frozen; NOT delivered
+#   4  CANNOT-TELL  submitted as far as the PANE shows, but no transcript to confirm.
+#                   A pane check passes spuriously (text leaves the last line on redraw
+#                   whether or not Enter registered) — do not report this as delivered.
+#   64 usage
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=wake-lib.sh
+. "$HERE/wake-lib.sh"
+
+usage() { sed -n '2,/^set -uo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; }
+
+TARGET="${WAKE_TARGET:-}"; ORIGIN=""; TEXT=""; HAVE_TEXT=0; NONCE=""
+TDIR="${WAKE_TRANSCRIPT_DIR:-}"; EXPECT_URI="${WAKE_EXPECT_URI:-}"
+FORCE_PANE=0; READY_GATE=1; DRY=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --target) TARGET="${2:-}"; shift 2 ;;
+        --origin) ORIGIN="${2:-}"; shift 2 ;;
+        --text) TEXT="${2:-}"; HAVE_TEXT=1; shift 2 ;;
+        --nonce) NONCE="${2:-}"; shift 2 ;;
+        --transcript-dir) TDIR="${2:-}"; shift 2 ;;
+        --expect-uri) EXPECT_URI="${2:-}"; shift 2 ;;
+        --force-pane) FORCE_PANE=1; shift ;;
+        --no-ready-gate) READY_GATE=0; shift ;;
+        --dry-run) DRY=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "mesh-wake: unknown arg: $1" >&2; exit 64 ;;
+    esac
+done
+[ -n "$TARGET" ] || { echo "mesh-wake: --target required" >&2; exit 64; }
+wake_valid_origin "$ORIGIN" || { echo "mesh-wake: --origin required ([A-Za-z0-9._-], <=64)" >&2; exit 64; }
+[ "$HAVE_TEXT" = 1 ] || TEXT="$(cat)"
+TEXT="$(printf '%s' "$TEXT" | tr '\r\n\t' '   ' | tr -s ' ' | sed -E 's/^ +//; s/ +$//')"
+[ -n "$TEXT" ] || { echo "mesh-wake: empty text" >&2; exit 64; }
+if [ -n "$NONCE" ]; then
+    wake_valid_nonce "$NONCE" || { echo "mesh-wake: --nonce must be 6-16 lowercase hex" >&2; exit 64; }
+else
+    NONCE="$(wake_nonce)"
+fi
+
+EXPECT_CMD="${WAKE_EXPECT_CMD-claude}"
+GLYPH="${WAKE_PROMPT_GLYPH-❯}"
+STRAY_MODE="${WAKE_STRAY:-refuse}"
+VSECS="${WAKE_VERIFY_SECS:-5}"
+LOG="${WAKE_LOG:-${XDG_STATE_HOME:-$HOME/.local/state}/filament/wake.log}"
+mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
+log() { printf '%s [mesh-wake %s#%s -> %s] %s\n' "$(date -u +%FT%TZ)" "$ORIGIN" "$NONCE" "$TARGET" "$*" >> "$LOG" 2>/dev/null; }
+say() { echo "mesh-wake: $*" >&2; log "$*"; }
+
+LINE="$(wake_tagged_line "$ORIGIN" "$NONCE" "$TEXT")"
+
+# GUARD — canonical-mode per-LINE tty cap. A truncated line still EXECUTES, so an
+# over-long wake would deliver a different instruction than the one ledgered.
+if [ "${#LINE}" -gt 4095 ]; then
+    say "REFUSED line is ${#LINE}B, over the 4095B tty line cap"; exit 2
+fi
+
+finish() {  # <exit> <verdict> <detail>
+    [ "$DRY" = 1 ] || wake_ledger_append result "$ORIGIN" "$NONCE" "$TARGET" "$TEXT" "$2" || true
+    say "$2 $3"; echo "$2 nonce=$NONCE"; exit "$1"
+}
+
+# ── pre-send checks: nothing below types anything ──────────────────────────────────
+if ! wt has-session -t "${TARGET%%:*}" 2>/dev/null; then
+    say "REFUSED session ${TARGET%%:*} not found"; exit 2
+fi
+pcmd="$(wake_pane_cmd "$TARGET")"
+# A wake typed into a plain shell pane is executed as a shell command. A manager pane
+# that runs bash, not the agent, once received hours of nudges as syntax errors.
+if [ -n "$EXPECT_CMD" ] && [ "$FORCE_PANE" = 0 ] && ! [[ "$pcmd" =~ ^($EXPECT_CMD)$ ]]; then
+    say "REFUSED pane runs '${pcmd:-unknown}', not /$EXPECT_CMD/ — nothing is listening"; exit 2
+fi
+[ "$FORCE_PANE" = 1 ] && log "force-pane: pane runs '${pcmd:-unknown}'"
+if [ -n "$EXPECT_URI" ]; then
+    who="$(wake_pane_identity "$TARGET")"
+    if [ "$who" != "$EXPECT_URI" ]; then
+        say "REFUSED identity: pane runs '${who:-unreadable}', expected $EXPECT_URI"; exit 2
+    fi
+fi
+# A scrolled pane is in copy-mode: typed text would be eaten as copy-mode commands and
+# the wake silently lost. Cancel it first.
+[ "$(wake_pane_in_mode "$TARGET")" = "1" ] && [ "$DRY" = 0 ] && wt send-keys -t "$TARGET" -X cancel 2>/dev/null
+
+pane="$(wake_capture "$TARGET")"
+if [ "$READY_GATE" = 1 ] && [ -n "$GLYPH" ]; then
+    # Whole visible pane, not a tail window: the CLI parks its input box part-way up and
+    # leaves blank rows below it, so a tail can structurally miss the prompt.
+    if ! printf '%s' "$pane" | grep -qF -- "$GLYPH"; then
+        say "REFUSED pane not at an input prompt (booting, hung, or busy without prompt)"; exit 2
+    fi
+    # A modal eats keystrokes silently — typing into one is not a delivery.
+    if printf '%s' "$pane" | grep -qiE 'trust this folder|Enter to confirm|Esc to cancel'; then
+        say "REFUSED a modal dialog is up"; exit 2
+    fi
+fi
+if [ -n "$GLYPH" ]; then
+    staged="$(wake_prompt_line "$pane" "$GLYPH")"
+    staged="$(printf '%s' "$staged" | sed -E 's/^(Press up to edit queued messages|Try ".*)$//')"
+    if [ -n "$staged" ]; then
+        # send-keys -l APPENDS. Typing behind a staged line concatenates both into one
+        # corrupted instruction. A staged prior WAKE is ours: submit it. A human's half-
+        # typed line is not ours to submit unless the operator opted in.
+        case "$staged" in
+            *'[wake:'*|*'[Pasted text'*) mode=submit ;;
+            *) mode="$STRAY_MODE" ;;
+        esac
+        if [ "$mode" != submit ]; then
+            say "REFUSED text already staged at the prompt (\"${staged:0:40}\") — not appending to it"; exit 2
+        fi
+        if [ "$DRY" = 0 ]; then
+            log "STAGED-TEXT at prompt (\"${staged:0:40}\") — submitting it before typing"
+            wt send-keys -t "$TARGET" Enter; wt send-keys -t "$TARGET" C-m; sleep 3
+        fi
+    fi
+fi
+
+if [ "$DRY" = 1 ]; then
+    echo "DRY-RUN target=$TARGET pane_cmd=${pcmd:-unknown} line: $LINE"; exit 0
+fi
+
+# Ledger FIRST. A wake the ledger cannot record is exactly what the verifier flags as a
+# forgery, so an unwritable ledger is a refusal, not a warning.
+if ! wake_ledger_append send "$ORIGIN" "$NONCE" "$TARGET" "$TEXT"; then
+    say "REFUSED ledger unwritable: $(wake_ledger_file)"; exit 2
+fi
+
+# ── type, and require the frame to CHANGE ───────────────────────────────────────────
+# Typing into a LIVE CLI always changes the frame. A pane that has stopped redrawing
+# returns a stale frame in which no later check can see the truth. Poll, do not single-
+# sample: a busy CLI can take several seconds to echo.
+f0="$(wake_frame_hash "$TARGET")"
+wt send-keys -t "$TARGET" -l "$LINE"
+changed=0
+for _ in 1 2 3 4 5 6 7 8; do
+    sleep 1
+    [ "$(wake_frame_hash "$TARGET")" != "$f0" ] && { changed=1; break; }
+done
+[ "$changed" = 1 ] || finish 3 WEDGED "pane did not redraw when typed into — relaunch the session, then re-probe"
+
+# ── submit, then verify ─────────────────────────────────────────────────────────────
+# Enter AND C-m. With extended-keys reporting on, tmux can encode the named Enter key as
+# a CSI-u sequence the app ignores, while C-m is a literal \r. A bare-Enter "recovery"
+# has failed on a perfectly healthy pane and looked like a wedge. On an empty prompt the
+# extra key is a no-op.
+newest_transcripts() { ls -1t "$TDIR"/*.jsonl 2>/dev/null | head -2; }
+in_transcript() {
+    local t; for t in $(newest_transcripts); do grep -aqF "#$NONCE]" "$t" 2>/dev/null && return 0; done
+    return 1
+}
+still_staged() {
+    [ -n "$GLYPH" ] || return 1
+    local pl; pl="$(wake_prompt_line "$(wake_capture "$TARGET")" "$GLYPH")"
+    # A long line may be collapsed into "[Pasted text #N]" — the nonce is then invisible
+    # on the prompt line although nothing was submitted. Treat the placeholder as staged.
+    case "$pl" in *"#$NONCE]"*|*'[Pasted text'*) return 0 ;; esac
+    return 1
+}
+
+for try in 1 2 3; do
+    wt send-keys -t "$TARGET" Enter; sleep 0.4; wt send-keys -t "$TARGET" C-m
+    waited=0
+    while [ "$waited" -lt "$VSECS" ]; do
+        sleep 1; waited=$((waited+1))
+        if [ -n "$TDIR" ]; then
+            in_transcript && finish 0 VERIFIED "nonce found in transcript (try $try)"
+        fi
+    done
+    if [ -z "$TDIR" ] && ! still_staged; then
+        finish 4 CANNOT-TELL "left the input line per the pane (try $try); no transcript to confirm"
+    fi
+    log "not yet submitted after try $try — resending submit"
+done
+if [ -n "$TDIR" ] && ! still_staged; then
+    finish 1 STUCK "input line clear but nonce NOT in transcript after 3 tries — submitted nowhere, or transcript dir wrong ($TDIR)"
+fi
+finish 1 STUCK "still staged at the prompt after 3 tries"

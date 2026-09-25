@@ -6,7 +6,7 @@
 # publishes one SYNTHESIS:true event on the same topic, then writes
 # BLACKBOARD/nightly-reflections/<date>/group.md and bumps LATEST.md.
 #
-# Per josh's accepted output spec + src's synthesis flow.
+# Per the accepted output spec + synthesis flow in docs/REFLECTION-PROTOCOL.md.
 
 set -euo pipefail
 
@@ -39,7 +39,7 @@ log "synthesize start — date=${DATE}"
 mkdir -p "$BLACKBOARD_DIR"
 
 # ── 1. Collect reflection events (skip synthesis posts + validate AUTHOR) ──
-# Validation per josh's REFLECTION-PROTOCOL.md §Phase 3:
+# Validation per REFLECTION-PROTOCOL.md §Phase 3:
 #   - AUTHOR must be a registered agent (agents/<name>/ slot exists)
 #   - AUTHOR must be in this topic's subscribers/ (i.e. was invited at kickoff)
 # Forged reflections from non-subscribed agents are quarantined, not synthesized.

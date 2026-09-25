@@ -1,8 +1,11 @@
 #!/bin/bash
 # stop-submesh [name] — stop one agent (frees its slot) or kill entire session
 
+# In-container home of the submesh (webtop convention: /config). Override for other layouts.
+SUBMESH_HOME="${SUBMESH_HOME:-/config}"
+
 NAME="$1"
-SLOTS_FILE=/config/submesh/slots
+SLOTS_FILE=${SUBMESH_HOME}/submesh/slots
 SESSION="submesh"
 
 if [ -n "$NAME" ] && [ "$NAME" != "all" ]; then
@@ -10,22 +13,54 @@ if [ -n "$NAME" ] && [ "$NAME" != "all" ]; then
         echo "Stopping manager kills the whole session. Use: stop-submesh all"
         exit 1
     fi
-    # remove from slots file so the slot is freed for next new-agent
+    # the slot this agent actually holds (the pane index below is NOT the slot number)
+    AGENT_SLOT=$(grep ":${NAME}$" "$SLOTS_FILE" 2>/dev/null | head -1 | cut -d: -f1)
+    # remove from slots file so the slot is freed for next new-agent.
+    # `grep -v` exits 1 when it prints nothing — i.e. when this was the ONLY agent — so the
+    # old `grep -v ... && mv` silently skipped the mv and the slot was never freed.
     if [ -f "$SLOTS_FILE" ]; then
-        grep -v ":${NAME}$" "$SLOTS_FILE" > "${SLOTS_FILE}.tmp" && mv "${SLOTS_FILE}.tmp" "$SLOTS_FILE"
+        { grep -v ":${NAME}$" "$SLOTS_FILE" || true; } > "${SLOTS_FILE}.tmp"
+        mv "${SLOTS_FILE}.tmp" "$SLOTS_FILE"
     fi
-    # find pane running this agent and clear it
+    # Panes are TAGGED with the tmux user option @submesh_agent=<name>. stop-submesh and
+    # submesh-agents find an agent by that tag, never by grepping screen text: a screen grep
+    # for "a1" also matches "a12", a path, or a chat line, and a stop aimed at the wrong
+    # pane kills the wrong agent.
+    # A session started by an older launcher has no tags; only then fall back to the
+    # screen grep (exact word match, not substring).
+    TAGGED=$(tmux list-panes -t "$SESSION:grid" -F '#{@submesh_agent}' 2>/dev/null | grep -c . || true)
     for PANE in 1 2 3; do
-        CONTENT=$(tmux capture-pane -t "$SESSION:grid.$PANE" -p 2>/dev/null | grep -c "$NAME" || true)
+        if [ "${TAGGED:-0}" -gt 0 ]; then
+            TAG=$(tmux display-message -p -t "$SESSION:grid.$PANE" '#{@submesh_agent}' 2>/dev/null)
+            [ "$TAG" = "$NAME" ] && CONTENT=1 || CONTENT=0
+        else
+            CONTENT=$(tmux capture-pane -t "$SESSION:grid.$PANE" -p 2>/dev/null | grep -cw -- "$NAME" || true)
+        fi
         if [ "$CONTENT" -gt 0 ]; then
-            tmux send-keys -t "$SESSION:grid.$PANE" "q" ""
-            tmux send-keys -t "$SESSION:grid.$PANE" "" ""
+            # respawn-pane -k kills whatever runs in the pane and restarts a clean shell.
+            # (This used to send a literal "q" + the marker printf as KEYSTROKES — into a
+            # running agent that is a prompt, not a stop: the agent kept running and was
+            # handed "qprintf ..." as a user message.)
+            tmux respawn-pane -k -t "$SESSION:grid.$PANE"
+            tmux set-option -p -u -t "$SESSION:grid.$PANE" @submesh_agent 2>/dev/null
+            sleep 0.3
             # find agent's slot
-            SLOT=$((PANE + 1))
-            HN=$(hostname 2>/dev/null || cat /etc/hostname 2>/dev/null)
-            if echo "$HN" | grep -qi "josh"; then PREFIX="josh-desk"; else PREFIX="ubuntu-desk"; fi
+            SLOT="${AGENT_SLOT:-$((PANE + 1))}"
+            # Desk prefix — single source of truth in desk-prefix.sh. This copy was the
+            # WORST of the four: it had no generic test at all, so its `else` handed one
+            # desktop's prefix to ANY host that did not match the first test.
+            if [ -r "${0%/*}/desk-prefix.sh" ]; then
+                . "${0%/*}/desk-prefix.sh"
+            else
+                # minimal fallback — keep in step with desk-prefix.sh resolution order
+                case "${AGENT_URI:-}" in
+                    *-desktop@*) PREFIX="${AGENT_URI%%-desktop@*}-desk" ;;
+                    *)           PREFIX="desk" ;;
+                esac
+                [ -n "${SUBMESH_DESK_PREFIX:-}" ] && PREFIX="$SUBMESH_DESK_PREFIX"
+            fi
             tmux send-keys -t "$SESSION:grid.$PANE" \
-                "printf '\n  Slot $((PANE+1)) — ${PREFIX}-${SLOT}@mesh\n  Run: new-agent <name> [type]\n\n'" Enter
+                "printf '\n  Slot ${SLOT} ready — ${PREFIX}-${SLOT}@mesh\n  Run: new-agent <name> [type]\n\n'" Enter
             echo "Agent '$NAME' stopped. Slot $SLOT freed."
             break
         fi

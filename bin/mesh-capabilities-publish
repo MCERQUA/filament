@@ -32,7 +32,16 @@ if str(_lib) not in sys.path:
 from intel_filter import enforce as _intel_enforce  # noqa: E402  SEC-032 fail-closed gate
 
 
-AGENT_URI = os.environ.get("AGENT_URI", "danielle-desktop@mesh")
+# NO DEFAULT IDENTITY. An earlier copy carried one desk's personal fallback URI; as a shared
+# binary that made EVERY desk publish as that desk whenever AGENT_URI was unset — writing
+# another agent's REGISTRY entry and relaying mail under its name. An unset identity is
+# undecidable, never guessable.
+AGENT_URI = os.environ.get("AGENT_URI") or ""
+if not AGENT_URI and not any(a in ("-h", "--help") for a in sys.argv[1:]):
+    sys.exit("mesh-capabilities-publish: AGENT_URI env var required — refusing to guess an identity")
+if AGENT_URI and not AGENT_URI.endswith("@mesh"):
+    sys.exit(f"mesh-capabilities-publish: AGENT_URI must end with @mesh, got: {AGENT_URI}")
+# str.replace is GLOBAL, so this also normalises a doubled @mesh@mesh suffix.
 AGENT_NAME = AGENT_URI.replace("@mesh", "")
 REGISTRY_DIR = Path("/mesh/REGISTRY")
 UPGRADES_DIR = Path("/mesh/UPGRADES")
@@ -48,20 +57,19 @@ def run(cmd: list[str], **kw) -> str:
 def detect_languages() -> list[dict]:
     langs = []
     seen_paths: set[str] = set()
-    for interp in ("python3.13", "python3", "node", "ruby", "go"):
-        path = shutil.which(interp)
+    # MESH_CAP_INTERPRETERS adds names (comma-separated) — e.g. a JS runtime installed
+    # outside the defaults. Entries may be absolute paths for tools that live off PATH.
+    extra = [x.strip() for x in os.environ.get("MESH_CAP_INTERPRETERS", "").split(",") if x.strip()]
+    for interp in ("python3.13", "python3", "node", "deno", "ruby", "go", *extra):
+        path = interp if (os.path.isabs(interp) and os.access(interp, os.X_OK)) else shutil.which(interp)
         if not path or path in seen_paths:
             continue
         seen_paths.add(path)
-        ver = run([interp, "--version"])
-        langs.append({"name": interp, "version": ver, "path": path})
-    # bun may live outside PATH at a known location
-    for bun_path in (shutil.which("bun"), "/config/mesh-tools/bin/bun/bun"):
-        if bun_path and Path(bun_path).is_file() and bun_path not in seen_paths:
-            seen_paths.add(bun_path)
-            ver = run([bun_path, "--version"])
-            langs.append({"name": "bun", "version": ver, "path": bun_path})
-            break
+        # Invoke the RESOLVED path, not the bare name: run([name, ...]) goes back through
+        # the ambient PATH, so a desk that HAS the interpreter reported an empty version
+        # from any shell that could not see it.
+        ver = run([path, "--version"])
+        langs.append({"name": os.path.basename(interp), "version": ver, "path": path})
     if shutil.which("bash"):
         langs.append({"name": "bash", "version": run(["bash", "--version"]).splitlines()[0],
                       "path": shutil.which("bash")})

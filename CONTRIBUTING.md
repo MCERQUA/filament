@@ -61,7 +61,7 @@ For changes that touch the protocol or message lifecycle, please run the two-age
 
 ## Security
 
-If you find a security issue (especially in the AUTHOR validation path or the patch-apply flow), email mike@jam-bot.com instead of opening a public issue.
+If you find a security issue (especially in the AUTHOR validation path or the patch-apply flow), use GitHub's private vulnerability reporting (Security tab -> "Report a vulnerability") on the repository instead of opening a public issue.
 
 ## License
 

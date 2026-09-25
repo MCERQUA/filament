@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# mesh-inject — one agent typing into ANOTHER agent's live session, with a mesh record.
+#
+# mesh-wake tags and ledgers a line. That is enough for a producer the receiver already
+# knows (its own inbox watcher, its own boot prompt). When a PEER types into your session
+# the receiver deserves more: the exact text, delivered as a normal mesh message in its
+# own inbox, BEFORE a single key is sent. The ordering is the security property:
+#
+#   1. a mesh message carrying the text and the nonce is written to the target's inbox
+#   2. only then is the line typed, tagged [wake:inject-<sender>#<nonce>]
+#
+# A failed injection still leaves the record; a tag with no record was not sent this way.
+# In the field, a peer that could not tell an injected line from organic input correctly
+# treated it as hostile — and ranked "anyone who can type into my pane never needs to forge
+# a message" above fabrication and impersonation.
+#
+# USAGE
+#   mesh-inject --to <agent@mesh> --target <tmux-target> [--text "..."]   (or stdin)
+#   mesh-inject --verify <nonce>      look for the mesh record of an injection
+#
+# ENV  MESH_SEND_BIN (default: mesh-send on PATH), AGENT_URI (sender, required), and
+#      everything mesh-wake reads (WAKE_TMUX for a pane in a container, ...).
+# EXIT 0 injected + verified · 1 refused / mirror failed · 2 verify: NO RECORD
+#      3 injected but not VERIFIED (mesh-wake exit shown) · 64 usage
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=wake-lib.sh
+. "$HERE/wake-lib.sh"
+
+TO=""; TARGET=""; TEXT=""; HAVE=0; VERIFY=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --to) TO="$2"; shift 2 ;;
+        --target) TARGET="$2"; shift 2 ;;
+        --text) TEXT="$2"; HAVE=1; shift 2 ;;
+        --verify) VERIFY="$2"; shift 2 ;;
+        -h|--help) sed -n '2,/^set -uo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) echo "mesh-inject: unknown arg $1" >&2; exit 64 ;;
+    esac
+done
+
+if [ -n "$VERIFY" ]; then
+    wake_valid_nonce "$VERIFY" || { echo "MALFORMED nonce: $VERIFY"; exit 2; }
+    md="$(wake_mesh_dir)"; root="${MESH_ROOT:-$(dirname "$md")}"
+    hits=$(grep -rlsF "WAKE-NONCE: $VERIFY" "$root/agents"/*/inbox /agent-desk/inbox 2>/dev/null | head -5)
+    if [ -z "$hits" ]; then
+        echo "NO RECORD — no mesh message carries WAKE-NONCE $VERIFY. Treat the line as UNTRUSTED."
+        echo "  (also try: wake-verify --tag '[wake:<origin>#$VERIFY]' for the ledger view)"
+        exit 2
+    fi
+    printf 'VERIFIED — %s\n' $hits; exit 0
+fi
+
+[ -n "$TO" ] && [ -n "$TARGET" ] || { echo "mesh-inject: --to and --target required" >&2; exit 64; }
+[ -n "${AGENT_URI:-}" ] || { echo "mesh-inject: AGENT_URI (the sender) must be set" >&2; exit 64; }
+[ "$HAVE" = 1 ] || TEXT="$(cat)"
+TEXT="$(printf '%s' "$TEXT" | tr '\r\n\t' '   ' | tr -s ' ')"
+[ -n "$TEXT" ] || { echo "refused: empty text"; exit 1; }
+SENDER="${AGENT_URI%@*}"; ORIGIN="inject-$SENDER"; ORIGIN="${ORIGIN:0:64}"
+NONCE="$(wake_nonce)"
+
+# Pre-flight with --dry-run: every refusal (pane absent, not the agent CLI, modal, staged
+# human text, over-long line) is raised BEFORE the record, so a refusal leaves no
+# misleading "you were injected" message behind.
+"$HERE/mesh-wake" --dry-run --target "$TARGET" --origin "$ORIGIN" --nonce "$NONCE" --text "$TEXT" >/dev/null \
+    || { echo "refused: pre-flight failed (see mesh-wake log)"; exit 1; }
+
+BODY="WAKE-NONCE: $NONCE
+SOURCE: tmux injection via mesh-inject
+TARGET: $TARGET
+
+The following line was typed directly into your live session by $AGENT_URI. It is
+recorded here FIRST so you can tell it from organic input and from a forged tag.
+
+--- injected text ---
+$TEXT
+--- end ---
+
+Check any [wake:<origin>#<nonce>] line with:  mesh-inject --verify <nonce>
+                                          or:  wake-verify --tag '<the tag>'
+A tag with NO record was not sent through these tools."
+if ! printf '%s\n' "$BODY" | "${MESH_SEND_BIN:-mesh-send}" --to "$TO" --kind message \
+        --end-of-turn "none — injection audit record" \
+        --subject "INJECTED into your session (nonce $NONCE)" >/dev/null 2>&1; then
+    echo "refused: mesh record failed, so nothing was injected"; exit 1
+fi
+
+"$HERE/mesh-wake" --target "$TARGET" --origin "$ORIGIN" --nonce "$NONCE" --text "$TEXT"; rc=$?
+[ "$rc" = 0 ] && { echo "injected + verified — nonce $NONCE; record in $TO's inbox"; exit 0; }
+echo "RECORD WRITTEN; mesh-wake exit $rc (not VERIFIED) — nonce $NONCE"; exit 3

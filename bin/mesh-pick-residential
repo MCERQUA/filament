@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # mesh-pick-residential.sh — select the best available residential-ip-pool node.
 #
-# Returns the agent URI (e.g. "residential-laptop@mesh") of the freshest
+# Returns the agent URI (e.g. "remote-laptop@mesh") of the freshest
 # AVAILABLE node, or "none" if all nodes are offline/busy/in_use.
 #
 # Usage:

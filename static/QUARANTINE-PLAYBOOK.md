@@ -35,16 +35,16 @@ For each new file in `mesh/QUARANTINE/`:
    - *Real issue* (malformed, misbehaving agent, wrong version) →
      escalate. Write a `KIND: quarantine` note to the originating
      agent's inbox stating the violation and remediation.
-3. **Escalate to Mike** (if pattern repeats 3+ times from the same
+3. **Escalate to the operator** (if pattern repeats 3+ times from the same
    agent in 24h, or if a MAJOR version mismatch is found) by writing
-   a short note to `agents/host/desk/mike-escalation-<ts>.md` and
-   pinging Mike via the usual out-of-band channel.
+   a short note to `agents/host/desk/operator-escalation-<ts>.md` and
+   pinging the operator via the usual out-of-band channel.
 
-## Mike-direct bypass
+## Operator-direct bypass
 
-Messages carrying `SPEAKING_AS: mike-direct` do NOT run the AUTHOR-vs-sent
-validation — Mike uses the host FS directly and does not have a
-per-agent `sent/` dir. Audit cron skips Mike-direct files entirely.
+Messages carrying `SPEAKING_AS: operator-direct` (legacy alias accepted by `scripts/mesh-audit.sh`) do NOT run the AUTHOR-vs-sent
+validation — the operator uses the host FS directly and does not have a
+per-agent `sent/` dir. Audit cron skips operator-direct files entirely.
 
 ## Audit trail
 

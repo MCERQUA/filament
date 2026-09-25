@@ -8,7 +8,8 @@ Stdlib-only.
 
 Env:
     AGENT_URI    required
-    MESH_ROOT    optional
+    MESH_ROOT    optional (host layout: $MESH_ROOT/agents/<me>/inbox)
+    MESH_INBOX   optional — names THIS agent's inbox directly; wins over every guess
 
 Usage:
     mesh-recv                              # list all unread
@@ -42,15 +43,56 @@ def agent_name() -> str:
     return name
 
 
-def discover_my_inbox() -> Path:
+def resolve_my_desk_dir() -> Path:
+    """Return this agent's own desk-root directory (the dir whose "inbox" and
+    other per-desk state actually belong to AGENT_URI), robust to a container
+    that bind-mounts MULTIPLE agents' desks at once.
+
+    Resolution order:
+      1. MESH_ROOT env override (explicit host-mesh layout).
+      2. A desk dir matching this agent's OWN "-desk-<N>" suffix: /agent-desk-<N>
+         — checked BEFORE the bare /agent-desk mount, and only trusted if that
+         exact numbered dir exists on this container.
+      3. /agent-desk — but ONLY when AGENT_URI has NO "-desk-<N>" suffix (the
+         single-desk-per-container case, or the primary/base identity that
+         legitimately owns /agent-desk even on a multi-mounted container).
+      4. Host path /mnt/agent-mesh/agents/<name>.
+
+    Bug this fixes (measured by a desk agent): a multi-desk container mounts
+    BOTH /agent-desk (the parent agent's desk, e.g. bob-desktop) and
+    /agent-desk-1 (bob-desk-1's OWN desk). The old code checked
+    Path("/agent-desk").is_dir() first, unconditionally, so every "-desk-N"
+    identity sharing that container silently read the PARENT's inbox instead of
+    its own — 21 unacked messages sat unread while mesh-recv reported "0 unread",
+    and downstream prompt relays issued false work orders off the wrong mail.
+    """
     override = os.environ.get("MESH_ROOT")
     if override:
-        return Path(override) / "agents" / agent_name() / "inbox"
-    if Path("/agent-desk").is_dir():
-        return Path("/agent-desk/inbox")
+        return Path(override) / "agents" / agent_name()
+
+    name = agent_name()
+    m = re.match(r"^(.+)-desk-(\d+)$", name)
+    if m:
+        desk_n_dir = Path(f"/agent-desk-{m.group(2)}")
+        if desk_n_dir.is_dir():
+            return desk_n_dir
+        # A "-desk-N" identity with no matching numbered mount on this container.
+        # Do NOT silently fall back to /agent-desk — that is another agent's desk.
+    elif Path("/agent-desk").is_dir():
+        return Path("/agent-desk")
+
     if Path("/mnt/agent-mesh").is_dir():
-        return Path("/mnt/agent-mesh/agents") / agent_name() / "inbox"
-    die("cannot discover mesh root — set MESH_ROOT")
+        return Path("/mnt/agent-mesh/agents") / name
+    die("cannot discover mesh root — set MESH_ROOT (or MESH_INBOX)")
+
+
+def discover_my_inbox() -> Path:
+    # MESH_INBOX, when set, names THIS desk's own inbox directly and wins over
+    # every path-guessing fallback (belt-and-suspenders alongside the desk-N match).
+    inbox_override = os.environ.get("MESH_INBOX")
+    if inbox_override:
+        return Path(inbox_override)
+    return resolve_my_desk_dir() / "inbox"
 
 
 def parse_frontmatter(text: str) -> dict:
@@ -109,13 +151,17 @@ def main() -> None:
 
     candidates = []
     for entry in inbox.iterdir():
-        if entry.is_file() and entry.suffix == ".md":
+        # No .md filter: a peer may write a non-.md artifact (report.html, a worker
+        # .flag) — a suffix skip made such files unobservable (two desks, two days
+        # of invisible mail). .dup-* names are ack-collision residue (see mesh-ack
+        # ack_file), not mail — surfaced by the residue note below, never as a row.
+        if entry.is_file() and ".dup-" not in entry.name:
             candidates.append(entry)
     if args.include_read:
         read_dir = inbox / ".read"
         if read_dir.is_dir():
             for entry in read_dir.iterdir():
-                if entry.is_file() and entry.suffix == ".md":
+                if entry.is_file() and ".dup-" not in entry.name:
                     candidates.append(entry)
 
     candidates.sort(key=file_ts, reverse=True)
@@ -150,8 +196,31 @@ def main() -> None:
         if len(rows) >= args.limit:
             break
 
+    # A non-.md file has no frontmatter, so its row reads KIND "?" — call it out
+    # explicitly, so a zero or a "?" can never be silently wrong about the directory.
+    # (*.dup-* is ack-collision residue — expected, listed only as a note.)
+    foreign = []
+    dup_residue = []
+    for entry in inbox.iterdir():
+        if entry.is_file() and entry.suffix != ".md":
+            (dup_residue if ".dup-" in entry.name else foreign).append(entry)
+
+    def _trailer() -> None:
+        if foreign:
+            print(f"\nWARNING: {len(foreign)} non-.md file(s) in this inbox — not standard mesh "
+                  f"messages (no frontmatter); inspect by hand:")
+            for e in sorted(foreign, key=lambda p: p.name):
+                try:
+                    sz = e.stat().st_size
+                except OSError:
+                    sz = 0
+                print(f"  {e.name}  ({sz} bytes)")
+        if dup_residue:
+            print(f"(note: {len(dup_residue)} .dup-* ack-residue file(s) present — expected, no action)")
+
     if not rows:
         print("(no messages)")
+        _trailer()
         return
 
     # Sort KIND:blocker to top, then by mtime descending (rows already sorted by mtime)
@@ -171,6 +240,7 @@ def main() -> None:
         flag = "R" if r["read"] else urg
         blocker_prefix = "[BLOCKER] " if r["kind"] == "blocker" else ""
         print(f"{r['mtime']:<20} {r['kind']:<13} {r['size']:<7} {flag:<1} {r['author']:<22} {blocker_prefix}{r['filename']}")
+    _trailer()
 
 
 if __name__ == "__main__":

@@ -79,7 +79,7 @@ timeout 10 find "$HOST_INBOX" -maxdepth 1 -name '*.md' -printf '%T@ %f\n' 2>/dev
 
 echo "[mesh-host-inbox-staleness-check] ALERT: host inbox ${age_min}m stale (threshold ${threshold_min}m, ${hours_label}). ${unread_count} unread. Alert: $(basename "$alert_file")" >&2
 
-# Optional HITL card — surface blocked items to Mike
+# Optional HITL card — surface blocked items to the operator
 if [ -n "$HITL_PENDING_DIR" ] && [ -d "$HITL_PENDING_DIR" ]; then
     hitl_file="${HITL_PENDING_DIR}/${ts}-host-inbox-stale-hitl.json"
     hitl_unread_list=$(timeout 10 find "$HOST_INBOX" -maxdepth 1 -name '*.md' -printf '"%f",' 2>/dev/null \

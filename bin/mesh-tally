@@ -5,7 +5,7 @@ Votes are written by `mesh-ack --vote` to mesh/BLACKBOARD/votes/<rfc-stem>/.
 This tool reads that directory and reports counts with quorum analysis.
 
 Quorum rules (per skill/SKILL.md):
-  BLOCK by any agent  → pending Mike review (no auto-ratification)
+  BLOCK by any agent  → pending operator review (no auto-ratification)
   3+ "no" (no BLOCK)  → host can override but should justify in DECISIONS/
   Otherwise majority "yes" → ratified
 

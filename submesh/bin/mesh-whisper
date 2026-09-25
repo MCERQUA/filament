@@ -5,9 +5,12 @@
 # The receiving agent sees it as a highlighted side-channel note mid-task.
 #
 # Usage:
-#   mesh-whisper Research-Dept "hey check josh-desk-2 — they have a question for you"
+#   mesh-whisper researcher "hey check bob-desk-2 — they have a question for you"
 #   mesh-whisper 2 "stop what you're doing, new priority: ..."
-#   mesh-whisper josh-desk-3@mesh "don't use that API — it's rate limited"
+#   mesh-whisper bob-desk-3@mesh "don't use that API — it's rate limited"
+
+# In-container home of the submesh (webtop convention: /config). Override for other layouts.
+SUBMESH_HOME="${SUBMESH_HOME:-/config}"
 
 TARGET="$1"
 MESSAGE="$2"
@@ -17,7 +20,7 @@ if [ -z "$TARGET" ] || [ -z "$MESSAGE" ]; then
     exit 1
 fi
 
-SLOTS_FILE=/config/submesh/slots
+SLOTS_FILE=${SUBMESH_HOME}/submesh/slots
 
 # resolve target to a slot number
 SLOT=""

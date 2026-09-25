@@ -1,12 +1,17 @@
 #!/bin/bash
 # submesh-grid — opens one Konsole window showing the full 2x2 tmux grid
 
-export DISPLAY=:1
-export XDG_RUNTIME_DIR=/config/.XDG
+# In-container home of the submesh (webtop convention: /config). Override for other layouts.
+SUBMESH_HOME="${SUBMESH_HOME:-/config}"
 
-if ! tmux has-session -t submesh 2>/dev/null; then
+export DISPLAY=:1
+export XDG_RUNTIME_DIR=${SUBMESH_HOME}/.XDG
+
+if ! tmux has-session -t=submesh 2>/dev/null; then
     echo "Sub-mesh not running. Use start-submesh first."
     exit 1
 fi
 
-konsole -e tmux attach -t submesh &
+# SUBMESH_TERM = the terminal launcher (default Konsole on KDE desktops), e.g. "xterm -e".
+SUBMESH_TERM="${SUBMESH_TERM:-konsole -e}"
+$SUBMESH_TERM tmux attach -t submesh &

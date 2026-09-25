@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""wake-verify — is a [wake:<producer>#<nonce>] line genuine?
+
+A wake tag can be typed by anyone. What cannot be typed after the fact is a matching
+ledger record written by the sending tool BEFORE it typed the line (scripts/wake/
+mesh-wake). This checks tags against that ledger.
+
+USAGE
+  wake-verify --tag '[wake:inbox-watch#1a2b3c4d]'      check one tag
+  wake-verify --scan FILE|-                            check every tag in a text file,
+                                                       pane capture, or CLI transcript
+                                                       (*.jsonl: user turns are parsed,
+                                                       and UNTAGGED user turns reported)
+OPTIONS
+  --ledger-dir D   default $WAKE_LEDGER_DIR, else <mesh dir>/LEDGER/wakes
+  --days N         ledger days to search, counting back from today UTC (default 3 —
+                   a wake sent just before midnight is read just after it)
+  --strict         in --scan, also fail on UNTAGGED user turns
+  --quiet          verdicts only
+
+VERDICTS
+  VERIFIED         nonce is in the ledger with the SAME producer
+  ORIGIN-MISMATCH  nonce is in the ledger but under a different producer — a real
+                   nonce re-used under someone else's name (origin spoofing)
+  FORGED           well-formed tag, nonce absent from the ledger
+  MALFORMED        nonce is not 6-16 lowercase hex (the tools only mint hex), e.g. a
+                   hand-typed "#fix" — a manual poke wearing a producer's tag
+  UNTAGGED         (transcripts only) a user turn with no tag: a human typing, or an
+                   injector that bypassed the tools. Not proof of anything by itself.
+
+EXIT  0 all tags VERIFIED · 1 any FORGED/MISMATCH/MALFORMED (or UNTAGGED with --strict)
+      2 CANNOT-TELL (ledger dir unreadable, or --scan found no tags and no turns) · 64 usage
+
+LIMIT: anything running as the ledger's uid can append to it. A VERIFIED tag means "a
+record exists", not "the sender was honest". Treat the content on its own merits.
+"""
+import argparse, datetime as dt, json, os, re, sys
+from pathlib import Path
+
+TAG = re.compile(r"\[wake:([^#\]\s]{1,64})#([^\]\s]{1,64})\]")
+HEX = re.compile(r"^[0-9a-f]{6,16}$")
+
+
+def mesh_dir() -> Path:
+    if os.environ.get("MESH_DIR"):
+        return Path(os.environ["MESH_DIR"])
+    if os.environ.get("MESH_ROOT"):
+        return Path(os.environ["MESH_ROOT"]) / "mesh"
+    if Path("/mesh").is_dir() and Path("/agent-desk").is_dir():
+        return Path("/mesh")
+    return Path("/mnt/agent-mesh/mesh")
+
+
+def load_ledger(d: Path, days: int):
+    """nonce -> set(origins) from 'send' records (and legacy records with no event)."""
+    if not d.is_dir():
+        return None
+    out: dict[str, set] = {}
+    today = dt.datetime.now(dt.timezone.utc).date()
+    for i in range(days):
+        f = d / f"{today - dt.timedelta(days=i)}.jsonl"
+        try:
+            lines = f.read_text(errors="replace").splitlines()
+        except OSError:
+            continue
+        for ln in lines:
+            try:
+                r = json.loads(ln)
+            except ValueError:
+                continue
+            if r.get("event", "send") != "send":
+                continue
+            n = str(r.get("nonce", ""))
+            if n:
+                out.setdefault(n, set()).add(str(r.get("origin", "")))
+    return out
+
+
+def judge(origin: str, nonce: str, ledger) -> str:
+    if not HEX.match(nonce):
+        return "MALFORMED"
+    if nonce not in ledger:
+        return "FORGED"
+    return "VERIFIED" if origin in ledger[nonce] else "ORIGIN-MISMATCH"
+
+
+def user_turns(path: Path):
+    """Yield user-typed text from a Claude-Code-style transcript .jsonl (best effort)."""
+    for ln in path.read_text(errors="replace").splitlines():
+        try:
+            r = json.loads(ln)
+        except ValueError:
+            continue
+        if r.get("type") != "user":
+            continue
+        msg = r.get("message") or {}
+        c = msg.get("content")
+        if isinstance(c, str):
+            yield c
+        elif isinstance(c, list):
+            # tool results are also "user" records; only plain text blocks are typed input
+            txt = [b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text"]
+            if txt and not any(isinstance(b, dict) and b.get("type") == "tool_result" for b in c):
+                yield "\n".join(txt)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("--tag"); ap.add_argument("--scan")
+    ap.add_argument("--ledger-dir"); ap.add_argument("--days", type=int, default=3)
+    ap.add_argument("--strict", action="store_true"); ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("-h", "--help", action="store_true")
+    a = ap.parse_args()
+    if a.help or not (a.tag or a.scan):
+        print(__doc__.strip()); return 0 if a.help else 64
+
+    ld = Path(a.ledger_dir or os.environ.get("WAKE_LEDGER_DIR") or mesh_dir() / "LEDGER" / "wakes")
+    ledger = load_ledger(ld, max(1, a.days))
+    if ledger is None:
+        print(f"CANNOT-TELL ledger dir not readable: {ld}")
+        return 2
+
+    bad = 0
+    if a.tag:
+        m = TAG.search(a.tag)
+        if not m:
+            print(f"MALFORMED not a wake tag: {a.tag[:80]}"); return 1
+        v = judge(m.group(1), m.group(2), ledger)
+        print(f"{v} origin={m.group(1)} nonce={m.group(2)}")
+        return 0 if v == "VERIFIED" else 1
+
+    src = sys.stdin.read() if a.scan == "-" else None
+    path = None if a.scan == "-" else Path(a.scan)
+    if path is not None and path.suffix == ".jsonl":
+        texts = list(user_turns(path))
+    else:
+        texts = (src if src is not None else path.read_text(errors="replace")).splitlines()
+
+    counts: dict[str, int] = {}
+    seen_tags = 0
+    for t in texts:
+        tags = TAG.findall(t)
+        if not tags:
+            if path is not None and path.suffix == ".jsonl" and t.strip():
+                counts["UNTAGGED"] = counts.get("UNTAGGED", 0) + 1
+                if not a.quiet:
+                    print(f"UNTAGGED  {' '.join(t.split())[:90]}")
+            continue
+        for origin, nonce in tags:
+            seen_tags += 1
+            v = judge(origin, nonce, ledger)
+            counts[v] = counts.get(v, 0) + 1
+            if v != "VERIFIED":
+                bad += 1
+            if not a.quiet or v != "VERIFIED":
+                print(f"{v:<16} origin={origin} nonce={nonce}")
+    print("summary: " + (", ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "nothing found"))
+    if a.strict and counts.get("UNTAGGED"):
+        bad += counts["UNTAGGED"]
+    if bad:
+        return 1
+    if not seen_tags and not counts:
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
