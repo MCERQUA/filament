@@ -2,7 +2,7 @@
 """mesh-chat — thin wrapper over mesh-event for chatroom topics.
 
 Subcommands:
-    post <slug> [--body "<text>"|--body-file <path>]  publish to chatroom.<slug>
+    post <slug> ["<text>"|--body "<text>"|--body-file <path>]  publish to chatroom.<slug> (stdin if none)
     tail <slug> [--n N] [--follow]                    print last N; -f to keep watching
     join <slug>                                       subscribe to chatroom.<slug>
     leave <slug>                                      unsubscribe
@@ -63,6 +63,15 @@ CHAT_BODY_CAP = 8192  # 8KB
 
 def cmd_post(args: argparse.Namespace) -> None:
     topic = topic_for(args.slug)
+    # 2026-10-25 (sms-host weekly-waste-audit): `mesh-chat post <slug> "<text>"` is the form agents
+    # naturally write (the weekly kickoff text itself says "mesh-chat post weekly-..."), but only
+    # --body/--body-file/stdin were accepted, so argparse died rc=2 "unrecognized arguments" AFTER
+    # echoing the whole body to stderr; behind `| tail -3` that looked like a successful echo and
+    # nothing was published. Accept the text positionally; refuse ambiguity instead of guessing.
+    if args.text is not None:
+        if args.body is not None or args.body_file:
+            die("give the message ONCE: positional TEXT, --body, or --body-file (got more than one)")
+        args.body = args.text
     # Enforce 8KB cap here (mesh-event has no --chat mode).
     if args.body is not None:
         if len(args.body.encode("utf-8")) > CHAT_BODY_CAP:
@@ -128,6 +137,7 @@ def main() -> None:
 
     po = sub.add_parser("post", help="publish a chat message")
     po.add_argument("slug", help="chatroom slug (e.g. 'general' or 'chatroom.general')")
+    po.add_argument("text", nargs="?", default=None, help="message text (same as --body)")
     po.add_argument("--body", default=None)
     po.add_argument("--body-file", default=None)
     po.add_argument("--ttl", type=int, default=None, help="time-to-live in seconds")
